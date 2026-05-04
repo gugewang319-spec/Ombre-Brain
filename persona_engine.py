@@ -4,7 +4,7 @@ import logging
 import os
 import re
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from openai import AsyncOpenAI
@@ -167,7 +167,7 @@ class PersonaStateEngine:
         conn.close()
 
     async def update_from_user_message(self, session_id: str, user_message: str) -> dict:
-        now = datetime.now()
+        now = self._now()
         global_state = self._ensure_global_state(now)
         session_state = self._ensure_session_state(session_id, now)
         session_state = self._apply_session_decay(session_id, session_state, now)
@@ -186,7 +186,7 @@ class PersonaStateEngine:
         return self._snapshot(global_state, session_state, evaluation.get("reply_guidance") or FALLBACK_GUIDANCE)
 
     def get_current_state(self, session_id: str) -> dict:
-        now = datetime.now()
+        now = self._now()
         global_state = self._ensure_global_state(now)
         session_state = self._ensure_session_state(session_id, now)
         session_state = self._apply_session_decay(session_id, session_state, now)
@@ -198,7 +198,7 @@ class PersonaStateEngine:
         events_limit: int = 20,
         sessions_limit: int = 20,
     ) -> dict:
-        now = datetime.now()
+        now = self._now()
         global_state = self._ensure_global_state(now)
         sessions = self._list_sessions(sessions_limit)
         active_session_id = (
@@ -218,7 +218,7 @@ class PersonaStateEngine:
                 "arousal": self.default_affect["arousal"],
                 "mood_label": self.default_affect["mood_label"],
                 "session_defensiveness": self.default_affect["session_defensiveness"],
-                "updated_at": now.isoformat(timespec="seconds"),
+                "updated_at": self._format_time(now),
             }
         events = self._list_events(events_limit, active_session_id)
         guidance = (
@@ -337,7 +337,7 @@ class PersonaStateEngine:
             "profile_id": self.profile_id,
             **{key: self._clamp_float(self.default_personality[key]) for key in self.PERSONALITY_KEYS},
             **{key: self._clamp_float(self.default_relationship[key]) for key in self.RELATIONSHIP_KEYS},
-            "updated_at": now.isoformat(timespec="seconds"),
+            "updated_at": self._format_time(now),
         }
         conn.execute(
             """
@@ -384,7 +384,7 @@ class PersonaStateEngine:
             "arousal": self._clamp_float(self.default_affect["arousal"]),
             "mood_label": str(self.default_affect["mood_label"]),
             "session_defensiveness": self._clamp_float(self.default_affect["session_defensiveness"]),
-            "updated_at": now.isoformat(timespec="seconds"),
+            "updated_at": self._format_time(now),
         }
         conn.execute(
             """
@@ -421,7 +421,7 @@ class PersonaStateEngine:
             decayed["session_defensiveness"],
             retention,
         )
-        decayed["updated_at"] = now.isoformat(timespec="seconds")
+        decayed["updated_at"] = self._format_time(now)
         self._save_session_state(session_id, decayed)
         return decayed
 
@@ -431,7 +431,7 @@ class PersonaStateEngine:
             updated[key] = self._clamp_float(float(updated.get(key, self.default_personality[key])) + delta)
         for key, delta in evaluation["relationship_delta"].items():
             updated[key] = self._clamp_float(float(updated.get(key, self.default_relationship[key])) + delta)
-        updated["updated_at"] = now.isoformat(timespec="seconds")
+        updated["updated_at"] = self._format_time(now)
 
         conn = self._connect()
         conn.execute(
@@ -471,7 +471,7 @@ class PersonaStateEngine:
             + relationship_delta.get("defensiveness", 0.0)
         )
         updated["mood_label"] = evaluation.get("mood_label", "warm_neutral") or "warm_neutral"
-        updated["updated_at"] = now.isoformat(timespec="seconds")
+        updated["updated_at"] = self._format_time(now)
         self._save_session_state(session_id, updated)
         return updated
 
@@ -504,7 +504,7 @@ class PersonaStateEngine:
         raw_response: str,
         error: str | None,
     ) -> None:
-        now = datetime.now().isoformat(timespec="seconds")
+        now = self._format_time(self._now())
         message_hash = hashlib.sha256(user_message.encode("utf-8")).hexdigest()
         conn = self._connect()
         conn.execute(
@@ -679,9 +679,18 @@ class PersonaStateEngine:
 
     def _parse_iso(self, value: Any) -> datetime | None:
         try:
-            return datetime.fromisoformat(str(value))
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
         except (TypeError, ValueError):
             return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    def _now(self) -> datetime:
+        return datetime.now(timezone.utc)
+
+    def _format_time(self, value: datetime) -> str:
+        return value.astimezone(timezone.utc).isoformat(timespec="seconds")
 
     def _json_dict(self, raw: Any) -> dict:
         try:

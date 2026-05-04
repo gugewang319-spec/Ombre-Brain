@@ -1364,7 +1364,12 @@ function esc(s) {
 
 function formatTimeAgo(iso) {
   if (!iso) return '—';
-  var d = new Date(iso);
+  var normalized = String(iso);
+  if (/^\d{4}-\d{2}-\d{2}T/.test(normalized) && !/(Z|[+-]\d{2}:\d{2})$/i.test(normalized)) {
+    normalized += 'Z';
+  }
+  var d = new Date(normalized);
+  if (Number.isNaN(d.getTime())) return '—';
   var now = new Date();
   var hours = Math.floor((now - d) / 3600000);
   if (hours < 1) return '刚刚';

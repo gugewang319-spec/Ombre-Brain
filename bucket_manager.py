@@ -31,7 +31,7 @@ import logging
 import re
 import shutil
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -366,7 +366,9 @@ class BucketManager:
 
             # --- Time ripple: boost nearby memories within ±48h ---
             # --- 时间涟漪：±48小时内的记忆轻微唤醒 ---
-            current_time = datetime.fromisoformat(str(post.get("created", post.get("last_active", ""))))
+            current_time = self._parse_iso_datetime(post.get("created", post.get("last_active", "")))
+            if current_time is None:
+                current_time = datetime.now(timezone.utc).replace(tzinfo=None)
             await self._time_ripple(bucket_id, current_time)
         except Exception as e:
             logger.warning(f"Failed to touch bucket / 触碰桶失败: {bucket_id}: {e}")
@@ -395,11 +397,10 @@ class BucketManager:
                 continue
 
             created_str = meta.get("created", meta.get("last_active", ""))
-            try:
-                created = datetime.fromisoformat(str(created_str))
-                delta_hours = abs((reference_time - created).total_seconds()) / 3600
-            except (ValueError, TypeError):
+            created = self._parse_iso_datetime(created_str)
+            if created is None:
                 continue
+            delta_hours = abs((reference_time - created).total_seconds()) / 3600
 
             if delta_hours <= hours:
                 # Boost activation_count by 0.3 (fractional), don't change last_active
@@ -591,12 +592,24 @@ class BucketManager:
         计算时间亲近度。
         """
         last_active_str = meta.get("last_active", meta.get("created", ""))
-        try:
-            last_active = datetime.fromisoformat(str(last_active_str))
-            days = max(0.0, (datetime.now() - last_active).total_seconds() / 86400)
-        except (ValueError, TypeError):
+        last_active = self._parse_iso_datetime(last_active_str)
+        if last_active is None:
             days = 30
+        else:
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            days = max(0.0, (now - last_active).total_seconds() / 86400)
         return math.exp(-0.1 * days)
+
+    def _parse_iso_datetime(self, value) -> Optional[datetime]:
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            return None
+        if parsed.tzinfo is not None:
+            return parsed.astimezone(timezone.utc).replace(tzinfo=None)
+        return parsed
 
     # ---------------------------------------------------------
     # List all buckets

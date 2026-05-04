@@ -1,7 +1,7 @@
 import asyncio
 import json
 from copy import deepcopy
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import frontmatter
 import httpx
@@ -984,6 +984,42 @@ def test_gateway_injects_after_existing_system_message(monkeypatch, test_config,
     assert "新猫粮" in injected
     assert "已解决论文" not in injected
     assert state_store.get_recent_bucket_ids("sess-inject", 5) == {cat_a}
+
+
+def test_gateway_accepts_timezone_aware_bucket_timestamps(monkeypatch, test_config, bucket_mgr):
+    bucket_id = _create_bucket(
+        bucket_mgr,
+        content="从 Supabase 写回来的桶带着时区时间。",
+        name="时区时间桶",
+        hours_ago=1,
+    )
+    file_path = bucket_mgr._find_bucket_file(bucket_id)
+    post = frontmatter.load(file_path)
+    aware_ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    post["created"] = aware_ts
+    post["last_active"] = aware_ts
+    with open(file_path, "w", encoding="utf-8") as fh:
+        fh.write(frontmatter.dumps(post))
+
+    app, _, _, captured = _build_service(
+        monkeypatch,
+        _gateway_config(test_config, recalled_memory_budget=0),
+        bucket_mgr,
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            headers={
+                "Authorization": "Bearer gateway-secret",
+                "X-Ombre-Session-Id": "sess-aware-time",
+            },
+            json={"messages": [{"role": "user", "content": "看看最近发生了什么"}]},
+        )
+
+    assert response.status_code == 200
+    injected = captured[0]["json"]["messages"][0]["content"]
+    assert "时区时间桶" in injected
 
 
 def test_gateway_injects_when_no_system_message(monkeypatch, test_config, bucket_mgr):

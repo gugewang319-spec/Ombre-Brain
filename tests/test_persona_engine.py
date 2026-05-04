@@ -1,7 +1,7 @@
 import json
 import sqlite3
 from copy import deepcopy
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -106,7 +106,7 @@ def test_persona_session_mood_half_life_decay(test_config):
     engine = PersonaStateEngine(cfg)
     engine.get_current_state("session-decay")
 
-    old_time = (datetime.now() - timedelta(minutes=90)).isoformat(timespec="seconds")
+    old_time = (datetime.now(timezone.utc) - timedelta(minutes=90)).isoformat(timespec="seconds")
     conn = sqlite3.connect(engine.db_path)
     conn.execute(
         """
@@ -172,3 +172,25 @@ async def test_persona_dashboard_payload_lists_state_sessions_and_events(test_co
     assert payload["events"][0]["event_type"] == "affection"
     assert payload["events"][0]["affect_delta"]["valence"] == pytest.approx(0.05)
     assert payload["config"]["model"] == "deepseek-chat"
+
+
+@pytest.mark.asyncio
+async def test_persona_timestamps_are_explicit_utc(test_config):
+    engine = PersonaStateEngine(_persona_config(test_config))
+    engine.client = FakePersonaClient(_event_payload())
+
+    await engine.update_from_user_message("session-timezone", "哥哥夸夸你")
+
+    conn = sqlite3.connect(engine.db_path)
+    session_row = conn.execute(
+        "SELECT updated_at FROM persona_session_state WHERE session_id = ?",
+        ("session-timezone",),
+    ).fetchone()
+    event_row = conn.execute(
+        "SELECT created_at FROM persona_events WHERE session_id = ?",
+        ("session-timezone",),
+    ).fetchone()
+    conn.close()
+
+    assert session_row[0].endswith("+00:00")
+    assert event_row[0].endswith("+00:00")
