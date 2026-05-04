@@ -56,3 +56,4 @@ async def test_create_memory_api_writes_chatgpt_source(monkeypatch, bucket_mgr):
     assert payload["source"] == "chatgpt"
     assert bucket["metadata"]["source"] == "chatgpt"
     assert bucket["metadata"]["created"].endswith("+00:00")
+    assert bucket["metadata"]["updated_at"].endswith("+00:00")

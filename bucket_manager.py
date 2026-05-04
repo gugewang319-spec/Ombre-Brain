@@ -114,6 +114,7 @@ class BucketManager:
         source: str = None,
         created: str = None,
         last_active: str = None,
+        updated_at: str = None,
     ) -> str:
         """
         Create a new memory bucket, return bucket ID.
@@ -130,6 +131,7 @@ class BucketManager:
         linked_content = content  # wikilink injection disabled; LLM adds [[]] via prompt
         created_at = created or now_iso()
         last_active_at = last_active or created_at
+        updated_at_value = updated_at or created_at
 
         # --- Pinned/protected buckets: lock importance to 10 ---
         # --- 钉选/保护桶：importance 强制锁定为 10 ---
@@ -148,6 +150,7 @@ class BucketManager:
             "type": bucket_type,
             "created": created_at,
             "last_active": last_active_at,
+            "updated_at": updated_at_value,
             "activation_count": 1,
         }
         if pinned:
@@ -289,7 +292,9 @@ class BucketManager:
         if "source" in kwargs:
             post["source"] = str(kwargs["source"])
 
-        # --- Auto-refresh activation time / 自动刷新激活时间 ---
+        # --- Auto-refresh content update time and activation time ---
+        # --- 自动刷新内容更新时间与激活时间 ---
+        post["updated_at"] = kwargs.get("updated_at") or now_iso()
         post["last_active"] = kwargs.get("last_active") or now_iso()
 
         try:

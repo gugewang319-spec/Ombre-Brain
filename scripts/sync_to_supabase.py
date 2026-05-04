@@ -76,6 +76,15 @@ def public_record(record: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in record.items() if not key.startswith("_")}
 
 
+def content_time(record: dict[str, Any]) -> datetime:
+    return parse_time(
+        record.get("updated_at")
+        or record.get("_file_updated_at")
+        or record.get("created")
+        or record.get("last_active")
+    )
+
+
 def parse_md(path: Path) -> dict[str, Any] | None:
     try:
         raw = path.read_text(encoding="utf-8")
@@ -96,6 +105,8 @@ def parse_md(path: Path) -> dict[str, Any] | None:
     title = str(meta.get("name") or meta.get("title") or path.stem)
     created = meta.get("created") or format_time(now_utc())
     last_active = meta.get("last_active") or created
+    updated_at = meta.get("updated_at")
+    file_updated_at = format_time(datetime.fromtimestamp(path.stat().st_mtime, timezone.utc))
     return {
         "id": bucket_id,
         "title": title,
@@ -110,8 +121,10 @@ def parse_md(path: Path) -> dict[str, Any] | None:
         "activation_count": int(float(meta.get("activation_count", 0))),
         "created": str(created),
         "last_active": str(last_active),
+        "updated_at": str(updated_at) if updated_at else file_updated_at,
         "source": str(meta.get("source") or "ombre"),
         "_path": str(path),
+        "_file_updated_at": file_updated_at,
     }
 
 
@@ -129,6 +142,12 @@ def record_to_md(record: dict[str, Any], path: Path) -> None:
         "activation_count": int(float(record.get("activation_count", 0))),
         "created": str(record.get("created") or format_time(now_utc())),
         "last_active": str(record.get("last_active") or record.get("created") or format_time(now_utc())),
+        "updated_at": str(
+            record.get("updated_at")
+            or record.get("created")
+            or record.get("last_active")
+            or format_time(now_utc())
+        ),
         "source": str(record.get("source") or "chatgpt"),
     }
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -190,8 +209,8 @@ def build_plan(
             to_push.append(local)
             continue
 
-        local_time = parse_time(local.get("last_active"))
-        remote_time = parse_time(remote.get("last_active") or remote.get("created"))
+        local_time = content_time(local)
+        remote_time = content_time(remote)
         local_source = str(local.get("source") or "ombre")
         remote_source = str(remote.get("source") or "")
 
@@ -208,7 +227,7 @@ def build_plan(
         if local is None:
             to_pull.append(remote)
             continue
-        if parse_time(remote.get("last_active") or remote.get("created")) > parse_time(local.get("last_active")):
+        if content_time(remote) > content_time(local):
             to_pull.append(remote)
 
     return Plan(

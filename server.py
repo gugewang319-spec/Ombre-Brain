@@ -1103,6 +1103,7 @@ async def api_create_memory(request):
             pinned=pinned,
             source="chatgpt",
             last_active=str(body.get("last_active") or now),
+            updated_at=str(body.get("updated_at") or now),
         )
         if not ok:
             return JSONResponse({"error": "update failed"}, status_code=500)
@@ -1123,6 +1124,7 @@ async def api_create_memory(request):
             source="chatgpt",
             created=str(body.get("created") or now),
             last_active=str(body.get("last_active") or now),
+            updated_at=str(body.get("updated_at") or now),
         )
         status = "created"
 

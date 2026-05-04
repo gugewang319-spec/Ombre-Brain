@@ -13,6 +13,7 @@ SPEC.loader.exec_module(sync)
 
 
 def _record(bucket_id, *, source="ombre", last_active="2026-05-04T08:00:00+00:00", **overrides):
+    updated_at = overrides.pop("updated_at", last_active)
     record = {
         "id": bucket_id,
         "title": f"title-{bucket_id}",
@@ -27,6 +28,7 @@ def _record(bucket_id, *, source="ombre", last_active="2026-05-04T08:00:00+00:00
         "activation_count": 1,
         "created": last_active,
         "last_active": last_active,
+        "updated_at": updated_at,
         "source": source,
     }
     record.update(overrides)
@@ -46,13 +48,13 @@ def test_plan_pulls_only_chatgpt_authored_remote_updates():
     assert [record["id"] for record in plan.to_pull] == ["new-chatgpt"]
 
 
-def test_plan_pushes_local_newer_by_last_active_not_synced_at():
-    local = [_record("local", last_active="2026-05-04T08:30:00+00:00")]
+def test_plan_pushes_local_newer_by_updated_at_not_synced_at():
+    local = [_record("local", updated_at="2026-05-04T08:30:00+00:00")]
     remote = [
         _record(
             "local",
             source="ombre",
-            last_active="2026-05-04T08:00:00+00:00",
+            updated_at="2026-05-04T08:00:00+00:00",
             synced_at="2026-05-04T10:00:00+00:00",
         )
     ]
@@ -61,6 +63,31 @@ def test_plan_pushes_local_newer_by_last_active_not_synced_at():
 
     assert [record["id"] for record in plan.to_push] == ["local"]
     assert plan.to_pull == []
+
+
+def test_plan_pulls_remote_table_editor_change_by_updated_at():
+    local = [
+        _record(
+            "chatgpt-memory",
+            source="chatgpt",
+            last_active="2026-05-04T10:00:00+00:00",
+            updated_at="2026-05-04T08:00:00+00:00",
+        )
+    ]
+    remote = [
+        _record(
+            "chatgpt-memory",
+            source="chatgpt",
+            content="remote edited content",
+            last_active="2026-05-04T08:00:00+00:00",
+            updated_at="2026-05-04T09:00:00+00:00",
+        )
+    ]
+
+    plan = sync.build_plan(local, remote)
+
+    assert [record["id"] for record in plan.to_pull] == ["chatgpt-memory"]
+    assert plan.to_push == []
 
 
 def test_local_path_for_record_uses_archive_folder_and_readable_filename(tmp_path):
@@ -89,6 +116,7 @@ def test_record_to_md_preserves_chatgpt_source_and_timezone(tmp_path):
 
     assert parsed["source"] == "chatgpt"
     assert parsed["last_active"].endswith("+00:00")
+    assert parsed["updated_at"].endswith("+00:00")
 
 
 async def test_bucket_manager_create_accepts_client_id_source_and_timezone(bucket_mgr):
@@ -100,6 +128,7 @@ async def test_bucket_manager_create_accepts_client_id_source_and_timezone(bucke
         source="chatgpt",
         created="2026-05-04T08:00:00+00:00",
         last_active="2026-05-04T08:00:00+00:00",
+        updated_at="2026-05-04T08:00:00+00:00",
     )
 
     bucket = await bucket_mgr.get(bucket_id)
@@ -107,6 +136,7 @@ async def test_bucket_manager_create_accepts_client_id_source_and_timezone(bucke
     assert bucket_id == "chatgpt_memory_20260504"
     assert bucket["metadata"]["source"] == "chatgpt"
     assert bucket["metadata"]["created"].endswith("+00:00")
+    assert bucket["metadata"]["updated_at"].endswith("+00:00")
 
 
 async def test_bucket_manager_update_preserves_client_source(bucket_mgr):
@@ -117,6 +147,7 @@ async def test_bucket_manager_update_preserves_client_source(bucket_mgr):
         content="新内容",
         source="chatgpt",
         last_active="2026-05-04T09:00:00+00:00",
+        updated_at="2026-05-04T09:00:00+00:00",
     )
     bucket = await bucket_mgr.get(bucket_id)
 
@@ -124,3 +155,4 @@ async def test_bucket_manager_update_preserves_client_source(bucket_mgr):
     assert bucket["content"] == "新内容"
     assert bucket["metadata"]["source"] == "chatgpt"
     assert bucket["metadata"]["last_active"].endswith("+00:00")
+    assert bucket["metadata"]["updated_at"].endswith("+00:00")
