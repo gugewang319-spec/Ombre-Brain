@@ -7,6 +7,7 @@
 ## 先读这个
 
 - 这是一个个性化 fork，不是原版 Ombre-Brain 的无改动镜像。
+- 原版代码仍遵循原项目 MIT License；本 fork 新增内容允许个人学习、自用和非商业二改，商业使用需另行取得授权。详见 [`NOTICE.md`](NOTICE.md)。
 - 默认人设、提示词和年轮作者使用 `config.yaml` 里的 `identity` 名字；示例默认是 `Haven`、`Rain`、`小雨/xiaoyu`。
 - 生产部署建议使用源码构建，并同时运行 `ombre-brain` 和 `ombre-gateway` 两个服务。
 - bucket 数据和运行状态必须放在持久化目录里；`state` 不建议放进任何双向同步目录。
