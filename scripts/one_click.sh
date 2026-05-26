@@ -1066,14 +1066,14 @@ run_doctor() {
   fi
 }
 
-maintenance_menu() {
+vector_menu() {
   local choice
   while true; do
     line
-    printf '==== 池又雨二改版 Ombre 维护工具 ====\n'
-    printf '1. 补缺失 embedding\n'
-    printf '2. 重建全部 embedding\n'
-    printf '3. 检查并清理孤儿 embedding\n'
+    printf '==== 池又雨二改版 Ombre 向量库相关 ====\n'
+    printf '1. 补缺失向量\n'
+    printf '2. 重建整个向量库\n'
+    printf '3. 检查并删除孤儿向量\n'
     printf '0. 返回上一级\n'
     if ! read -r -p '输入（0-3）：' choice; then
       printf '\n'
@@ -1097,7 +1097,7 @@ main_menu() {
     printf '1. 首次部署\n'
     printf '2. 更新版本\n'
     printf '3. 错误排查\n'
-    printf '4. 常用维护\n'
+    printf '4. 向量库相关\n'
     printf '5. 安装短命令 ob\n'
     printf '0. 退出\n'
     if ! read -r -p '输入（0-5）：' choice; then
@@ -1108,7 +1108,7 @@ main_menu() {
       1) first_deploy; pause ;;
       2) update_version; pause ;;
       3) run_doctor; pause ;;
-      4) maintenance_menu ;;
+      4) vector_menu ;;
       5) install_shortcut; pause ;;
       0) exit 0 ;;
       *) printf '请输入 0-5。\n' ;;
