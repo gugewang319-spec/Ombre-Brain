@@ -1563,6 +1563,93 @@ vector_cleanup_orphans() {
   fi
 }
 
+vector_import_dedupe_guide() {
+  vector_prepare_target "导入重复桶清理指引" || return 1
+  local service="${OMBRE_SERVICE:-ombre-brain}"
+  local cleanup_choice
+  line
+  printf '导入重复桶清理指引\n'
+  line
+  printf '1. 不要直接删除全部 buckets，除非这个实例里只有这次导入的数据。\n'
+  printf '2. 少量重复：优先打开 Dashboard → 导入 → 已导入记忆，用「删除」或「噪声」。\n'
+  printf '   Dashboard 删除会走 /api/import/review，并同步清掉对应 embedding。\n'
+  printf '3. 大量重复：先备份，再只删确认属于本次导入的 bucket 文件。\n'
+  printf '   建议按导入时间、标题和正文人工确认；不要批量删除 permanent/anchor/pinned 桶。\n'
+  printf '4. 本菜单会先扫描重复桶；可选人工逐组确认，或一键删除 exact duplicate 中安全的一份。\n'
+  printf '   扫描结果会打印重复桶前两句话和相似度；80%% 疑似重复只在人工确认模式里删除。\n\n'
+
+  if [[ "${DEPLOY_TARGET}" == "python" ]]; then
+    printf '本地 Python 部署参考命令：\n'
+    printf '  mkdir -p state/backups\n'
+    printf '  tar -czf "state/backups/before-import-dedupe-$(date +%%Y%%m%%d_%%H%%M%%S).tar.gz" buckets state\n'
+    printf '  python scripts/cleanup_duplicate_buckets.py\n'
+    printf '  python scripts/cleanup_duplicate_buckets.py --interactive --near-threshold 80\n'
+    printf '  python scripts/cleanup_duplicate_buckets.py --delete --yes\n'
+    printf '  # 如果你已经手动删除过 bucket 文件，再清 orphan embeddings：\n'
+    printf '  python scripts/cleanup_orphan_embeddings.py --delete --yes\n'
+  else
+    printf 'Docker/Compose 部署参考命令：\n'
+    printf '  docker compose -f %s exec -T %s sh -lc '"'"'mkdir -p /state/backups && tar -czf "/state/backups/before-import-dedupe-$(date +%%Y%%m%%d_%%H%%M%%S).tar.gz" /data /state'"'"'\n' "${COMPOSE_FILE}" "${service}"
+    printf '  docker compose -f %s exec -T %s python scripts/cleanup_duplicate_buckets.py\n' "${COMPOSE_FILE}" "${service}"
+    printf '  docker compose -f %s exec -T %s python scripts/cleanup_duplicate_buckets.py --interactive --near-threshold 80\n' "${COMPOSE_FILE}" "${service}"
+    printf '  docker compose -f %s exec -T %s python scripts/cleanup_duplicate_buckets.py --delete --yes\n' "${COMPOSE_FILE}" "${service}"
+    printf '  # 如果你已经手动删除过 bucket 文件，再清 orphan embeddings：\n'
+    printf '  docker compose -f %s exec -T %s python scripts/cleanup_orphan_embeddings.py --delete --yes\n' "${COMPOSE_FILE}" "${service}"
+  fi
+
+  printf '\n'
+  printf '开始扫描重复桶...\n'
+  if [[ "${DEPLOY_TARGET}" == "python" ]]; then
+    local python_cmd
+    python_cmd="$(detect_python_cmd)" || return 1
+    "${python_cmd}" scripts/cleanup_duplicate_buckets.py --limit 30 || return 1
+  else
+    run_target_shell "PYTHONIOENCODING=utf-8 python scripts/cleanup_duplicate_buckets.py --limit 30" || return 1
+  fi
+
+  printf '\n选择清理方式：\n'
+  printf '1. 人工逐组确认（包含相似度 >=80%% 的疑似重复；y 删建议项，1/2 删左/右）\n'
+  printf '2. 一键删除确定重复（只删 exact duplicate 中安全的一份）\n'
+  printf '0. 不删除\n'
+  if ! read -r -p '输入（0-2）：' cleanup_choice; then
+    printf '\n'
+    return 0
+  fi
+
+  case "${cleanup_choice}" in
+    1)
+      if ! prompt_yes_no '确认已经备份；进入人工确认模式吗' 'n'; then
+        printf '已跳过删除。\n'
+        return 0
+      fi
+      if [[ "${DEPLOY_TARGET}" == "python" ]]; then
+        "${python_cmd}" scripts/cleanup_duplicate_buckets.py --interactive --near-threshold 80 --limit 30
+      else
+        run_target_shell "PYTHONIOENCODING=utf-8 python scripts/cleanup_duplicate_buckets.py --interactive --near-threshold 80 --limit 30"
+      fi
+      ;;
+    2)
+      if ! prompt_yes_no '确认已经备份；一键删除 exact duplicate 中安全的一份吗' 'n'; then
+        printf '已跳过删除。\n'
+        return 0
+      fi
+      if [[ "${DEPLOY_TARGET}" == "python" ]]; then
+        "${python_cmd}" scripts/cleanup_duplicate_buckets.py --delete --yes --limit 30
+      else
+        run_target_shell "PYTHONIOENCODING=utf-8 python scripts/cleanup_duplicate_buckets.py --delete --yes --limit 30"
+      fi
+      ;;
+    0|'')
+      printf '已跳过删除。\n'
+      ;;
+    *)
+      printf '请输入 0-2。\n'
+      ;;
+  esac
+
+  printf '\n如果已经误删 bucket，先从备份包恢复，不要继续重建向量库。\n'
+}
+
 vector_menu() {
   local choice
   while true; do
@@ -1571,8 +1658,9 @@ vector_menu() {
     printf '1. 补缺失向量\n'
     printf '2. 重建整个向量库\n'
     printf '3. 检查并删除孤儿向量\n'
+    printf '4. 导入重复桶清理指引\n'
     printf '0. 返回上一级\n'
-    if ! read -r -p '输入（0-3）：' choice; then
+    if ! read -r -p '输入（0-4）：' choice; then
       printf '\n'
       return 0
     fi
@@ -1580,8 +1668,9 @@ vector_menu() {
       1) vector_backfill_embeddings; pause ;;
       2) vector_rebuild_embeddings; pause ;;
       3) vector_cleanup_orphans; pause ;;
+      4) vector_import_dedupe_guide; pause ;;
       0) return 0 ;;
-      *) printf '请输入 0-3。\n' ;;
+      *) printf '请输入 0-4。\n' ;;
     esac
   done
 }

@@ -1035,6 +1035,24 @@ COMPOSE_FILE=compose.hk.yml bash scripts/embedding_rebuild.sh
 # 一键检查孤儿 embedding，确认后清理
 COMPOSE_FILE=compose.hk.yml bash scripts/embedding_cleanup_orphans.sh
 
+# 导入重复桶清理/去重
+# 不要直接删除全部 buckets；优先在 Dashboard -> 导入 -> 导入结果里删除/标为噪声。
+# 如果必须批量手动删除 bucket 文件，先备份 buckets/state。
+docker compose -f compose.hk.yml exec -T ombre-brain sh -lc 'mkdir -p /state/backups && tar -czf "/state/backups/before-import-dedupe-$(date +%Y%m%d_%H%M%S).tar.gz" /data /state'
+# 扫描重复桶；会打印前两句话和相似度，默认不会自动删近似重复。
+docker compose -f compose.hk.yml exec -T ombre-brain python scripts/cleanup_duplicate_buckets.py
+# 人工逐组确认：exact duplicate 可按组删；相似度 >=80% 的疑似重复按 y/1/2 选择。
+docker compose -f compose.hk.yml exec -T ombre-brain python scripts/cleanup_duplicate_buckets.py --interactive --near-threshold 80
+# 一键删除只处理 exact duplicate 中安全的一份，并清对应 embedding。
+docker compose -f compose.hk.yml exec -T ombre-brain python scripts/cleanup_duplicate_buckets.py --delete --yes
+# 如果你已经手动删除过 bucket 文件，再清没有对应 bucket 文件的 orphan embeddings。
+docker compose -f compose.hk.yml exec -T ombre-brain python scripts/cleanup_orphan_embeddings.py --delete --yes
+# Python 直跑同理：
+python scripts/cleanup_duplicate_buckets.py
+python scripts/cleanup_duplicate_buckets.py --interactive --near-threshold 80
+python scripts/cleanup_duplicate_buckets.py --delete --yes
+python scripts/cleanup_orphan_embeddings.py --delete --yes
+
 # enrich 补跑
 # 正常情况下 reflection scheduler 会自动少量补跑；需要手动修复时可从 MCP 客户端调用 enrich_backfill(limit=20)。
 
@@ -1056,8 +1074,9 @@ docker compose -f compose.hk.yml exec -T ombre-brain python scripts/cleanup_migr
 - `scripts/update_deploy.sh`：适合“我只想更新到最新版”。它会 `git pull --ff-only`，如果 compose 里是 `build:` 就重建镜像，否则先 pull 镜像，再启动容器，最后做健康检查。
 - `scripts/embedding_backfill.sh`：只补缺失的 embedding，适合升级后发现部分记忆没有语义召回。
 - `scripts/embedding_rebuild.sh`：重建全部 embedding，适合 embedding 模型、base_url 或 embedding 文本格式改过之后使用。它会消耗更多 API 次数。
-- `scripts/embedding_cleanup_orphans.sh`：检查 `embeddings.db` 里已经没有对应 bucket 文件的记录，并要求输入确认后删除。
-- Python 直跑用户可以从 `scripts/one_click.sh` 的“向量库相关”菜单执行补向量、重建向量和清孤儿向量，不需要 Docker Compose。
+- `scripts/embedding_cleanup_orphans.sh`：检查 `embeddings.db` 里已经没有对应 bucket 文件的记录，并要求输入确认后删除；确认已备份且要非交互执行时可追加 `--yes`。
+- Python 直跑用户可以从 `scripts/one_click.sh` 的“向量库相关”菜单执行补向量、重建向量、清孤儿向量和导入重复桶清理，不需要 Docker Compose。
+- 导入重复桶清理：不要直接删全部桶。优先在 Dashboard 的“导入 -> 导入结果”里删除/标为噪声；需要批量处理时先备份 `buckets/state`，再用 `scripts/cleanup_duplicate_buckets.py` 扫描。扫描结果会打印重复桶前两句话和相似度；`--interactive --near-threshold 80` 会逐组确认，疑似重复按 `y` 删除建议项、按 `1/2` 删除左/右；`--delete --yes` 只会一键删除 exact duplicate 中安全的一份并清对应 embedding。
 - 原版迁移菜单：先检查旧部署、备份 buckets/state，再生成旧 `feel` 审阅表和 mapping。如果二改版目录和原版目录不同，可以选“备份指定原版目录”，手动填写原版仓库路径，脚本会只打包其中的 `buckets/`、`state/`、`config.yaml`、`.env`。可以逐条输入 `y` 接受候选源记忆，输入 `n` 自己填源记忆 bucket id，或输入 `w` 保留为 whisper/无源 feel。旧 `feel` 写入年轮前必须预演 mapping；清理旧独立 `feel` 前也会要求先看 dry-run。
 
 `doctor.sh` 常见结论：
