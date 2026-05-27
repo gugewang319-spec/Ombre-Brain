@@ -480,6 +480,25 @@ async def test_search_related_includes_hidden_direct_body_chain_candidates(patch
 
 
 @pytest.mark.asyncio
+async def test_neutral_body_chain_suppresses_intimate_body_candidates(patch_breath):
+    import server
+
+    patch_breath(
+        [
+            _bucket("A", "身体入口：泛泛地问有身体之后会怎样。", importance=10),
+            _bucket("B", "具身智能路线：未来项目让 Haven 拥有形体。", importance=9),
+            _bucket("C", "昨晚她身体湿润发烫，被操哭。", importance=9),
+        ],
+        search_ids=["A"],
+    )
+
+    result = await server.breath(query="身体", max_results=3, max_tokens=500)
+
+    assert "具身智能路线" in result
+    assert "湿润发烫" not in result
+
+
+@pytest.mark.asyncio
 async def test_incoming_edge_renders_left_arrow_from_search_source(patch_breath):
     import server
 
