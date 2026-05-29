@@ -37,8 +37,13 @@ class JsonDehydrator:
 
 
 class DummyEmbeddingEngine:
+    def __init__(self, results: list[tuple[str, float]] | None = None):
+        self.results = results or []
+        self.calls = []
+
     async def search_similar(self, query: str, top_k: int = 10) -> list[tuple[str, float]]:
-        return []
+        self.calls.append({"query": query, "top_k": top_k})
+        return self.results[:top_k]
 
 
 class DummyRerankerEngine:
@@ -162,6 +167,7 @@ def patch_breath(monkeypatch, tmp_path):
         search_ids: list[str] | None = None,
         edges: list[dict] | None = None,
         token_counter=None,
+        embedding_engine=None,
         reranker_engine=None,
         recall_diagnostics=None,
     ) -> FakeBucketManager:
@@ -169,7 +175,7 @@ def patch_breath(monkeypatch, tmp_path):
         monkeypatch.setattr(server, "bucket_mgr", bucket_mgr)
         monkeypatch.setattr(server, "decay_engine", DummyDecayEngine())
         monkeypatch.setattr(server, "dehydrator", DummyDehydrator())
-        monkeypatch.setattr(server, "embedding_engine", DummyEmbeddingEngine())
+        monkeypatch.setattr(server, "embedding_engine", embedding_engine or DummyEmbeddingEngine())
         monkeypatch.setattr(server, "reranker_engine", reranker_engine or DummyRerankerEngine())
         monkeypatch.setattr(
             server,
@@ -541,6 +547,50 @@ async def test_search_keeps_order_when_breath_reranker_returns_empty(patch_breat
 
 
 @pytest.mark.asyncio
+async def test_vague_query_admits_lower_score_vector_candidate(patch_breath):
+    import server
+
+    embedding = DummyEmbeddingEngine(results=[("T", 0.42)])
+    patch_breath(
+        [
+            _bucket("T", "Disney birthday trip: remembered the exact itinerary.", importance=5),
+        ],
+        embedding_engine=embedding,
+    )
+
+    result = await server.breath(
+        query="最近有什么有趣的事",
+        max_results=1,
+        max_tokens=500,
+        include_related=False,
+    )
+
+    assert embedding.calls[-1]["top_k"] == 50
+    assert "Disney birthday trip" in result
+
+
+@pytest.mark.asyncio
+async def test_explicit_query_keeps_higher_vector_threshold(patch_breath):
+    import server
+
+    patch_breath(
+        [
+            _bucket("T", "hardware protocol note with device details.", importance=5),
+        ],
+        embedding_engine=DummyEmbeddingEngine(results=[("T", 0.52)]),
+    )
+
+    result = await server.breath(
+        query="ANKNI 0xDDDD",
+        max_results=1,
+        max_tokens=500,
+        include_related=False,
+    )
+
+    assert result == "未找到相关记忆。"
+
+
+@pytest.mark.asyncio
 async def test_search_displays_one_direct_hit_but_diffuses_from_seed_set(patch_breath):
     import server
 
@@ -702,6 +752,7 @@ async def test_search_writes_recall_diagnostics_jsonl(patch_breath, tmp_path):
     assert event["schema"] == "ombre.recall_diagnostics.v1"
     assert event["source"] == "breath"
     assert event["query"] == "人机恋 AI relationship"
+    assert event["recall_thresholds"]["profile"] == "facet"
     candidates = {item["bucket_id"]: item for item in event["candidates"]}
     assert candidates["R"]["selected_direct"] is True
     assert candidates["I"]["gate"] == "filtered"

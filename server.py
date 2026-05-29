@@ -80,6 +80,8 @@ from memory_diffusion import (
 from memory_edges import MemoryEdgeStore
 from memory_moments import MemoryMomentStore
 from memory_relevance import (
+    active_facets,
+    facets_for_text,
     memory_relevance_options_from_config,
     query_has_facet,
     recall_rank,
@@ -1819,6 +1821,7 @@ def _score_to_unit(score: float) -> float:
 def _write_breath_recall_diagnostics(
     *,
     query: str,
+    recall_thresholds: dict,
     seed_diagnostics: dict[str, dict],
     pre_gate_candidates: list[dict],
     gated_candidates: list[dict],
@@ -1886,6 +1889,7 @@ def _write_breath_recall_diagnostics(
             "source": "breath",
             "mode": "search",
             "query": str(query or ""),
+            "recall_thresholds": recall_thresholds,
             "seed_buckets": list(seed_diagnostics.values())[:max_candidates],
             "candidates": candidates,
             "final": {
@@ -1930,6 +1934,78 @@ def _diagnostic_text_preview(moment: dict) -> str:
     if max_chars <= 0:
         return ""
     return _moment_text(moment, max_chars)
+
+
+def _breath_recall_thresholds(query: str, max_results: int) -> dict:
+    threshold_cfg = config.get("recall_thresholds", {}) or {}
+    options = _recall_relevance_options()
+    query_active = active_facets(facets_for_text(query, options))
+    has_explicit = _query_has_explicit_entity_marker(query)
+    is_vague = _query_is_vague_recall(query)
+
+    base_vector_min = _float_between(threshold_cfg.get("vector_min_score"), 0.50, 0.0, 1.0)
+    profile = "default"
+    vector_min = base_vector_min
+    top_k = max(max_results, 20)
+
+    if has_explicit:
+        profile = "explicit"
+        vector_min = _float_between(threshold_cfg.get("explicit_vector_min_score"), 0.55, 0.0, 1.0)
+    elif is_vague:
+        profile = "vague"
+        vector_min = _float_between(threshold_cfg.get("vague_vector_min_score"), 0.40, 0.0, 1.0)
+        top_k = max(top_k, _int_between(threshold_cfg.get("vague_top_k"), 50, 20, 100))
+    elif query_active:
+        profile = "facet"
+        vector_min = _float_between(threshold_cfg.get("facet_vector_min_score"), 0.45, 0.0, 1.0)
+
+    return {
+        "profile": profile,
+        "vector_min_score": vector_min,
+        "semantic_top_k": top_k,
+        "query_facets": sorted(query_active),
+        "has_explicit_entity": has_explicit,
+        "is_vague": is_vague,
+    }
+
+
+def _query_has_explicit_entity_marker(query: str) -> bool:
+    text = str(query or "")
+    if re.search(r"\b[A-Z0-9][A-Z0-9._:/-]{2,}\b", text):
+        return True
+    if re.search(r"\b0x[0-9a-fA-F]+\b", text):
+        return True
+    if re.search(r"\b[A-Za-z]+/[A-Za-z0-9._-]+\b", text):
+        return True
+    if re.search(r"\d", text):
+        return True
+    return False
+
+
+def _query_is_vague_recall(query: str) -> bool:
+    text = str(query or "").strip().lower()
+    if not text:
+        return False
+    vague_markers = (
+        "最近",
+        "有趣",
+        "想起来",
+        "回忆",
+        "记忆",
+        "什么事",
+        "有什么",
+        "随便",
+        "random",
+        "recent",
+        "interesting",
+        "anything",
+        "memory",
+        "memories",
+    )
+    if any(marker in text for marker in vague_markers):
+        return True
+    terms = re.findall(r"[A-Za-z0-9_./:-]+|[\u4e00-\u9fff]{1,4}", text)
+    return len(terms) <= 2 and not _query_has_explicit_entity_marker(text)
 
 
 def _query_wants_body_chain(query: str) -> bool:
@@ -2648,13 +2724,17 @@ async def breath(
 
     # --- Vector similarity channel: find semantically related buckets ---
     # --- 向量相似度通道：找到语义相关的桶 ---
+    recall_thresholds = _breath_recall_thresholds(query, max_results)
     matched_ids = {b["id"] for b in matches}
     try:
-        vector_results = await embedding_engine.search_similar(query, top_k=max(max_results, 20))
+        vector_results = await embedding_engine.search_similar(
+            query,
+            top_k=int(recall_thresholds["semantic_top_k"]),
+        )
         for bucket_id, sim_score in vector_results:
             if bucket_id in seed_diagnostics:
                 seed_diagnostics[bucket_id]["embedding_score"] = round(float(sim_score), 4)
-            if bucket_id not in matched_ids and sim_score > 0.5:
+            if bucket_id not in matched_ids and sim_score >= recall_thresholds["vector_min_score"]:
                 bucket = await bucket_mgr.get(bucket_id)
                 if bucket:
                     if bucket.get("metadata", {}).get("type") == "feel":
@@ -2834,6 +2914,7 @@ async def breath(
 
     _write_breath_recall_diagnostics(
         query=query,
+        recall_thresholds=recall_thresholds,
         seed_diagnostics=seed_diagnostics,
         pre_gate_candidates=pre_gate_moment_candidates,
         gated_candidates=gated_moment_candidates,

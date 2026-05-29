@@ -79,6 +79,13 @@ def load_config(config_path: str = None) -> dict:
             "max_candidates": 20,
             "max_text_chars": 220,
         },
+        "recall_thresholds": {
+            "vector_min_score": 0.50,
+            "facet_vector_min_score": 0.45,
+            "vague_vector_min_score": 0.40,
+            "explicit_vector_min_score": 0.55,
+            "vague_top_k": 50,
+        },
         "decay": {
             "lambda": 0.05,
             "threshold": 0.3,
