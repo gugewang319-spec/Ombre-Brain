@@ -110,6 +110,7 @@ from persona_engine import PersonaStateEngine
 from reflection_engine import ReflectionEngine
 from recall_diagnostics import RecallDiagnosticsLogger
 from reranker_engine import RerankerEngine
+from source_refs import source_ref_window
 from utils import (
     bucket_text_for_embedding,
     count_tokens_approx,
@@ -2083,18 +2084,23 @@ def _rendered_bucket_content(bucket: dict) -> str:
 
 def _original_window_around_moment(original: str, moment: dict, max_chars: int = 760) -> str:
     text = str(original or "").strip()
+    source_window = source_ref_window(
+        moment,
+        allowed_root=str(config.get("buckets_dir") or ""),
+        max_chars=max_chars,
+    )
     if not text:
-        return ""
+        return source_window
     needle = strip_temperature_meaning_lines(strip_wikilinks(str(moment.get("text") or ""))).strip()
     compact_needle = " ".join(needle.split())
     compact_text = " ".join(text.split())
     if not compact_needle:
-        return _clip_text(compact_text, max_chars)
+        return source_window or _clip_text(compact_text, max_chars)
     index = compact_text.find(compact_needle)
     if index < 0:
         index = compact_text.find(compact_needle[:80])
     if index < 0:
-        return _clip_text(compact_text, max_chars)
+        return source_window or _clip_text(compact_text, max_chars)
     half = max_chars // 2
     start = max(0, index - half)
     end = min(len(compact_text), index + len(compact_needle) + half)

@@ -60,6 +60,7 @@ from recall_policy import RecallPolicy
 from memory_nodes import MemoryNodeStore
 from persona_engine import PersonaStateEngine
 from reranker_engine import RerankerEngine
+from source_refs import source_ref_window
 from utils import (
     count_tokens_approx,
     load_config,
@@ -2895,19 +2896,24 @@ class GatewayService:
         max_chars: int = 760,
     ) -> str:
         text = str(original or "").strip()
+        source_window = source_ref_window(
+            moment,
+            allowed_root=str(self.config.get("buckets_dir") or ""),
+            max_chars=max_chars,
+        )
         if not text:
-            return ""
+            return source_window
         needle = strip_temperature_meaning_lines(strip_wikilinks(str(moment.get("text") or ""))).strip()
         compact_needle = " ".join(needle.split())
         compact_text = " ".join(text.split())
         if not compact_needle:
-            return self._clip_text(text, max_chars)
+            return source_window or self._clip_text(text, max_chars)
         index = compact_text.find(compact_needle)
         source = compact_text
         if index < 0:
             index = source.find(compact_needle[:80])
         if index < 0:
-            return self._clip_text(source, max_chars)
+            return source_window or self._clip_text(source, max_chars)
         half = max_chars // 2
         start = max(0, index - half)
         end = min(len(source), index + len(compact_needle) + half)

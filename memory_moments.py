@@ -74,6 +74,7 @@ DEFAULT_ANNOTATION_OPTIONS = {
     "max_evidence_spans": 3,
     "max_evidence_chars": 120,
 }
+DEFAULT_CONTENT_START_LINE = 1
 
 
 class MemoryMomentStore:
@@ -434,15 +435,18 @@ def parse_bucket_moments(
     moments: list[dict] = []
     ordinal = 0
 
-    content = _clean_text(bucket.get("content", ""))
+    raw_content = str(bucket.get("content") or "")
+    source_base = _source_ref_base(bucket)
+    content = _clean_text(raw_content)
     if content:
         structured = _content_moments(
             bucket_id,
-            content,
+            raw_content,
             base_meta,
             updated_at,
             relevance_options,
             annotation_options,
+            source_base,
         )
         if structured:
             for moment in structured:
@@ -460,6 +464,7 @@ def parse_bucket_moments(
                     source="content",
                     source_id="body",
                     metadata=base_meta,
+                    source_ref=_source_ref_for_body(raw_content, source_base),
                     created_at=str(meta.get("created") or meta.get("updated_at") or ""),
                     updated_at=updated_at,
                     relevance_options=relevance_options,
@@ -582,6 +587,7 @@ def _content_moments(
     updated_at: str,
     relevance_options: MemoryRelevanceOptions,
     annotation_options: dict,
+    source_base: dict | None = None,
 ) -> list[dict]:
     blocks = _split_markdown_blocks(content)
     if not any(_canonical_section(block["heading"]) for block in blocks if block["heading"]):
@@ -607,6 +613,7 @@ def _content_moments(
                 source="content",
                 source_id=f"{section}-{block_index}",
                 metadata=base_meta,
+                source_ref=_source_ref_for_block(block, source_base),
                 created_at=str(base_meta.get("bucket_created") or ""),
                 updated_at=updated_at,
                 relevance_options=relevance_options,
@@ -620,30 +627,53 @@ def _content_moments(
 def _split_markdown_blocks(content: str) -> list[dict]:
     lines = content.replace("\r\n", "\n").replace("\r", "\n").split("\n")
     blocks = []
-    current = {"heading": "", "heading_line": "", "lines": []}
-    for line in lines:
+    current = {"heading": "", "heading_line": "", "heading_line_no": 0, "start_line": 1, "lines": []}
+    for line_no, line in enumerate(lines, start=1):
         match = HEADING_RE.match(line)
         if match:
             if current["heading"] or any(str(item).strip() for item in current["lines"]):
-                blocks.append(
-                    {
-                        "heading": current["heading"],
-                        "heading_line": current["heading_line"],
-                        "text": "\n".join(current["lines"]).strip(),
-                    }
-                )
-            current = {"heading": match.group(2), "heading_line": line, "lines": []}
+                blocks.append(_block_from_split_state(current, line_no - 1))
+            current = {
+                "heading": match.group(2),
+                "heading_line": line,
+                "heading_line_no": line_no,
+                "start_line": line_no,
+                "lines": [],
+            }
         else:
             current["lines"].append(line)
     if current["heading"] or any(str(item).strip() for item in current["lines"]):
-        blocks.append(
-            {
-                "heading": current["heading"],
-                "heading_line": current["heading_line"],
-                "text": "\n".join(current["lines"]).strip(),
-            }
-        )
+        blocks.append(_block_from_split_state(current, len(lines)))
     return blocks
+
+
+def _block_from_split_state(current: dict, fallback_end_line: int) -> dict:
+    heading = str(current.get("heading") or "")
+    heading_line = str(current.get("heading_line") or "")
+    raw_lines = list(current.get("lines") or [])
+    text = "\n".join(raw_lines).strip()
+    start_line = _safe_int(current.get("start_line"), 1)
+    end_line = max(start_line, int(fallback_end_line))
+    if heading:
+        for index, line in enumerate(raw_lines, start=start_line + 1):
+            if str(line).strip():
+                end_line = index
+    else:
+        nonblank = [
+            index
+            for index, line in enumerate(raw_lines, start=start_line)
+            if str(line).strip()
+        ]
+        if nonblank:
+            start_line = nonblank[0]
+            end_line = nonblank[-1]
+    return {
+        "heading": heading,
+        "heading_line": heading_line,
+        "text": text,
+        "start_line": start_line,
+        "end_line": end_line,
+    }
 
 
 def _make_edge(
@@ -712,6 +742,7 @@ def _make_moment(
     source: str,
     source_id: str,
     metadata: dict,
+    source_ref: dict | None = None,
     created_at: str,
     updated_at: str,
     relevance_options: MemoryRelevanceOptions | None = None,
@@ -719,6 +750,8 @@ def _make_moment(
 ) -> dict:
     text = _clean_text(text)
     metadata = _clean_metadata(metadata)
+    if source_ref:
+        metadata = _clean_metadata({**metadata, "source_ref": source_ref})
     metadata = _annotated_metadata(
         text,
         section,
@@ -774,8 +807,52 @@ def _bucket_metadata(meta: dict, bucket: dict) -> dict:
             "bucket_has_affect_anchor": "### affect_anchor" in content,
             "bucket_created": meta.get("created"),
             "bucket_updated_at": meta.get("updated_at"),
+            "bucket_path": bucket.get("path"),
         }
     )
+
+
+def _source_ref_base(bucket: dict) -> dict | None:
+    meta = bucket.get("metadata") if isinstance(bucket.get("metadata"), dict) else {}
+    path = str(bucket.get("path") or meta.get("path") or meta.get("bucket_path") or "").strip()
+    if not path:
+        return None
+    start_line = _safe_int(
+        bucket.get("content_start_line") or meta.get("content_start_line"),
+        DEFAULT_CONTENT_START_LINE,
+    )
+    return {
+        "path": path,
+        "content_start_line": max(1, start_line),
+        "source": "bucket_content",
+    }
+
+
+def _source_ref_for_body(content: str, source_base: dict | None) -> dict | None:
+    if not source_base:
+        return None
+    line_count = max(1, len(str(content or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")))
+    start = int(source_base["content_start_line"])
+    return {
+        "path": source_base["path"],
+        "start_line": start,
+        "end_line": start + line_count - 1,
+        "source": source_base.get("source") or "bucket_content",
+    }
+
+
+def _source_ref_for_block(block: dict, source_base: dict | None) -> dict | None:
+    if not source_base:
+        return None
+    start_line = _safe_int(block.get("start_line"), 1)
+    end_line = _safe_int(block.get("end_line"), start_line)
+    offset = int(source_base["content_start_line"]) - 1
+    return {
+        "path": source_base["path"],
+        "start_line": max(1, offset + start_line),
+        "end_line": max(1, offset + end_line),
+        "source": source_base.get("source") or "bucket_content",
+    }
 
 
 def _annotated_metadata(
@@ -1040,6 +1117,13 @@ def _safe_float(value) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _safe_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _clamp_float(value: Any, low: float, high: float) -> float:

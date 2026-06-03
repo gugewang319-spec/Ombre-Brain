@@ -978,15 +978,27 @@ class BucketManager:
         解析 Markdown 文件，返回桶的结构化数据。
         """
         try:
+            raw = Path(file_path).read_text(encoding="utf-8")
             post = frontmatter.load(file_path)
             return {
                 "id": post.get("id", Path(file_path).stem),
                 "metadata": dict(post.metadata),
                 "content": post.content,
                 "path": file_path,
+                "content_start_line": _markdown_body_start_line(raw),
             }
         except Exception as e:
             logger.warning(
                 f"Failed to load bucket file / 加载桶文件失败: {file_path}: {e}"
             )
             return None
+
+
+def _markdown_body_start_line(text: str) -> int:
+    lines = str(text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    if not lines or lines[0].strip() != "---":
+        return 1
+    for index, line in enumerate(lines[1:], start=2):
+        if line.strip() == "---":
+            return index + 1
+    return 1
