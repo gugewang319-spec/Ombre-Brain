@@ -82,13 +82,10 @@ CONFLICT_MARKERS = (
     "conflict",
     "fight",
     "argument",
-    "blocked",
     "冲突",
     "吵架",
     "争吵",
     "矛盾",
-    "误会",
-    "阻断",
 )
 OLD_VERSION_MARKERS = (
     "old version",
@@ -97,12 +94,10 @@ OLD_VERSION_MARKERS = (
     "deprecated",
     "obsolete",
     "superseded",
-    "resolved",
     "旧版",
     "旧方案",
     "旧链",
     "旧路径",
-    "已解决",
     "已合并",
     "已经合并",
     "已废弃",
@@ -407,14 +402,9 @@ def relation_type_for(score: float, source: IndexedMoment, target: IndexedMoment
 
 def moment_has_old_version_marker(moment: dict[str, Any]) -> bool:
     meta = moment.get("metadata", {}) if isinstance(moment.get("metadata"), dict) else {}
-    raw_facets = meta.get("annotation_facets")
-    if isinstance(raw_facets, dict):
-        try:
-            if float(raw_facets.get("old_or_resolved", 0.0)) >= 0.35:
-                return True
-        except (TypeError, ValueError):
-            pass
     if meta.get("resolved") or meta.get("digested") or meta.get("bucket_resolved") or meta.get("bucket_digested"):
+        return True
+    if str(meta.get("type") or meta.get("bucket_type") or "").lower() in {"archive", "archived"}:
         return True
     return moment_has_marker(moment, OLD_VERSION_MARKERS)
 
