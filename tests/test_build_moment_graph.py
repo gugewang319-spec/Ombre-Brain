@@ -156,6 +156,32 @@ def test_replace_generated_edges_preserves_bucket_context_edges(test_config):
     assert not any(edge["reason"].startswith("local_graph:") for edge in remaining)
 
 
+def test_bucket_refresh_preserves_generated_cross_bucket_edges(test_config):
+    store = MemoryMomentStore(test_config)
+    bucket = {
+        "id": "bucket-a",
+        "content": "## context\n背景。\n\n## original\n正文。",
+        "metadata": {"id": "bucket-a", "name": "bucket-a", "type": "dynamic"},
+    }
+    store.upsert_bucket(bucket)
+    generated = {
+        "source": "bucket-a:m1",
+        "target": "bucket-b:m1",
+        "bucket_id": "bucket-a",
+        "relation_type": "supports",
+        "confidence": 0.7,
+        "reason": "local_graph: generated edge survives refresh",
+        "created_at": "2026-06-01T00:00:00+00:00",
+    }
+
+    assert store.replace_generated_edges([generated]) == 1
+    store.upsert_bucket(bucket)
+
+    edges = store.list_edges("bucket-a")
+    assert any(edge["reason"].startswith("local_graph:") for edge in edges)
+    assert any(edge["relation_type"] == "next_context" for edge in edges)
+
+
 def test_run_once_writes_edges_and_incremental_idle(monkeypatch, test_config, tmp_path):
     bucket_mgr = BucketManager(test_config)
     asyncio.run(

@@ -347,7 +347,13 @@ class MemoryMomentStore:
 
     def _replace_bucket(self, conn: sqlite3.Connection, bucket_id: str, moments: list[dict]) -> None:
         conn.execute("DELETE FROM memory_moments WHERE bucket_id = ?", (bucket_id,))
-        conn.execute("DELETE FROM memory_moment_edges WHERE bucket_id = ?", (bucket_id,))
+        conn.execute(
+            """
+            DELETE FROM memory_moment_edges
+            WHERE bucket_id = ? AND reason NOT LIKE 'local_graph:%'
+            """,
+            (bucket_id,),
+        )
         for moment in moments:
             conn.execute(
                 """
