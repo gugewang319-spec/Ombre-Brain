@@ -965,3 +965,34 @@ gateway:
 
 - Dashboard 只读观察面板已能看 query 命中 moment、direct / secondary 角色、direct 渲染形状、diffusion path、被 gate 掉的原因。
 - 外部 transcript / raw chat source 若要接入，再把 `source_ref.source` 从 `bucket_content` 扩到 transcript 文件。
+
+## 2026-06-04 追加：Dashboard 可调召回轴与 Gateway 热更新
+
+新增提交：
+
+```text
+1763f9c Show memory diffusion config in dashboard
+df0a41d Expose recall modes in dashboard config
+5f045bb Hot reload memory diffusion config
+```
+
+当前 Dashboard 的“配置 -> 记忆浮现”可以直接调：
+
+- Gateway 冷却：`cooldown_hours`、`skip_recent_rounds`
+- 直命中展示：`direct_render_mode=auto|compact|full`
+- 召回对照档：`retrieval_mode=graph|bucket`
+- 图扩散：`memory_diffusion.enabled/top_k/min_activation`
+- 链式扩散：`chain_walk_enabled/chain_max_hops/chain_min_confidence/chain_max_frontier`
+
+`/api/config` 保存时会：
+
+1. 更新 `ombre-brain` 当前进程里的 `config`。
+2. `persist=true` 时写入 `config.yaml`，如果只读则同步到 `config.runtime.yaml`。
+3. 如果配置了 `OMBRE_GATEWAY_ADMIN_URL`，把 `gateway` 和 `memory_diffusion` payload 一起 POST 到 `ombre-gateway /api/config`，让 Gateway 不重启就重算 `direct_render_mode/retrieval_mode/diffusion_options`。
+
+已验证：
+
+- 本地全量测试：`447 passed, 7 skipped`。
+- VPS `/opt/Ombre-Brain` 已部署到 `5f045bb`。
+- `http://8.136.154.242:18001/health` 和 `http://8.136.154.242:18002/health` 正常。
+- 从 live `ombre-brain` 容器调用 `server.api_config_update()` 发送同值参数，返回 `gateway_hot_reloaded`，并包含 `memory_diffusion.top_k / chain_walk_enabled / chain_max_hops`。

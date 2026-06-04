@@ -358,7 +358,7 @@ ombre-gateway
 
 新机器可以复制 `compose.hk.yml` 再按自己的路径、端口和镜像策略调整。
 
-`OMBRE_GATEWAY_ADMIN_URL` 用来让 Dashboard 改“记忆浮现”里的冷却时间/轮数后，现场通知 `ombre-gateway`。不加这条也能跑，但 Gateway 可能要重启后才读到新值。
+`OMBRE_GATEWAY_ADMIN_URL` 用来让 Dashboard 改“记忆浮现”里的参数后，现场通知 `ombre-gateway`。目前会热更新冷却时间/轮数、直命中展示形状、召回模式，以及 `memory_diffusion` 的扩散和链式扩散参数。不加这条也能跑；Dashboard 仍会更新 `ombre-brain` 运行时和 yaml，但 Gateway 要重启后才读到这些值。
 
 ### 配置文件和 runtime 配置
 
@@ -492,7 +492,13 @@ gateway:
   cooldown_hours: 6
 ```
 
-`skip_recent_rounds` 是最近几轮避开刚注入过的 bucket；`cooldown_hours` 是冷却曲线恢复到正常分数所需的小时数。Dashboard 的“配置 -> 记忆浮现”可以改这两个值。当前 Dashboard 只热更新这两个 Gateway 参数；其它 Gateway 配置仍建议改 yaml 后重启服务。
+`skip_recent_rounds` 是最近几轮避开刚注入过的 bucket；`cooldown_hours` 是冷却曲线恢复到正常分数所需的小时数。Dashboard 的“配置 -> 记忆浮现”还可以改：
+
+- `direct_render_mode`：`auto | compact | full`，控制可靠直命中是原文、窗口还是脱水胶囊。
+- `retrieval_mode`：`graph | bucket`，默认 `graph`；`bucket` 只作为接近 main 旧桶召回的对照档。
+- `memory_diffusion`：图扩散开关、返回条数、最小激活、链式扩散、链路深度/置信/前沿。
+
+如果设置了 `OMBRE_GATEWAY_ADMIN_URL`，这些参数保存后会同时热更新 `breath()` 和 Gateway；如果没有设置，Gateway 需要重启后才读取 yaml/runtime config。
 
 ### Night Dream
 

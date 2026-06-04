@@ -64,6 +64,8 @@ memory_diffusion:
   chain_max_frontier: 24
 ```
 
+Dashboard 的“配置 -> 记忆浮现”可以直接调整图扩散和链式扩散参数。保存后 `ombre-brain` 立即使用新值；如果配置了 `OMBRE_GATEWAY_ADMIN_URL`，Gateway 也会通过 `/api/config` 热更新 `diffusion_options`，不需要重启容器。
+
 ## 适合的边
 
 手写或 backfill 关系边时，优先用这些关系：
