@@ -1473,6 +1473,7 @@
   <div id="breath-results">
     <div class="loading">输入 query 后点击「模拟 Breath」查看评分链路</div>
   </div>
+  <div id="recall-results" class="diffusion-panel" style="display:none"></div>
   <div id="diffusion-results" class="diffusion-panel" style="display:none"></div>
 </div>
 
@@ -3171,9 +3172,16 @@ async function runBreathDebug() {
   var arousal = document.getElementById('breath-arousal').value;
   var results = document.getElementById('breath-results');
   var info = document.getElementById('breath-info');
+  var recall = document.getElementById('recall-results');
   var diffusion = document.getElementById('diffusion-results');
 
   results.innerHTML = '<div class="loading">计算中…</div>';
+  if (recall) {
+    recall.style.display = '';
+    recall.innerHTML = query
+      ? '<h3>Moment 命中</h3><div class="loading">读取 recall debug…</div>'
+      : '<h3>Moment 命中</h3><div class="loading">输入 query 后查看 moment candidates。</div>';
+  }
   if (diffusion) {
     diffusion.style.display = '';
     diffusion.innerHTML = query
@@ -3209,7 +3217,10 @@ async function runBreathDebug() {
       ' → 通过=<code>' + data.passed_count + '</code> 桶' +
       (query ? '' : ' &nbsp;|&nbsp; <em>未输入 query，topic 分数全为 0</em>');
 
-    if (query) loadDiffusionDebug(query);
+    if (query) {
+      loadRecallDebug(query);
+      loadDiffusionDebug(query);
+    }
 
     if (!data.results.length) {
       results.innerHTML = '<div class="loading">无结果</div>';
@@ -3252,6 +3263,72 @@ async function runBreathDebug() {
   } catch (e) {
     results.innerHTML = '<div class="loading">请求失败: ' + esc(e.message) + '</div>';
   }
+}
+
+async function loadRecallDebug(query) {
+  var target = document.getElementById('recall-results');
+  if (!target) return;
+  try {
+    var url = BASE + '/api/recall-debug?q=' + encodeURIComponent(query) + '&max_candidates=12&max_results=3';
+    var res = await authFetch(url);
+    if (!res) return;
+    var data = await res.json();
+    target.innerHTML = renderRecallDebug(data);
+  } catch (e) {
+    target.innerHTML = '<h3>Moment 命中</h3><div class="loading">加载失败: ' + esc(e.message) + '</div>';
+  }
+}
+
+function renderRecallDebug(data) {
+  if (!data || data.status !== 'ok') {
+    return '<h3>Moment 命中</h3><div class="loading">无 recall 诊断数据</div>';
+  }
+  var candidates = Array.isArray(data.candidates) ? data.candidates : [];
+  var thresholds = data.recall_thresholds || {};
+  var chips = [
+    { text: (data.seed_buckets || []).length + ' seed buckets' },
+    { text: candidates.length + ' candidates' },
+    { text: (data.admitted_count || 0) + ' admitted', state: data.admitted_count ? 'allow' : '' },
+    { text: (data.suppressed_count || 0) + ' suppressed', state: data.suppressed_count ? 'block' : '' },
+    { text: 'profile ' + (thresholds.profile || 'default') },
+  ];
+  var body = candidates.length
+    ? '<div class="moment-list">' + candidates.map(renderRecallCandidate).join('') + '</div>'
+    : '<div class="loading">没有 moment candidates。</div>';
+  return '<h3>Moment 命中</h3>' + renderMomentChips(chips) + body;
+}
+
+function renderRecallCandidate(candidate) {
+  var c = candidate || {};
+  var admitted = c.admission === 'admitted';
+  var selected = !!c.selected_returned;
+  var chips = [
+    { text: selected ? 'returned' : admitted ? 'admitted' : 'suppressed', state: selected || admitted ? 'allow' : 'block' },
+    { text: 'pre #' + rankText(c.pre_rank) },
+    { text: 'gate ' + (c.gate_rank == null ? 'filtered' : '#' + rankText(c.gate_rank)), state: c.gate === 'filtered' ? 'block' : 'allow' },
+    { text: 'final ' + (c.final_rank == null ? '—' : '#' + rankText(c.final_rank)) },
+    { text: 'section ' + (c.section || 'moment') },
+  ];
+  if (c.admission_reason) chips.push({ text: c.admission_reason, state: admitted ? 'allow' : 'block' });
+  if (c.rerank_score != null) chips.push({ text: 'rerank ' + Number(c.rerank_score).toFixed(2) });
+  if (c.embedding_score != null) chips.push({ text: 'semantic ' + Number(c.embedding_score).toFixed(2) });
+  if (c.gate_reasons && c.gate_reasons.length) {
+    chips.push({ text: c.gate_reasons.join(' · '), state: c.gate === 'filtered' ? 'block' : '' });
+  }
+  return '<div class="moment-item">' +
+    '<div class="moment-head">' +
+      '<div class="moment-title">' + esc(c.bucket_name || c.bucket_id || 'unknown') + '</div>' +
+      '<div class="moment-source">' + esc(c.moment_id || '') + '</div>' +
+    '</div>' +
+    renderMomentChips(chips) +
+    (c.annotation_summary ? '<div class="diffusion-path">summary: ' + esc(c.annotation_summary) + '</div>' : '') +
+    '<div class="moment-body">' + esc(c.text_preview || '') + '</div>' +
+  '</div>';
+}
+
+function rankText(value) {
+  if (value == null) return '—';
+  return String(Number(value) + 1);
 }
 
 async function loadDiffusionDebug(query) {

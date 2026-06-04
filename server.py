@@ -2700,6 +2700,185 @@ def _recall_rank(query: str, moment: dict) -> tuple[int, float]:
     return recall_rank(query, moment, _recall_relevance_options())
 
 
+async def _build_recall_debug_payload(
+    query: str,
+    *,
+    max_candidates: int = 20,
+    max_results: int = 3,
+    domain: str = "",
+    valence: float | None = None,
+    arousal: float | None = None,
+) -> dict:
+    query = str(query or "").strip()
+    if not query:
+        return {"status": "error", "error": "query_required"}
+
+    max_candidates = _int_between(max_candidates, 20, 1, 100)
+    max_results = _int_between(max_results, 3, 1, 20)
+    domain_filter = [d.strip() for d in str(domain or "").split(",") if d.strip()] or None
+    q_valence = valence if isinstance(valence, (int, float)) and 0 <= valence <= 1 else None
+    q_arousal = arousal if isinstance(arousal, (int, float)) and 0 <= arousal <= 1 else None
+    search_query = recall_search_query(query, _recall_relevance_options())
+    warnings: list[str] = []
+
+    try:
+        matches = await bucket_mgr.search(
+            search_query,
+            limit=max(max_candidates, max_results, 20),
+            domain_filter=domain_filter,
+            query_valence=q_valence,
+            query_arousal=q_arousal,
+        )
+    except Exception as e:
+        return {"status": "error", "error": "search_failed", "message": str(e)}
+
+    seed_diagnostics: dict[str, dict] = {}
+    for bucket in matches:
+        _upsert_breath_seed_diagnostic(
+            seed_diagnostics,
+            bucket,
+            "keyword",
+            bucket_search_score=bucket.get("score"),
+        )
+
+    recall_thresholds = _breath_recall_thresholds(query, max_results)
+    matched_ids = {bucket["id"] for bucket in matches if bucket.get("id")}
+    try:
+        vector_results = await embedding_engine.search_similar(
+            search_query,
+            top_k=int(recall_thresholds["semantic_top_k"]),
+        )
+        for bucket_id, sim_score in vector_results:
+            if bucket_id in seed_diagnostics:
+                seed_diagnostics[bucket_id]["embedding_score"] = round(float(sim_score), 4)
+            if bucket_id not in matched_ids and sim_score >= recall_thresholds["vector_min_score"]:
+                bucket = await bucket_mgr.get(bucket_id)
+                if bucket and bucket.get("metadata", {}).get("type") != "feel":
+                    bucket["score"] = round(sim_score * 100, 2)
+                    bucket["vector_match"] = True
+                    _upsert_breath_seed_diagnostic(
+                        seed_diagnostics,
+                        bucket,
+                        "vector",
+                        embedding_score=sim_score,
+                    )
+                    matches.append(bucket)
+                    matched_ids.add(bucket_id)
+    except Exception as e:
+        warnings.append(f"vector_search_failed: {e}")
+
+    try:
+        all_buckets = await bucket_mgr.list_all(include_archive=False)
+    except Exception as e:
+        warnings.append(f"list_buckets_failed: {e}")
+        all_buckets = matches
+
+    await _refresh_moment_graph(all_buckets)
+    bucket_boosts = seed_scores_for_buckets(matches)
+    searched_candidates = memory_moment_store.search_moments(
+        search_query,
+        limit=max(max_candidates, max_results, 20),
+        bucket_boosts=bucket_boosts,
+    )
+    explicit_lookup = _query_explicitly_requests_archive_memory(query)
+    direct_candidates = _direct_recallable_moments(searched_candidates, explicit_lookup=explicit_lookup)
+    pre_gate_candidates = direct_candidates[:max_candidates]
+    gated_candidates = _apply_recall_relevance_gate(query, direct_candidates)
+    reranked_candidates = await _rerank_breath_moment_candidates(query, gated_candidates)
+
+    admitted_moments = []
+    suppressed_moments = []
+    for moment in reranked_candidates:
+        admission = _breath_moment_admission_decision(
+            query,
+            moment,
+            seed_diagnostics,
+        )
+        item = dict(moment)
+        item["_admission_reason"] = admission.reason
+        item["_admission_debug"] = getattr(admission, "debug", {})
+        if admission.admit:
+            admitted_moments.append(item)
+        else:
+            suppressed_moments.append(item)
+
+    gated_by_id = _moment_index(gated_candidates)
+    reranked_by_id = _moment_index(reranked_candidates)
+    suppressed_by_id = _moment_index(suppressed_moments)
+    gated_rank = _moment_rank(gated_candidates)
+    reranked_rank = _moment_rank(reranked_candidates)
+    returned_ids = [
+        str(moment.get("moment_id") or "")
+        for moment in admitted_moments[:max_results]
+        if moment.get("moment_id")
+    ]
+    returned_set = set(returned_ids)
+    options = _recall_relevance_options()
+
+    candidates = []
+    for index, moment in enumerate(pre_gate_candidates):
+        moment_id = str(moment.get("moment_id") or "")
+        bucket_id = str(moment.get("bucket_id") or "")
+        decision = relevance_decision(query, moment, options)
+        gated = gated_by_id.get(moment_id)
+        final = reranked_by_id.get(moment_id) or gated
+        seed = seed_diagnostics.get(bucket_id, {})
+        admission = _breath_moment_admission_decision(query, final or moment, seed_diagnostics)
+        candidates.append(
+            {
+                "pre_rank": index,
+                "gate_rank": gated_rank.get(moment_id),
+                "final_rank": reranked_rank.get(moment_id),
+                "bucket_id": bucket_id,
+                "bucket_name": _moment_bucket_title(moment),
+                "moment_id": moment_id,
+                "section": moment.get("section"),
+                "sources": seed.get("sources", []),
+                "bucket_search_score": seed.get("bucket_search_score"),
+                "keyword_score": seed.get("keyword_score"),
+                "embedding_score": seed.get("embedding_score"),
+                "score_before_gate": _safe_float(moment.get("score")),
+                "score_after_gate": _safe_float(gated.get("score")) if gated else None,
+                "rerank_score": _safe_float(final.get("rerank_score")) if final else None,
+                "combined_score": _safe_float(final.get("combined_score")) if final else None,
+                "intent_rank": _recall_rank(query, final or moment)[0],
+                "gate": "filtered" if decision.multiplier <= 0 else "kept",
+                "gate_multiplier": round(float(decision.multiplier), 4),
+                "gate_reasons": list(decision.reasons),
+                "admission": (
+                    "suppressed"
+                    if moment_id in suppressed_by_id
+                    else "admitted"
+                    if admission.admit
+                    else "suppressed"
+                ),
+                "admission_reason": admission.reason,
+                "admission_debug": getattr(admission, "debug", {}),
+                "selected_returned": moment_id in returned_set,
+                "layer_debug": moment_layer_debug(final or moment, explicit_lookup=explicit_lookup),
+                "runtime_gate": moment_runtime_gate_debug(final or moment, explicit_lookup=explicit_lookup),
+                "annotation_summary": (moment.get("metadata") or {}).get("annotation_summary"),
+                "annotation_facets": (moment.get("metadata") or {}).get("annotation_facets", {}),
+                "evidence_spans": (moment.get("metadata") or {}).get("evidence_spans", []),
+                "text_preview": _diagnostic_text_preview(moment),
+            }
+        )
+
+    return {
+        "status": "ok",
+        "query": query,
+        "search_query": search_query,
+        "recall_thresholds": recall_thresholds,
+        "seed_buckets": list(seed_diagnostics.values())[:max_candidates],
+        "candidate_count": len(pre_gate_candidates),
+        "admitted_count": len(admitted_moments),
+        "suppressed_count": len(suppressed_moments),
+        "returned_moment_ids": returned_ids,
+        "candidates": candidates,
+        "warnings": warnings,
+    }
+
+
 def _secondary_direct_limit(query: str, related_per_memory: int) -> int:
     return _recall_query_plan(query).secondary_direct_limit(related_per_memory)
 
@@ -5537,6 +5716,31 @@ async def api_diffusion_debug(request):
         max_seeds=max_seeds,
         max_hits=max_hits,
         edge_min_confidence=edge_min_confidence,
+    )
+    if payload.get("status") == "error":
+        return JSONResponse(payload, status_code=400)
+    return JSONResponse(payload)
+
+
+@mcp.custom_route("/api/recall-debug", methods=["GET"])
+async def api_recall_debug(request):
+    """Debug endpoint: inspect query-to-moment recall candidates."""
+    from starlette.responses import JSONResponse
+    err = _require_dashboard_auth(request)
+    if err:
+        return err
+
+    q_valence = request.query_params.get("valence")
+    q_arousal = request.query_params.get("arousal")
+    q_valence = float(q_valence) if q_valence else None
+    q_arousal = float(q_arousal) if q_arousal else None
+    payload = await _build_recall_debug_payload(
+        request.query_params.get("q", ""),
+        max_candidates=_int_between(request.query_params.get("max_candidates"), 20, 1, 100),
+        max_results=_int_between(request.query_params.get("max_results"), 3, 1, 20),
+        domain=request.query_params.get("domain", ""),
+        valence=q_valence,
+        arousal=q_arousal,
     )
     if payload.get("status") == "error":
         return JSONResponse(payload, status_code=400)

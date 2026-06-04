@@ -51,6 +51,18 @@ def test_dashboard_breath_debug_loads_diffusion_paths():
     assert ".diffusion-panel" in html
 
 
+def test_dashboard_breath_debug_loads_recall_moment_candidates():
+    html = Path("dashboard.html").read_text(encoding="utf-8")
+    breath_block = html.split("async function runBreathDebug()", 1)[1].split("async function loadDiffusionDebug", 1)[0]
+
+    assert 'id="recall-results"' in html
+    assert "loadRecallDebug(query);" in breath_block
+    assert "BASE + '/api/recall-debug?q='" in html
+    assert "function renderRecallDebug(data)" in html
+    assert "function renderRecallCandidate(candidate)" in html
+    assert "Moment 命中" in html
+
+
 def test_dashboard_exposes_gateway_memory_cooldown_settings():
     html = Path("dashboard.html").read_text(encoding="utf-8")
 

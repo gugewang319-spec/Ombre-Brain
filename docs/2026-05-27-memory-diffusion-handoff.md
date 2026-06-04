@@ -872,11 +872,12 @@ source_ref:
 - Breath 模拟页新增 `扩散路径` 面板。
 - 新增 `/api/diffusion-debug?q=...`，复用 `inspect_diffusion` 的 payload，显示 bucket-level seeds / hits / paths / gate。
 - 这仍是 bucket-level diffusion 诊断，不等于完整 moment graph 观察面板。
+- Breath 模拟页新增 `Moment 命中` 面板。
+- 新增 `/api/recall-debug?q=...`，复用 breath 的 moment candidate / relevance gate / rerank / admission 逻辑，显示 query 命中哪个 moment、是否 admitted、是否 returned、被 gate 或 suppress 的原因。
 
 还可以继续扩成只读面板：
 
 - moment_edges。
-- query 命中哪个 moment。
 - 扩散路径。
 - Gateway 最近注入内容。
 
