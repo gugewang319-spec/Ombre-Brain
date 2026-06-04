@@ -996,3 +996,16 @@ df0a41d Expose recall modes in dashboard config
 - VPS `/opt/Ombre-Brain` 已部署到 `5f045bb`。
 - `http://8.136.154.242:18001/health` 和 `http://8.136.154.242:18002/health` 正常。
 - 从 live `ombre-brain` 容器调用 `server.api_config_update()` 发送同值参数，返回 `gateway_hot_reloaded`，并包含 `memory_diffusion.top_k / chain_walk_enabled / chain_max_hops`。
+
+## 2026-06-04 追加：query breath 默认不随机漂旧记忆
+
+`breath(query=...)` 里的 `--- 久未碰过 ---` 随机旧记忆默认关闭。这样普通查询只返回可靠直命中、联想浮现和梦境，不会因为 direct 少于 3 条就突然混入无关旧桶。
+
+如果确实想让有 query 的 breath 也随机回响旧记忆，可以显式设置：
+
+```yaml
+recall:
+  query_resurface_enabled: true
+```
+
+更推荐的旧记忆抽卡入口仍是 `resurface(max_results=..., include_archive=...)`。

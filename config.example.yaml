@@ -189,6 +189,10 @@ recall_thresholds:
   explicit_admission_rerank_score: 0.65
   vague_top_k: 50
 
+# --- Recall behavior / 召回行为 ---
+recall:
+  query_resurface_enabled: false      # true allows query breath() to append a random dormant memory when direct/related recall is sparse
+
 # --- Moment annotations / 记忆片段标注 ---
 # Stores lightweight summary/facets/evidence_spans in moment metadata.
 # The current built-in annotator is a deterministic fallback; future workers can

@@ -1,5 +1,6 @@
 import pytest
 import json
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 from memory_edges import MemoryEdgeStore
@@ -108,6 +109,17 @@ class FakeBucketManager:
 
     async def touch(self, bucket_id: str) -> None:
         self.touched.append(bucket_id)
+
+    def _parse_iso_datetime(self, value):
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+        if parsed.tzinfo is not None:
+            return parsed.astimezone(timezone.utc).replace(tzinfo=None)
+        return parsed
 
 
 def _bucket(
@@ -1858,6 +1870,53 @@ async def test_random_drift_does_not_exceed_remaining_budget(patch_breath, monke
     assert "[bucket_id:A]" in result
     assert "--- 久未碰过 ---" not in result
     assert "B low score drift candidate" not in result
+
+
+@pytest.mark.asyncio
+async def test_query_breath_does_not_resurface_old_memory_by_default(patch_breath, monkeypatch):
+    import server
+
+    patch_breath(
+        [
+            _bucket("A", "A search hit", score=9.0),
+            _bucket("D", "D dormant drift candidate", score=0.5),
+        ],
+        search_ids=["A"],
+    )
+    monkeypatch.setattr(server.random, "random", lambda: 0.0)
+    monkeypatch.setattr(server.random, "randint", lambda start, end: 1)
+
+    result = await server.breath(query="hit", max_tokens=500, include_related=False)
+
+    assert "[bucket_id:A]" in result
+    assert "--- 久未碰过 ---" not in result
+    assert "D dormant drift candidate" not in result
+
+
+@pytest.mark.asyncio
+async def test_query_breath_can_opt_into_resurface_old_memory(patch_breath, monkeypatch):
+    import server
+
+    patch_breath(
+        [
+            _bucket("A", "A search hit", score=9.0),
+            _bucket("D", "D dormant drift candidate", score=0.5),
+        ],
+        search_ids=["A"],
+    )
+    monkeypatch.setattr(
+        server,
+        "config",
+        {**server.config, "recall": {"query_resurface_enabled": True}},
+    )
+    monkeypatch.setattr(server.random, "random", lambda: 0.0)
+    monkeypatch.setattr(server.random, "randint", lambda start, end: 1)
+
+    result = await server.breath(query="hit", max_tokens=500, include_related=False)
+
+    assert "[bucket_id:A]" in result
+    assert "--- 久未碰过 ---" in result
+    assert "D dormant drift candidate" in result
 
 
 @pytest.mark.asyncio

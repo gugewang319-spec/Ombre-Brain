@@ -2176,6 +2176,11 @@ def _normalize_retrieval_mode(value: object) -> str:
     return mode if mode in {"graph", "bucket"} else "graph"
 
 
+def _query_resurface_enabled() -> bool:
+    recall_cfg = config.get("recall", {}) if isinstance(config.get("recall", {}), dict) else {}
+    return _bool_value(recall_cfg.get("query_resurface_enabled"), False)
+
+
 def _bucket_relevance_node(bucket: dict, score: float = 0.0) -> dict:
     meta = bucket.get("metadata", {}) if isinstance(bucket.get("metadata"), dict) else {}
     return {
@@ -4175,6 +4180,7 @@ async def breath(
         not related_entry
         and len(returned_moments) < 3
         and not recall_thresholds.get("has_explicit_entity")
+        and _query_resurface_enabled()
         and not auto_surface
         and max_tokens > token_used
         and random.random() < 0.4

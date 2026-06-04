@@ -706,7 +706,7 @@ breath(domain="whisper", max_tokens=1200)
 
 ```text
 1. retrieval_mode="bucket" 只作为可选对照模式；默认 graph 模式仍更适合观察 p0 的 moment 扩散链。
-2. 有 query、直接命中少于 3 条且没有联想浮现时，仍可能随机带出 “--- 久未碰过 ---” 的旧记忆；目前没有单独开关。
+2. 有 query 的 breath 默认不会随机带出 “--- 久未碰过 ---”。如果想恢复旧的随机回响，显式设置 `recall.query_resurface_enabled=true`，或者直接调用 `resurface()`。
 3. 联想浮现来自 moment_edges 与 memory_edges 的桥接边；embedding 相似边主要用于候选检索，不等于手写关系。当前 moment_edges 是 deterministic 前后文/温度边，LLM/embedding 增量建边留给后续 CLI worker。
 ```
 
