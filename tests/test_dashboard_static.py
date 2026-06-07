@@ -146,6 +146,37 @@ def test_dashboard_exposes_profile_fact_page():
     assert ".profile-proposal-panel" in html
 
 
+def test_dashboard_exposes_portrait_state_panel():
+    html = Path("dashboard.html").read_text(encoding="utf-8")
+    profile_tab_block = html.split("if (target === 'profile')", 1)[1].split("if (target === 'word-map')", 1)[0]
+    load_buckets_block = html.split("async function loadBuckets()", 1)[1].split("function getActiveTab()", 1)[0]
+
+    assert 'id="portrait-state-panel"' in html
+    assert 'id="portrait-state-summary"' in html
+    assert 'id="portrait-state-content"' in html
+    assert 'id="portrait-maintain-message"' in html
+    assert "Portrait State" in html
+    assert "只读，不写 profile_fact、anchor 或 Core Memory" in html
+    assert "loadPortraitState()" in html
+    assert "runPortraitMaintain" in html
+    assert "renderPortraitState" in html
+    assert "renderPortraitScope" in html
+    assert "renderPortraitCandidates" in html
+    assert "renderPortraitEvidence" in html
+    assert "BASE + '/api/portrait-state'" in html
+    assert "BASE + '/api/portrait-maintain'" in html
+    assert "body: JSON.stringify({ force: true })" in html
+    assert "read only" in html
+    assert "手动生成" in html
+    assert "state.stable_candidates" in html
+    assert "state.profile_fact_candidates" in html
+    assert ".portrait-state-grid" in html
+    assert ".portrait-candidate-grid" in html
+    assert "loadPortraitState();" in profile_tab_block
+    assert "loadProfileFacts();" in profile_tab_block
+    assert "loadPortraitState();" in load_buckets_block
+
+
 def test_dashboard_hides_confirm_button_for_active_profile_facts():
     html = Path("dashboard.html").read_text(encoding="utf-8")
 

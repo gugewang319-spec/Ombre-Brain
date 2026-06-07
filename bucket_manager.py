@@ -344,6 +344,12 @@ class BucketManager:
             post["object"] = str(kwargs["object"])
         if "evidence" in kwargs:
             post["evidence"] = kwargs["evidence"] if isinstance(kwargs["evidence"], list) else []
+        if "source_bucket_ids" in kwargs:
+            post["source_bucket_ids"] = kwargs["source_bucket_ids"] if isinstance(kwargs["source_bucket_ids"], list) else []
+        if "source_persona_event_ids" in kwargs:
+            post["source_persona_event_ids"] = (
+                kwargs["source_persona_event_ids"] if isinstance(kwargs["source_persona_event_ids"], list) else []
+            )
 
         # --- Auto-refresh content update time and activation time ---
         # --- 自动刷新内容更新时间与激活时间 ---

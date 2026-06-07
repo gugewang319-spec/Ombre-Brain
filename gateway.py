@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import httpx
 import uvicorn
@@ -61,6 +62,10 @@ from memory_layers import (
 from recall_policy import RecallPolicy
 from memory_nodes import MemoryNodeStore
 from persona_engine import PersonaStateEngine
+from persona_event_selection import (
+    format_persona_event_trace_line,
+    select_persona_events,
+)
 from reranker_engine import RerankerEngine
 from source_refs import source_ref_window
 from utils import (
@@ -268,6 +273,28 @@ class GatewayService:
         self.relationship_weather_include_weekly = bool(
             self.gateway_cfg.get("relationship_weather_include_weekly", False)
         )
+        self.date_persona_trace_enabled = self._bool_config_value(
+            self.gateway_cfg.get("date_persona_trace_enabled"),
+            True,
+        )
+        self.date_persona_trace_budget = max(0, int(self.gateway_cfg.get("date_persona_trace_budget", 220)))
+        self.date_persona_trace_max_events = max(
+            0,
+            min(8, int(self.gateway_cfg.get("date_persona_trace_max_events", 5))),
+        )
+        self.date_persona_trace_include_daily = self._bool_config_value(
+            self.gateway_cfg.get("date_persona_trace_include_daily"),
+            True,
+        )
+        gateway_timezone = str(
+            self.gateway_cfg.get("timezone")
+            or (config.get("reflection", {}) if isinstance(config.get("reflection", {}), dict) else {}).get("timezone")
+            or "Asia/Shanghai"
+        )
+        try:
+            self.gateway_tz = ZoneInfo(gateway_timezone)
+        except Exception:
+            self.gateway_tz = ZoneInfo("Asia/Shanghai")
         self.favorite_memory_budget = int(self.gateway_cfg.get("favorite_memory_budget", 180))
         self.favorite_memory_max_cards = max(0, int(self.gateway_cfg.get("favorite_memory_max_cards", 1)))
         self.related_memory_budget = int(self.gateway_cfg.get("related_memory_budget", 220))
@@ -389,6 +416,9 @@ class GatewayService:
                 "recent_context_cooldown_hours": self.recent_context_cooldown_hours,
                 "recent_context_reentry_idle_hours": self.recent_context_reentry_idle_hours,
                 "recent_context_budget": self.recent_budget,
+                "date_persona_trace_enabled": self.date_persona_trace_enabled,
+                "date_persona_trace_budget": self.date_persona_trace_budget,
+                "date_persona_trace_max_events": self.date_persona_trace_max_events,
                 "recalled_memory_budget": self.recalled_budget,
                 "related_memory_budget": self.related_memory_budget,
                 "current_inner_state_interval_rounds": self.current_inner_state_interval_rounds,
@@ -431,6 +461,10 @@ class GatewayService:
             "recent_context_cooldown_hours": self.recent_context_cooldown_hours,
             "recent_context_reentry_idle_hours": self.recent_context_reentry_idle_hours,
             "recent_context_budget": self.recent_budget,
+            "date_persona_trace_enabled": self.date_persona_trace_enabled,
+            "date_persona_trace_budget": self.date_persona_trace_budget,
+            "date_persona_trace_max_events": self.date_persona_trace_max_events,
+            "date_persona_trace_include_daily": self.date_persona_trace_include_daily,
             "recalled_memory_budget": self.recalled_budget,
             "related_memory_budget": self.related_memory_budget,
             "current_inner_state_interval_rounds": self.current_inner_state_interval_rounds,
@@ -512,6 +546,28 @@ class GatewayService:
             self.recent_budget = max(0, int(payload["recent_context_budget"]))
             self.gateway_cfg["recent_context_budget"] = self.recent_budget
             updated.append("gateway.recent_context_budget")
+        if "date_persona_trace_enabled" in payload:
+            self.date_persona_trace_enabled = self._bool_config_value(
+                payload["date_persona_trace_enabled"],
+                True,
+            )
+            self.gateway_cfg["date_persona_trace_enabled"] = self.date_persona_trace_enabled
+            updated.append("gateway.date_persona_trace_enabled")
+        if "date_persona_trace_budget" in payload:
+            self.date_persona_trace_budget = max(0, int(payload["date_persona_trace_budget"]))
+            self.gateway_cfg["date_persona_trace_budget"] = self.date_persona_trace_budget
+            updated.append("gateway.date_persona_trace_budget")
+        if "date_persona_trace_max_events" in payload:
+            self.date_persona_trace_max_events = max(0, min(8, int(payload["date_persona_trace_max_events"])))
+            self.gateway_cfg["date_persona_trace_max_events"] = self.date_persona_trace_max_events
+            updated.append("gateway.date_persona_trace_max_events")
+        if "date_persona_trace_include_daily" in payload:
+            self.date_persona_trace_include_daily = self._bool_config_value(
+                payload["date_persona_trace_include_daily"],
+                True,
+            )
+            self.gateway_cfg["date_persona_trace_include_daily"] = self.date_persona_trace_include_daily
+            updated.append("gateway.date_persona_trace_include_daily")
         if "recalled_memory_budget" in payload:
             self.recalled_budget = max(0, int(payload["recalled_memory_budget"]))
             self.gateway_cfg["recalled_memory_budget"] = self.recalled_budget
@@ -991,6 +1047,8 @@ class GatewayService:
         grouped_moments: dict[str, list[dict]] = {}
         moment_edges: list[dict] = []
         recalled_memory = ""
+        date_persona_trace = ""
+        date_persona_trace_debug: dict[str, Any] = self._date_persona_trace_debug_base(current_user_query)
         relationship_weather = ""
         favorite_memory = ""
         favorite_ids: list[str] = []
@@ -1077,6 +1135,10 @@ class GatewayService:
                 all_buckets,
                 self.recalled_budget,
                 current_user_query,
+            )
+            date_persona_trace, date_persona_trace_debug = self._build_date_persona_trace_block(
+                current_user_query,
+                all_buckets,
             )
             if self._should_inject_interval(session_id, self.relationship_weather_interval_rounds):
                 relationship_weather = await self._build_relationship_weather_block(all_buckets)
@@ -1193,6 +1255,7 @@ class GatewayService:
             portrait_memory=portrait_memory,
             recent_context=recent_context,
             recalled_memory=recalled_memory,
+            date_persona_trace=date_persona_trace,
             relationship_weather=relationship_weather,
             favorite_memory=favorite_memory,
             related_memory=related_memory,
@@ -1223,6 +1286,8 @@ class GatewayService:
                 portrait_memory_debug=portrait_memory_debug,
                 recalled_moments=recalled_moments,
                 recalled_memory=recalled_memory,
+                date_persona_trace=date_persona_trace,
+                date_persona_trace_debug=date_persona_trace_debug,
                 related_memory=related_memory,
                 targeted_memory_detail=targeted_memory_detail,
                 targeted_memory_detail_debug=targeted_memory_detail_debug,
@@ -3580,6 +3645,168 @@ class GatewayService:
         if not last_success:
             return None
         return max(0.0, (datetime.now() - last_success).total_seconds() / 3600)
+
+    def _date_persona_trace_debug_base(self, query: str = "") -> dict[str, Any]:
+        return {
+            "enabled": self.date_persona_trace_enabled,
+            "status": "skipped",
+            "skip_reason": "",
+            "query_preview": self._clip_text(query, 160),
+            "date": "",
+            "label": "",
+            "daily_bucket_id": "",
+            "selected_event_ids": [],
+            "event_count": 0,
+            "excerpt_event_count": 0,
+        }
+
+    def _query_date_hint(self, query: str) -> dict[str, str] | None:
+        text = str(query or "").strip()
+        if not text:
+            return None
+        now = datetime.now(self.gateway_tz)
+        explicit = re.search(r"(20\d{2})[-/.年](\d{1,2})[-/.月](\d{1,2})日?", text)
+        if explicit:
+            year, month, day = (int(part) for part in explicit.groups())
+            try:
+                target = datetime(year, month, day, tzinfo=self.gateway_tz).date()
+            except ValueError:
+                return None
+            return {"date": target.isoformat(), "label": target.isoformat()}
+        relative_days = [
+            ("前天", -2),
+            ("昨晚", -1),
+            ("昨天", -1),
+            ("昨日", -1),
+        ]
+        for label, offset in relative_days:
+            if label in text:
+                return {
+                    "date": (now + timedelta(days=offset)).date().isoformat(),
+                    "label": label,
+                }
+        if "今天" in text and self._today_query_requests_date_trace(text):
+            return {"date": now.date().isoformat(), "label": "今天"}
+        return None
+
+    @staticmethod
+    def _today_query_requests_date_trace(query: str) -> bool:
+        text = str(query or "")
+        detail_markers = (
+            "为什么",
+            "怎么说",
+            "怎么回事",
+            "发生",
+            "当时",
+            "记得",
+            "确认",
+            "激动",
+            "哭",
+            "那次",
+            "这次",
+        )
+        return any(marker in text for marker in detail_markers)
+
+    def _build_date_persona_trace_block(
+        self,
+        query_text: str,
+        all_buckets: list[dict],
+    ) -> tuple[str, dict[str, Any]]:
+        debug = self._date_persona_trace_debug_base(query_text)
+        if not self.date_persona_trace_enabled:
+            debug["skip_reason"] = "disabled"
+            return "", debug
+        if self.date_persona_trace_budget <= 0 or self.date_persona_trace_max_events <= 0:
+            debug["skip_reason"] = "budget_disabled"
+            return "", debug
+        hint = self._query_date_hint(query_text)
+        if not hint:
+            debug["skip_reason"] = "no_date_hint"
+            return "", debug
+
+        date_key = hint["date"]
+        debug["date"] = date_key
+        debug["label"] = hint["label"]
+        lines = [
+            f"Read-only date trace for {date_key} ({hint['label']}).",
+            "Prefer direct memory facts when present; use this only as same-day tone and original-turn context.",
+        ]
+
+        daily_bucket = self._daily_impression_bucket_for_date(all_buckets, date_key)
+        if self.date_persona_trace_include_daily and daily_bucket:
+            debug["daily_bucket_id"] = str(daily_bucket.get("id") or "")
+            daily_text = strip_display_temperature_sections(
+                strip_wikilinks(str(daily_bucket.get("content") or ""))
+            ).strip()
+            if daily_text:
+                lines.append(f"daily_impression: {self._clip_text(daily_text, 150)}")
+
+        selected_events = self._persona_events_for_date(date_key)
+        if selected_events:
+            lines.append("turns:")
+            for event in selected_events:
+                lines.append(format_persona_event_trace_line(event, excerpt_limit=150))
+
+        if len(lines) <= 2:
+            debug["skip_reason"] = "no_material"
+            return "", debug
+
+        debug["status"] = "injected"
+        debug["event_count"] = len(selected_events)
+        debug["selected_event_ids"] = [
+            int(event.get("id"))
+            for event in selected_events
+            if event.get("id") is not None
+        ]
+        debug["excerpt_event_count"] = sum(
+            1
+            for event in selected_events
+            if str(event.get("user_excerpt") or "").strip()
+            or str(event.get("assistant_excerpt") or "").strip()
+        )
+        return self._trim_text("\n".join(lines), self.date_persona_trace_budget), debug
+
+    def _persona_events_for_date(self, date_key: str) -> list[dict[str, Any]]:
+        persona_engine = self.persona_engine
+        if not persona_engine or not hasattr(persona_engine, "_list_events"):
+            return []
+        try:
+            events = persona_engine._list_events(max(80, self.date_persona_trace_max_events * 8))
+        except Exception:
+            return []
+        matched = []
+        for event in events:
+            created = self._parse_persona_event_local_time(event.get("created_at"))
+            if created and created.date().isoformat() == date_key:
+                matched.append(event)
+        return select_persona_events(matched, limit=self.date_persona_trace_max_events)
+
+    def _parse_persona_event_local_time(self, value: Any) -> datetime | None:
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(self.gateway_tz)
+
+    def _daily_impression_bucket_for_date(self, all_buckets: list[dict], date_key: str) -> dict | None:
+        fallback = None
+        expected_id = f"reflection_daily_{date_key}"
+        for bucket in all_buckets:
+            meta = bucket.get("metadata", {}) if isinstance(bucket.get("metadata"), dict) else {}
+            tags = {str(tag) for tag in meta.get("tags", [])}
+            if meta.get("type") != "feel":
+                continue
+            if not ({"relationship_weather", "daily_impression"} & tags):
+                continue
+            if str(bucket.get("id") or "") == expected_id:
+                return bucket
+            if str(meta.get("date") or "") == date_key:
+                fallback = bucket
+        return fallback
 
     @staticmethod
     def _query_requests_recent_context(query: str) -> bool:
@@ -5998,10 +6225,11 @@ class GatewayService:
         relationship_weather: str,
         favorite_memory: str,
         related_memory: str,
-        targeted_memory_detail: str,
-        dream_context: str,
+        targeted_memory_detail: str = "",
+        dream_context: str = "",
         memory_detail_recall_instruction: str = "",
         context_mode: str = "",
+        date_persona_trace: str = "",
     ) -> tuple[str, str]:
         stable_sections = []
         if core_memory.strip() or portrait_memory.strip():
@@ -6026,6 +6254,7 @@ class GatewayService:
                 favorite_memory,
                 recent_context,
                 recalled_memory,
+                date_persona_trace,
                 targeted_memory_detail,
                 related_memory,
                 memory_detail_recall_instruction,
@@ -6049,6 +6278,7 @@ class GatewayService:
                     "[created:YYYY-MM-DD] is the bucket record date, not necessarily the event date; prefer event dates in the memory text.",
                 )
             add_section("Recalled Memory", recalled_memory)
+            add_section("Date Persona Trace", date_persona_trace)
             add_section("Targeted Memory Detail", targeted_memory_detail)
             add_section("Diffused Memory", related_memory)
             add_section("Memory Detail Request", memory_detail_recall_instruction)
@@ -6341,6 +6571,8 @@ class GatewayService:
         suppressed_moments: list[dict] | None = None,
         suppressed_buckets: list[dict] | None = None,
         query_planner_debug: dict[str, Any] | None = None,
+        date_persona_trace: str = "",
+        date_persona_trace_debug: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         recalled_moment_ids = [
             str(moment.get("moment_id") or "")
@@ -6396,6 +6628,8 @@ class GatewayService:
             "portrait_memory_debug": portrait_memory_debug or self._portrait_memory_debug_base(),
             "recent_context_injected": bool(str(recent_context or "").strip()),
             "recent_context_reason": recent_context_reason,
+            "date_persona_trace_injected": bool(str(date_persona_trace or "").strip()),
+            "date_persona_trace_debug": date_persona_trace_debug or self._date_persona_trace_debug_base(query),
             "dream_context_injected": bool(str(dream_context or "").strip()),
             "dream_context_status": dream_context_status,
             "query_planner_debug": query_planner_debug or self._query_planner_debug_base(query),
@@ -6441,6 +6675,7 @@ class GatewayService:
             ],
             "context_mode": context_mode,
             "recalled_memory": recalled_memory,
+            "date_persona_trace": date_persona_trace,
             "targeted_memory_detail": targeted_memory_detail,
             "diffused_memory": related_memory,
             "dream_context": dream_context,

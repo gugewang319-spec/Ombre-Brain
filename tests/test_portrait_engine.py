@@ -11,6 +11,7 @@ from portrait_engine import DailyPortraitMaintainer
 async def test_daily_portrait_maintainer_writes_evidence_bound_state_only(tmp_path, test_config, bucket_mgr):
     evidence_id = await bucket_mgr.create(
         content=(
+            "开头原文有一点松动味道，不能只靠短 moment 丢掉。\n\n"
             "### moment\n\n"
             "小雨说最近在把新窗口 handoff 改成画像和近期状态，而不是塞一堆旧记忆。\n\n"
             "### assistant_reflection\n\n"
@@ -53,6 +54,7 @@ async def test_daily_portrait_maintainer_writes_evidence_bound_state_only(tmp_pa
             "moment",
             "assistant_reflection",
         ]
+        assert "开头原文有一点松动味道" in materials["buckets"][0]["source_excerpt"]
         return {
             "daily_summary": "小雨把换窗恢复方向定到画像和近期状态。",
             "add_recent": [

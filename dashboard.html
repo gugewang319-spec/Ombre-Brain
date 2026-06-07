@@ -1623,6 +1623,105 @@
     font-size: 12px;
     margin-bottom: 12px;
   }
+  .portrait-state-panel {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 14px;
+    margin-bottom: 24px;
+  }
+  .portrait-state-summary {
+    color: var(--text-dim);
+    font-size: 12px;
+    margin-bottom: 12px;
+  }
+  .portrait-state-meta,
+  .portrait-row-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .portrait-state-grid,
+  .portrait-candidate-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 10px;
+  }
+  .portrait-candidate-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    margin-top: 12px;
+  }
+  .portrait-scope,
+  .portrait-candidates {
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px;
+    background: var(--surface-solid);
+    min-width: 0;
+  }
+  .portrait-scope h3,
+  .portrait-candidates h3 {
+    color: var(--accent);
+    font-size: 13px;
+    font-weight: 600;
+    margin-bottom: 8px;
+  }
+  .portrait-layer {
+    border-top: 1px solid var(--border);
+    padding-top: 8px;
+    margin-top: 8px;
+  }
+  .portrait-layer-title {
+    color: var(--text-light);
+    font-size: 10px;
+    letter-spacing: 0.4px;
+    text-transform: uppercase;
+    margin-bottom: 6px;
+  }
+  .portrait-row {
+    padding: 7px 0;
+    border-top: 1px solid rgba(168, 147, 132, 0.18);
+    color: var(--text-dim);
+    font-size: 12px;
+  }
+  .portrait-row:first-of-type { border-top: none; }
+  .portrait-row-text {
+    color: var(--text);
+    line-height: 1.55;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+  .portrait-row-meta {
+    margin-top: 6px;
+  }
+  .portrait-evidence {
+    margin-top: 5px;
+    color: var(--text-light);
+    font-size: 11px;
+    line-height: 1.45;
+    overflow-wrap: anywhere;
+  }
+  .portrait-evidence button {
+    margin-left: 5px;
+    min-height: 22px;
+    padding: 1px 6px;
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    background: var(--surface);
+    color: var(--text-dim);
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 11px;
+  }
+  .portrait-evidence button:hover {
+    border-color: var(--border-strong);
+    color: var(--accent);
+  }
+  .portrait-empty {
+    color: var(--text-light);
+    font-size: 12px;
+    line-height: 1.5;
+  }
   .profile-proposal-panel {
     background: var(--surface);
     border: 1px solid var(--border);
@@ -1890,6 +1989,8 @@
     .profile-actions { justify-content: flex-start; min-width: 0; }
     .profile-meta-grid { grid-template-columns: 1fr; }
     .profile-proposal-form { grid-template-columns: 1fr; }
+    .portrait-state-grid,
+    .portrait-candidate-grid { grid-template-columns: 1fr; }
     .word-map-toolbar { align-items: flex-start; flex-direction: column; }
     .word-map-actions { justify-content: flex-start; }
     .word-map-grid { grid-template-columns: 1fr; }
@@ -2162,6 +2263,23 @@
 
 <div class="content" id="profile-view" style="display:none">
   <div class="profile-shell">
+    <div class="profile-toolbar">
+      <div>
+        <h2>Portrait State</h2>
+        <p>新窗口 handoff 当前使用的每日画像状态；只读，不写 profile_fact、anchor 或 Core Memory。</p>
+      </div>
+      <div class="profile-actions">
+        <button type="button" onclick="loadPortraitState()">刷新</button>
+        <button type="button" onclick="runPortraitMaintain()">手动生成</button>
+      </div>
+    </div>
+    <section class="portrait-state-panel" id="portrait-state-panel">
+      <div class="profile-proposal-message" id="portrait-maintain-message"></div>
+      <div class="portrait-state-summary" id="portrait-state-summary">加载中…</div>
+      <div id="portrait-state-content">
+        <div class="loading">加载 Portrait State…</div>
+      </div>
+    </section>
     <div class="profile-toolbar">
       <div>
         <h2>Profile Facts</h2>
@@ -2551,6 +2669,7 @@ const PATH_PREFIX = location.pathname.replace(/\/dashboard\/?$/, '');
 const BASE = location.origin + PATH_PREFIX;
 let allBuckets = [];
 let renderedBuckets = [];
+let portraitState = null;
 let profileFacts = [];
 let profileFactProposals = [];
 let anchorProposals = [];
@@ -2685,7 +2804,10 @@ document.querySelectorAll('.tab').forEach(tab => {
     if (target === 'reflection') renderReflectionReview();
     if (target === 'dreams') loadDreams();
     if (target === 'persona') loadPersona();
-    if (target === 'profile') loadProfileFacts();
+    if (target === 'profile') {
+      loadPortraitState();
+      loadProfileFacts();
+    }
     if (target === 'word-map') loadWordMap();
     if (target === 'network') loadNetwork();
     if (target === 'config') loadConfig();
@@ -2718,7 +2840,10 @@ async function loadBuckets() {
     renderBuckets(filterBuckets(allBuckets));
     if (getActiveTab() === 'reflection') renderReflectionReview();
     if (getActiveTab() === 'dreams') loadDreams();
-    if (getActiveTab() === 'profile') loadProfileFacts();
+    if (getActiveTab() === 'profile') {
+      loadPortraitState();
+      loadProfileFacts();
+    }
     if (getActiveTab() === 'word-map') loadWordMap();
   } catch (e) {
     document.getElementById('bucket-list').innerHTML = '<div class="loading">加载失败: ' + esc(e.message) + '</div>';
@@ -2930,6 +3055,185 @@ async function loadDreams() {
   } catch (e) {
     content.innerHTML = '<div class="loading">加载失败: ' + esc(e.message) + '</div>';
   }
+}
+
+function portraitRows(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+function portraitStatusChip(label, enabled) {
+  return '<span class="profile-chip ' + (enabled ? 'active' : 'deprecated') + '">' +
+    esc(label + ' ' + (enabled ? 'on' : 'off')) +
+  '</span>';
+}
+
+function setPortraitMaintainMessage(message, tone) {
+  var el = document.getElementById('portrait-maintain-message');
+  if (!el) return;
+  el.textContent = message || '';
+  el.classList.remove('ok', 'error');
+  if (tone) el.classList.add(tone);
+}
+
+async function loadPortraitState() {
+  var content = document.getElementById('portrait-state-content');
+  var summary = document.getElementById('portrait-state-summary');
+  if (!content || !summary) return;
+  content.innerHTML = '<div class="loading">加载 Portrait State…</div>';
+  summary.textContent = '读取中…';
+  try {
+    var res = await authFetch(BASE + '/api/portrait-state');
+    if (!res) return;
+    var data = await res.json().catch(function() { return {}; });
+    if (!res.ok) throw new Error(data.error || '加载失败');
+    portraitState = data;
+    renderPortraitState(data);
+  } catch (e) {
+    summary.textContent = '读取失败';
+    content.innerHTML = '<div class="loading">加载失败: ' + esc(e.message) + '</div>';
+  }
+}
+
+async function runPortraitMaintain() {
+  setPortraitMaintainMessage('生成中…', '');
+  try {
+    var res = await authFetch(BASE + '/api/portrait-maintain', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ force: true })
+    });
+    if (!res) return;
+    var data = await res.json().catch(function() { return {}; });
+    if (!res.ok) throw new Error(data.error || '生成失败');
+    var materials = data.materials || {};
+    var rejected = Array.isArray(data.rejected) ? data.rejected.length : Number(data.rejected_count || 0);
+    var parts = [
+      data.status || 'ok',
+      data.date || '',
+      'buckets ' + (materials.buckets == null ? '—' : materials.buckets),
+      'persona events ' + (materials.persona_events == null ? '—' : materials.persona_events),
+      'rejected ' + (Number.isFinite(rejected) ? rejected : 0)
+    ].filter(Boolean);
+    setPortraitMaintainMessage('已生成：' + parts.join(' · '), 'ok');
+    await loadPortraitState();
+  } catch (e) {
+    setPortraitMaintainMessage('生成失败: ' + e.message, 'error');
+  }
+}
+
+function renderPortraitState(data) {
+  var content = document.getElementById('portrait-state-content');
+  var summary = document.getElementById('portrait-state-summary');
+  if (!content || !summary) return;
+  var state = data || {};
+  var portrait = state.portrait || {};
+  summary.innerHTML = '<div class="portrait-state-meta">' +
+    '<span class="profile-chip">read only</span>' +
+    portraitStatusChip('engine', state.enabled !== false) +
+    portraitStatusChip('auto', state.auto_enabled !== false) +
+    portraitStatusChip('daily', state.daily_enabled !== false) +
+    '<span class="profile-chip">last run ' + esc(state.last_run_date || '—') + '</span>' +
+    '<span class="profile-chip">updated ' + esc(state.updated_at || '—') + '</span>' +
+    '<span class="profile-chip">state ' + esc(state.state_path || '—') + '</span>' +
+  '</div>';
+  content.innerHTML =
+    '<div class="portrait-state-grid">' +
+      renderPortraitScope('user', portrait.user || {}) +
+      renderPortraitScope('persona', portrait.persona || {}) +
+      renderPortraitScope('relationship', portrait.relationship || {}) +
+    '</div>' +
+    '<div class="portrait-candidate-grid">' +
+      renderPortraitCandidates('Stable Candidates', state.stable_candidates) +
+      renderPortraitCandidates('Profile Fact Candidates', state.profile_fact_candidates) +
+    '</div>';
+}
+
+function renderPortraitScope(scope, scopeState) {
+  var labels = {
+    user: 'User Portrait',
+    persona: 'Persona',
+    relationship: 'Relationship'
+  };
+  var stableRows = scopeState.stable ? [{
+    text: scopeState.stable,
+    evidence: scopeState.stable_evidence || [],
+    updated_at: scopeState.stable_updated_at || ''
+  }] : [];
+  var midRows = scopeState.mid_term ? [{
+    text: scopeState.mid_term,
+    evidence: scopeState.mid_term_evidence || [],
+    updated_at: scopeState.mid_term_updated_at || ''
+  }] : [];
+  return '<section class="portrait-scope">' +
+    '<h3>' + esc(labels[scope] || scope) + '</h3>' +
+    renderPortraitLayer('stable', stableRows, '还没有 stable portrait。') +
+    renderPortraitLayer('mid term', midRows, '还没有 mid-term portrait。') +
+    renderPortraitLayer('staging pool', portraitRows(scopeState.staging_pool).slice(0, 6), 'staging pool 为空。') +
+    renderPortraitLayer('recent buffer', portraitRows(scopeState.recent_buffer).slice(0, 6), 'recent buffer 为空。') +
+  '</section>';
+}
+
+function renderPortraitLayer(title, rows, emptyText) {
+  return '<div class="portrait-layer">' +
+    '<div class="portrait-layer-title">' + esc(title) + '</div>' +
+    renderPortraitRows(rows, emptyText) +
+  '</div>';
+}
+
+function renderPortraitRows(rows, emptyText) {
+  rows = portraitRows(rows);
+  if (!rows.length) return '<div class="portrait-empty">' + esc(emptyText || '没有记录。') + '</div>';
+  return rows.map(renderPortraitRow).join('');
+}
+
+function renderPortraitCandidates(title, candidates) {
+  var rows = portraitRows(candidates).slice(-8).reverse();
+  return '<section class="portrait-candidates">' +
+    '<h3>' + esc(title) + '</h3>' +
+    renderPortraitRows(rows, '没有候选。') +
+  '</section>';
+}
+
+function renderPortraitRow(item) {
+  item = item || {};
+  var text = item.text || item.summary || item.fact || item.reason || '';
+  var meta = [];
+  if (item.scope) meta.push(item.scope);
+  if (item.status) meta.push(item.status);
+  if (item.profile_kind) meta.push(item.profile_kind);
+  if (item.predicate) meta.push(item.predicate);
+  if (item.object) meta.push(item.object);
+  if (item.confidence != null) meta.push('confidence ' + Number(item.confidence || 0).toFixed(2));
+  if (item.count) meta.push('seen ' + item.count);
+  if (item.updated_at || item.last_seen_date || item.created_at) {
+    meta.push(item.updated_at || item.last_seen_date || item.created_at);
+  }
+  return '<div class="portrait-row">' +
+    '<div class="portrait-row-text">' + esc(text) + '</div>' +
+    (meta.length ? '<div class="portrait-row-meta">' + meta.map(function(part) {
+      return '<span class="profile-chip">' + esc(part) + '</span>';
+    }).join('') + '</div>' : '') +
+    renderPortraitEvidence(item.evidence) +
+  '</div>';
+}
+
+function renderPortraitEvidence(evidence) {
+  var rows = portraitRows(evidence).filter(function(item) {
+    return item && (item.bucket_id || item.moment_id || item.session_id);
+  });
+  if (!rows.length) return '';
+  var parts = rows.slice(0, 4).map(function(item) {
+    var bucketId = String(item.bucket_id || '');
+    var labels = [];
+    if (bucketId) labels.push('#' + bucketId);
+    if (item.moment_id) labels.push(item.moment_id);
+    if (item.session_id) labels.push('session ' + item.session_id);
+    var openButton = bucketId
+      ? '<button type="button" onclick="showDetail(\'' + jsString(bucketId) + '\')">打开证据</button>'
+      : '';
+    return esc(labels.join(' · ')) + openButton;
+  });
+  return '<div class="portrait-evidence">evidence: ' + parts.join(' / ') + '</div>';
 }
 
 async function loadProfileFacts() {

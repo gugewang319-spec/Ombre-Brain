@@ -11,6 +11,7 @@ from typing import Any
 from openai import AsyncOpenAI
 
 from identity import generic_identity_names, identity_names, render_identity_template
+from persona_event_selection import trim_persona_excerpt
 
 logger = logging.getLogger("ombre_brain.persona")
 
@@ -112,6 +113,7 @@ class PersonaStateEngine:
             0.0,
             float(self.persona_cfg.get("event_force_after_minutes", 30)),
         )
+        self.event_excerpt_chars = max(0, int(self.persona_cfg.get("event_excerpt_chars", 220)))
 
         self.default_personality = {
             "openness": 0.56,
@@ -229,6 +231,8 @@ class PersonaStateEngine:
                 residue TEXT,
                 inner_thought TEXT,
                 surface_trigger TEXT,
+                user_excerpt TEXT,
+                assistant_excerpt TEXT,
                 recalled_memory_ids TEXT,
                 tool_summary TEXT,
                 confidence REAL,
@@ -264,6 +268,8 @@ class PersonaStateEngine:
         self._ensure_column(conn, "persona_events", "residue", "TEXT")
         self._ensure_column(conn, "persona_events", "inner_thought", "TEXT")
         self._ensure_column(conn, "persona_events", "surface_trigger", "TEXT")
+        self._ensure_column(conn, "persona_events", "user_excerpt", "TEXT")
+        self._ensure_column(conn, "persona_events", "assistant_excerpt", "TEXT")
         self._ensure_column(conn, "persona_events", "recalled_memory_ids", "TEXT")
         self._ensure_column(conn, "persona_events", "tool_summary", "TEXT")
         conn.execute(
@@ -800,6 +806,8 @@ class PersonaStateEngine:
         now = self._format_time(self._now())
         message_hash = hashlib.sha256(user_message.encode("utf-8")).hexdigest()
         assistant_hash = hashlib.sha256(assistant_response.encode("utf-8")).hexdigest() if assistant_response else None
+        user_excerpt = trim_persona_excerpt(user_message, self.event_excerpt_chars)
+        assistant_excerpt = trim_persona_excerpt(assistant_response, self.event_excerpt_chars)
         conn = self._connect()
         conn.execute(
             """
@@ -807,9 +815,10 @@ class PersonaStateEngine:
             (profile_id, session_id, message_hash, exchange_hash, assistant_hash,
              event_type, perceived_intent, affect_delta, relationship_event,
              relationship_delta, personality_signal, personality_delta, mood_label,
-             reply_guidance, residue, inner_thought, surface_trigger, recalled_memory_ids, tool_summary, confidence,
+             reply_guidance, residue, inner_thought, surface_trigger, user_excerpt, assistant_excerpt,
+             recalled_memory_ids, tool_summary, confidence,
              raw_response, error, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 self.profile_id,
@@ -829,6 +838,8 @@ class PersonaStateEngine:
                 evaluation.get("residue"),
                 evaluation.get("inner_thought"),
                 evaluation.get("surface_trigger"),
+                user_excerpt,
+                assistant_excerpt,
                 json.dumps(recalled_memory_ids or [], ensure_ascii=False),
                 tool_summary,
                 evaluation.get("confidence"),
@@ -879,7 +890,7 @@ class PersonaStateEngine:
         rows = conn.execute(
             f"""
             SELECT id, session_id, message_hash, event_type, perceived_intent,
-                   surface_trigger, inner_thought,
+                   surface_trigger, inner_thought, user_excerpt, assistant_excerpt,
                    affect_delta, relationship_event, relationship_delta,
                    personality_signal, personality_delta, mood_label,
                    reply_guidance, residue, recalled_memory_ids, tool_summary,
@@ -902,6 +913,8 @@ class PersonaStateEngine:
                 "perceived_intent": row["perceived_intent"] or "",
                 "surface_trigger": row["surface_trigger"] or "",
                 "inner_thought": row["inner_thought"] or row["residue"] or "",
+                "user_excerpt": row["user_excerpt"] or "",
+                "assistant_excerpt": row["assistant_excerpt"] or "",
                 "affect_delta": self._json_dict(row["affect_delta"]),
                 "relationship_event": bool(row["relationship_event"]),
                 "relationship_delta": self._json_dict(row["relationship_delta"]),

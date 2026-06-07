@@ -689,6 +689,7 @@ async def test_reflect_daily_requires_five_memory_or_update_items(test_config):
 @pytest.mark.asyncio
 async def test_reflect_daily_persona_events_do_not_count_toward_minimum(test_config):
     cfg = _no_api_config(test_config)
+    cfg["reflection"]["persona_events_limit"] = 1
     bucket_mgr = BucketManager(cfg)
     engine = ReflectionEngine(cfg)
     await _create_daily_memories(bucket_mgr, count=4)
@@ -698,13 +699,27 @@ async def test_reflect_daily_persona_events_do_not_count_toward_minimum(test_con
         def _list_events(self, limit: int) -> list[dict]:
             return [
                 {
+                    "id": 1,
                     "mood_label": "soft",
                     "perceived_intent": "补充关系天气",
+                    "surface_trigger": "小雨说今天很想被记住",
+                    "inner_thought": "想把这点温度留下",
                     "residue": "只作为补充",
+                    "user_excerpt": "哥哥今天要记得我",
+                    "assistant_excerpt": "我记得。",
                     "relationship_event": True,
                     "confidence": 0.8,
                     "created_at": "2026-05-21T18:00:00+08:00",
-                }
+                },
+                {
+                    "id": 2,
+                    "mood_label": "soft",
+                    "perceived_intent": "补充关系天气",
+                    "surface_trigger": "小雨又说今天很想被记住",
+                    "relationship_event": True,
+                    "confidence": 0.7,
+                    "created_at": "2026-05-21T18:10:00+08:00",
+                },
             ]
 
     result = await engine.reflect("daily", bucket_mgr, persona_engine=PersonaEvents(), force=True, now=now)

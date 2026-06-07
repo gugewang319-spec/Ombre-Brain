@@ -286,6 +286,10 @@ gateway:
   inject_total_budget: 1200
   core_memory_budget: 0
   recent_context_budget: 300
+  date_persona_trace_enabled: true   # date words like 昨天/昨晚 add small same-day persona/original-turn trace
+  date_persona_trace_budget: 220
+  date_persona_trace_max_events: 5
+  date_persona_trace_include_daily: true
   recalled_memory_budget: 400
   direct_render_mode: auto   # auto | compact | full; direct/recalled display shape
   retrieval_mode: graph       # graph | bucket; bucket skips moment graph diffusion
@@ -433,6 +437,7 @@ persona:
   event_affect_single_threshold: 0.14
   event_similarity_threshold: 0.82
   event_force_after_minutes: 30
+  event_excerpt_chars: 220          # short evidence snippets for future date traces, not full transcripts
   initial_personality:
     openness: 0.56
     conscientiousness: 0.50
@@ -481,6 +486,8 @@ reflection:
   max_tokens: 700
   timezone: "Asia/Shanghai"
   daily_hour: 4                   # generate daily impression after this local hour
+  persona_events_limit: 12         # selected and deduped; persona events supplement daily weather only
+  persona_events_scan_limit: 80
   weekly_enabled: false            # weekly impressions are off by default; daily impressions remain
   weekly_day: 0                   # 0=Monday, 6=Sunday; auto run writes the previous week
   weekly_hour: 4

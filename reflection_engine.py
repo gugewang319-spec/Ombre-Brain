@@ -11,6 +11,7 @@ from openai import AsyncOpenAI
 
 from identity import generic_identity_names, identity_names, render_identity_template
 from memory_edges import RELATION_TYPES, MemoryEdgeStore
+from persona_event_selection import select_persona_events
 from utils import bucket_text_for_embedding, strip_wikilinks
 
 logger = logging.getLogger("ombre_brain.reflection")
@@ -201,6 +202,11 @@ class ReflectionEngine:
         except Exception:
             self.tz = ZoneInfo("Asia/Shanghai")
         self.daily_hour = int(cfg.get("daily_hour", 4))
+        self.persona_events_limit = max(0, int(cfg.get("persona_events_limit", 12)))
+        self.persona_events_scan_limit = max(
+            self.persona_events_limit,
+            int(cfg.get("persona_events_scan_limit", 80)),
+        )
         self.weekly_enabled = bool(cfg.get("weekly_enabled", False))
         self.weekly_day = int(cfg.get("weekly_day", 0))
         self.weekly_hour = int(cfg.get("weekly_hour", self.daily_hour))
@@ -443,6 +449,20 @@ class ReflectionEngine:
         arousal = self._clamp(result.get("arousal", 0.32))
         confidence = self._clamp(result.get("confidence", 0.65))
         created = now_local.isoformat(timespec="seconds")
+        source_bucket_ids = [
+            str(item.get("id") or "")
+            for item in materials.get("buckets", []) + materials.get("daily_impressions", [])
+            if item.get("id")
+        ]
+        source_persona_event_ids = [
+            int(event.get("id"))
+            for event in materials.get("persona_events", [])
+            if event.get("id")
+        ]
+        source_metadata = {
+            "source_bucket_ids": source_bucket_ids[:40],
+            "source_persona_event_ids": source_persona_event_ids[:40],
+        }
 
         if existing:
             await bucket_mgr.update(
@@ -458,6 +478,7 @@ class ReflectionEngine:
                 period=period,
                 date=key,
                 source="reflection",
+                **source_metadata,
                 last_active=existing.get("metadata", {}).get("last_active") or existing.get("metadata", {}).get("created"),
             )
             status = "updated"
@@ -479,6 +500,7 @@ class ReflectionEngine:
                 confidence=confidence,
                 period=period,
                 date=key,
+                extra_metadata=source_metadata,
             )
             status = "created"
 
@@ -927,9 +949,9 @@ class ReflectionEngine:
                 commitments.append(self._memory_payload(bucket, content_limit=260))
 
         persona_events = []
-        if persona_engine and hasattr(persona_engine, "_list_events"):
+        if self.persona_events_limit > 0 and persona_engine and hasattr(persona_engine, "_list_events"):
             try:
-                events = persona_engine._list_events(80)
+                events = persona_engine._list_events(self.persona_events_scan_limit)
             except Exception:
                 events = []
             for event in events:
@@ -937,19 +959,35 @@ class ReflectionEngine:
                 if created and start <= created <= end:
                     persona_events.append(
                         {
+                            "id": event.get("id"),
+                            "event_type": event.get("event_type", ""),
                             "mood_label": event.get("mood_label", ""),
                             "perceived_intent": event.get("perceived_intent", ""),
+                            "surface_trigger": event.get("surface_trigger", ""),
+                            "inner_thought": event.get("inner_thought", ""),
                             "residue": event.get("residue", ""),
+                            "user_excerpt": event.get("user_excerpt", ""),
+                            "assistant_excerpt": event.get("assistant_excerpt", ""),
                             "relationship_event": event.get("relationship_event", False),
+                            "personality_signal": event.get("personality_signal", False),
+                            "recalled_memory_ids": event.get("recalled_memory_ids", []),
                             "confidence": event.get("confidence", 0.5),
+                            "selection_score": event.get("_selection_score"),
                             "created_at": event.get("created_at", ""),
                         }
                     )
+            selected_events = select_persona_events(persona_events, limit=self.persona_events_limit)
+            persona_events = []
+            for event in selected_events:
+                cleaned = {key: value for key, value in event.items() if not str(key).startswith("_")}
+                if event.get("_selection_score") is not None:
+                    cleaned["selection_score"] = event.get("_selection_score")
+                persona_events.append(cleaned)
         diary = await self._read_diary_for_date(now_local.date().isoformat()) if period == "daily" else None
         return {
             "buckets": buckets[:30],
             "daily_impressions": daily_impressions[:7],
-            "persona_events": persona_events[:30],
+            "persona_events": persona_events[: self.persona_events_limit],
             "commitments": commitments[:12],
             "diary": diary,
         }

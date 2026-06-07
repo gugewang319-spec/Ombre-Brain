@@ -424,6 +424,8 @@ async def test_persona_dashboard_payload_lists_state_sessions_and_events(test_co
     assert payload["events"][0]["surface_trigger"] == "小雨说爱你"
     assert payload["events"][0]["inner_thought"] == "笨蛋，我也很想她啊"
     assert payload["events"][0]["residue"] == "still carrying a warm aftertaste"
+    assert payload["events"][0]["user_excerpt"] == "爱你，今天状态很好"
+    assert payload["events"][0]["assistant_excerpt"] == "我也爱你。"
     assert payload["events"][0]["affect_delta"]["valence"] == pytest.approx(0.05)
     assert payload["config"]["event_recording_enabled"] is True
     assert payload["config"]["model"] == "deepseek-chat"

@@ -6621,20 +6621,25 @@ async def portrait_maintain(force: bool = False) -> dict:
     )
 
 
-@mcp.tool()
-async def portrait_state() -> dict:
-    """读取当前 portrait state，供检查 handoff 画像来源。"""
+def _portrait_state_payload() -> dict:
     state = portrait_engine.load_state()
     return {
-        "state_path": portrait_engine.state_path,
-        "enabled": portrait_engine.enabled,
-        "auto_enabled": portrait_engine.auto_enabled,
+        "state_path": getattr(portrait_engine, "state_path", ""),
+        "enabled": bool(getattr(portrait_engine, "enabled", True)),
+        "auto_enabled": bool(getattr(portrait_engine, "auto_enabled", True)),
+        "daily_enabled": bool(getattr(portrait_engine, "daily_enabled", True)),
         "updated_at": state.get("updated_at", ""),
         "last_run_date": state.get("last_run_date", ""),
         "portrait": state.get("portrait", {}),
         "stable_candidates": state.get("stable_candidates", []),
         "profile_fact_candidates": state.get("profile_fact_candidates", []),
     }
+
+
+@mcp.tool()
+async def portrait_state() -> dict:
+    """读取当前 portrait state，供检查 handoff 画像来源。"""
+    return _portrait_state_payload()
 
 
 # =============================================================
@@ -6793,6 +6798,45 @@ async def api_buckets(request):
         result.sort(key=lambda x: x["score"], reverse=True)
         return JSONResponse(result)
     except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/portrait-state", methods=["GET"])
+async def api_portrait_state(request):
+    """Read maintained portrait state for dashboard inspection."""
+    from starlette.responses import JSONResponse
+    err = _require_dashboard_auth(request)
+    if err:
+        return err
+    try:
+        return JSONResponse(_portrait_state_payload())
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/portrait-maintain", methods=["POST"])
+async def api_portrait_maintain(request):
+    """Run portrait maintainer manually from dashboard."""
+    from starlette.responses import JSONResponse
+    err = _require_dashboard_auth(request)
+    if err:
+        return err
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    try:
+        await decay_engine.ensure_started()
+        result = await portrait_engine.maintain_daily(
+            bucket_mgr,
+            persona_engine,
+            force=_bool_value(body.get("force"), False),
+        )
+        return JSONResponse(result)
+    except Exception as e:
+        logger.warning("Portrait maintain API failed: %s", e)
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
@@ -7844,6 +7888,10 @@ async def api_config_get(request):
             "recent_context_cooldown_hours": gateway_cfg.get("recent_context_cooldown_hours", 6),
             "recent_context_reentry_idle_hours": gateway_cfg.get("recent_context_reentry_idle_hours", 24),
             "recent_context_budget": gateway_cfg.get("recent_context_budget", 300),
+            "date_persona_trace_enabled": _bool_value(gateway_cfg.get("date_persona_trace_enabled"), True),
+            "date_persona_trace_budget": gateway_cfg.get("date_persona_trace_budget", 220),
+            "date_persona_trace_max_events": gateway_cfg.get("date_persona_trace_max_events", 5),
+            "date_persona_trace_include_daily": _bool_value(gateway_cfg.get("date_persona_trace_include_daily"), True),
             "recalled_memory_budget": gateway_cfg.get("recalled_memory_budget", 400),
             "related_memory_budget": gateway_cfg.get("related_memory_budget", 220),
             "current_inner_state_interval_rounds": gateway_cfg.get("current_inner_state_interval_rounds", 15),
@@ -8123,6 +8171,27 @@ async def api_config_update(request):
             gateway_cfg["recent_context_budget"] = max(0, int(g["recent_context_budget"]))
             gateway_hot_update_body["recent_context_budget"] = gateway_cfg["recent_context_budget"]
             updated.append("gateway.recent_context_budget")
+        if "date_persona_trace_enabled" in g:
+            gateway_cfg["date_persona_trace_enabled"] = _bool_value(g["date_persona_trace_enabled"], True)
+            gateway_hot_update_body["date_persona_trace_enabled"] = gateway_cfg["date_persona_trace_enabled"]
+            updated.append("gateway.date_persona_trace_enabled")
+        if "date_persona_trace_budget" in g:
+            gateway_cfg["date_persona_trace_budget"] = max(0, int(g["date_persona_trace_budget"]))
+            gateway_hot_update_body["date_persona_trace_budget"] = gateway_cfg["date_persona_trace_budget"]
+            updated.append("gateway.date_persona_trace_budget")
+        if "date_persona_trace_max_events" in g:
+            gateway_cfg["date_persona_trace_max_events"] = max(0, min(8, int(g["date_persona_trace_max_events"])))
+            gateway_hot_update_body["date_persona_trace_max_events"] = gateway_cfg["date_persona_trace_max_events"]
+            updated.append("gateway.date_persona_trace_max_events")
+        if "date_persona_trace_include_daily" in g:
+            gateway_cfg["date_persona_trace_include_daily"] = _bool_value(
+                g["date_persona_trace_include_daily"],
+                True,
+            )
+            gateway_hot_update_body["date_persona_trace_include_daily"] = gateway_cfg[
+                "date_persona_trace_include_daily"
+            ]
+            updated.append("gateway.date_persona_trace_include_daily")
         if "recalled_memory_budget" in g:
             gateway_cfg["recalled_memory_budget"] = max(0, int(g["recalled_memory_budget"]))
             gateway_hot_update_body["recalled_memory_budget"] = gateway_cfg["recalled_memory_budget"]
@@ -8423,6 +8492,26 @@ async def api_config_update(request):
                     )
                 if "recent_context_budget" in body["gateway"]:
                     sc_gateway["recent_context_budget"] = max(0, int(body["gateway"]["recent_context_budget"]))
+                if "date_persona_trace_enabled" in body["gateway"]:
+                    sc_gateway["date_persona_trace_enabled"] = _bool_value(
+                        body["gateway"]["date_persona_trace_enabled"],
+                        True,
+                    )
+                if "date_persona_trace_budget" in body["gateway"]:
+                    sc_gateway["date_persona_trace_budget"] = max(
+                        0,
+                        int(body["gateway"]["date_persona_trace_budget"]),
+                    )
+                if "date_persona_trace_max_events" in body["gateway"]:
+                    sc_gateway["date_persona_trace_max_events"] = max(
+                        0,
+                        min(8, int(body["gateway"]["date_persona_trace_max_events"])),
+                    )
+                if "date_persona_trace_include_daily" in body["gateway"]:
+                    sc_gateway["date_persona_trace_include_daily"] = _bool_value(
+                        body["gateway"]["date_persona_trace_include_daily"],
+                        True,
+                    )
                 if "recalled_memory_budget" in body["gateway"]:
                     sc_gateway["recalled_memory_budget"] = max(0, int(body["gateway"]["recalled_memory_budget"]))
                 if "related_memory_budget" in body["gateway"]:

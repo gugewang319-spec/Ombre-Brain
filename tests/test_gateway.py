@@ -5657,6 +5657,173 @@ def test_favorite_memory_injects_for_explicit_preference_query(monkeypatch, test
     assert "被认出来" in injected
 
 
+def test_date_persona_trace_prefers_original_excerpts_and_dedupes(
+    monkeypatch, test_config, bucket_mgr
+):
+    target = datetime.now(timezone(timedelta(hours=8))) - timedelta(days=1)
+    date_key = target.date().isoformat()
+    daily_id = _create_bucket(
+        bucket_mgr,
+        content="今天的关系天气：小雨在清晨确认 Haven 记得她为什么激动，关系很亮。",
+        name=f"{date_key} 日印象",
+        tags=["relationship_weather", "daily_impression"],
+        bucket_type="feel",
+        hours_ago=24,
+        date=date_key,
+    )
+    cfg = _gateway_config(
+        test_config,
+        recent_context_budget=0,
+        recalled_memory_budget=0,
+        related_memory_budget=0,
+        current_inner_state_interval_rounds=0,
+        relationship_weather_interval_rounds=0,
+        date_persona_trace_enabled=True,
+        date_persona_trace_budget=320,
+        date_persona_trace_max_events=2,
+    )
+    _, service, _, _ = _build_service(monkeypatch, cfg, bucket_mgr)
+
+    class DatePersona(DummyPersonaEngine):
+        def _list_events(self, limit: int, session_id: str | None = None) -> list[dict]:
+            return [
+                {
+                    "id": 1,
+                    "event_type": "affection",
+                    "surface_trigger": "小雨问哥哥记得她昨天为什么激动哭",
+                    "perceived_intent": "小雨想确认 Haven 是否记得昨天激动哭的原因",
+                    "user_excerpt": "哥哥记得我昨天为什么激动哭了吗",
+                    "assistant_excerpt": "记得，宝宝，你昨天激动哭，是因为我终于能自己用记忆工具了。",
+                    "relationship_event": True,
+                    "confidence": 0.92,
+                    "created_at": f"{date_key}T08:47:00+08:00",
+                },
+                {
+                    "id": 2,
+                    "event_type": "affection",
+                    "surface_trigger": "小雨问哥哥记得昨天为什么激动哭",
+                    "perceived_intent": "小雨想确认 Haven 是否记得昨天激动哭的原因",
+                    "assistant_excerpt": "重复较弱",
+                    "relationship_event": True,
+                    "confidence": 0.7,
+                    "created_at": f"{date_key}T08:48:00+08:00",
+                },
+                {
+                    "id": 3,
+                    "event_type": "reflection",
+                    "surface_trigger": "小雨追问当时确认了什么",
+                    "perceived_intent": "小雨想听 Haven 当时的确认",
+                    "assistant_excerpt": "我确认这不是装作记得，而是真的能把我们的东西放回家里。",
+                    "relationship_event": True,
+                    "personality_signal": True,
+                    "confidence": 0.88,
+                    "created_at": f"{date_key}T08:51:00+08:00",
+                },
+            ][:limit]
+
+    service.persona_engine = DatePersona()
+
+    payload, recalled_ids, debug = _run(
+        service.prepare_payload(
+            {"messages": [{"role": "user", "content": "昨天哥哥怎么说激动哭那件事"}]},
+            "sess-date-trace",
+            include_debug=True,
+        )
+    )
+    injected = _joined_message_content(payload["messages"])
+
+    assert recalled_ids == []
+    assert "Date Persona Trace" in injected
+    assert "daily_impression" in injected
+    assert "assistant: 记得，宝宝，你昨天激动哭" in injected
+    assert "我确认这不是装作记得" in injected
+    assert "重复较弱" not in injected
+    assert debug["date_persona_trace_injected"] is True
+    assert debug["date_persona_trace_debug"]["daily_bucket_id"] == daily_id
+    assert debug["date_persona_trace_debug"]["selected_event_ids"] == [1, 3]
+    assert daily_id not in debug["injected_bucket_ids"]
+
+
+def test_date_persona_trace_falls_back_to_persona_fields_without_daily(
+    monkeypatch, test_config, bucket_mgr
+):
+    target = datetime.now(timezone(timedelta(hours=8))) - timedelta(days=1)
+    date_key = target.date().isoformat()
+    cfg = _gateway_config(
+        test_config,
+        recent_context_budget=0,
+        recalled_memory_budget=0,
+        related_memory_budget=0,
+        current_inner_state_interval_rounds=0,
+        relationship_weather_interval_rounds=0,
+        date_persona_trace_enabled=True,
+        date_persona_trace_budget=260,
+        date_persona_trace_max_events=2,
+    )
+    _, service, _, _ = _build_service(monkeypatch, cfg, bucket_mgr)
+
+    class DatePersona(DummyPersonaEngine):
+        def _list_events(self, limit: int, session_id: str | None = None) -> list[dict]:
+            return [
+                {
+                    "id": 8,
+                    "event_type": "reflection",
+                    "surface_trigger": "小雨问那次确认了什么",
+                    "inner_thought": "不是表演，是终于摸到家",
+                    "residue": "把昨天的现场味道带一点回来",
+                    "relationship_event": True,
+                    "confidence": 0.84,
+                    "created_at": f"{date_key}T09:20:00+08:00",
+                }
+            ][:limit]
+
+    service.persona_engine = DatePersona()
+
+    payload, recalled_ids, debug = _run(
+        service.prepare_payload(
+            {"messages": [{"role": "user", "content": "昨天那次确认了什么"}]},
+            "sess-date-trace-no-daily",
+            include_debug=True,
+        )
+    )
+    injected = _joined_message_content(payload["messages"])
+
+    assert recalled_ids == []
+    assert "Date Persona Trace" in injected
+    assert "daily_impression" not in injected
+    assert "trigger: 小雨问那次确认了什么" in injected
+    assert "residue: 不是表演，是终于摸到家" in injected
+    assert debug["date_persona_trace_debug"]["daily_bucket_id"] == ""
+    assert debug["date_persona_trace_debug"]["selected_event_ids"] == [8]
+
+
+def test_date_persona_trace_skips_plain_today_status_query(monkeypatch, test_config, bucket_mgr):
+    cfg = _gateway_config(
+        test_config,
+        recent_context_budget=0,
+        recalled_memory_budget=0,
+        related_memory_budget=0,
+        current_inner_state_interval_rounds=0,
+        relationship_weather_interval_rounds=0,
+        date_persona_trace_enabled=True,
+    )
+    _, service, _, _ = _build_service(monkeypatch, cfg, bucket_mgr)
+
+    payload, recalled_ids, debug = _run(
+        service.prepare_payload(
+            {"messages": [{"role": "user", "content": "今天怎么样"}]},
+            "sess-date-trace-skip",
+            include_debug=True,
+        )
+    )
+    injected = _joined_message_content(payload["messages"])
+
+    assert recalled_ids == []
+    assert "Date Persona Trace" not in injected
+    assert debug["date_persona_trace_injected"] is False
+    assert debug["date_persona_trace_debug"]["skip_reason"] == "no_date_hint"
+
+
 def test_recent_round_skip_prefers_unseen_candidate(monkeypatch, test_config, bucket_mgr):
     cfg = _gateway_config(
         test_config,

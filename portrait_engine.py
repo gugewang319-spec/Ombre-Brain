@@ -61,7 +61,7 @@ PORTRAIT_PROMPT_TEMPLATE = """你是 {ai_name}，正在维护你和 {user_displa
 - profile_fact_candidate 只提候选，不确认、不写入长期 profile_fact。
 - stable_candidate 只提候选，不直接覆盖 stable portrait。
 - rewrite_mid_term 只能综合 staging_pool 里的观察，或本次明确 move_to_staging 的观察；不要直接把当天新材料写成 mid_term。
-- memory_materials 已经是短摘要、路径、tags、created 日期和关键 moment/reflection 片段；不要要求更长正文。
+- memory_materials 含路径、tags、created 日期、关键 moment/reflection 片段，以及 source_excerpt 原文短摘；优先读证据原味，不要要求更长正文。
 - 每条 add/rewrite/candidate 都必须带 evidence；没有证据就放 skip。
 - 输出 JSON 对象，不要 markdown，不要解释。"""
 
@@ -96,6 +96,7 @@ class DailyPortraitMaintainer:
         )
         self.material_limit = max(1, int(cfg.get("material_limit", 18)))
         self.first_run_material_limit = max(self.material_limit, int(cfg.get("first_run_material_limit", 80)))
+        self.source_excerpt_chars = max(1, int(cfg.get("source_excerpt_chars", 900)))
         self.persona_events_limit = max(0, int(cfg.get("persona_events_limit", 12)))
         self.recent_buffer_max = max(1, int(cfg.get("recent_buffer_max", 24)))
         self.staging_pool_max = max(1, int(cfg.get("staging_pool_max", 24)))
@@ -632,8 +633,9 @@ class DailyPortraitMaintainer:
         meta = bucket.get("metadata", {}) if isinstance(bucket.get("metadata"), dict) else {}
         key_sections = self._extract_key_sections(str(bucket.get("content") or ""))
         text = self._format_key_sections(key_sections)
+        source_excerpt = self._clip(strip_wikilinks(bucket_text_for_embedding(bucket)), self.source_excerpt_chars)
         if not text:
-            text = self._clip(bucket_text_for_embedding(bucket), 600)
+            text = source_excerpt
         return {
             "bucket_id": str(bucket.get("id") or meta.get("id") or ""),
             "name": str(meta.get("name") or bucket.get("id") or ""),
@@ -649,6 +651,7 @@ class DailyPortraitMaintainer:
             "confidence": self._clamp(meta.get("confidence"), 0.55),
             "key_sections": key_sections,
             "text": self._clip(strip_wikilinks(text), 700),
+            "source_excerpt": source_excerpt,
         }
 
     def _persona_event_materials(self, persona_engine, start: datetime, end: datetime, *, initial: bool) -> list[dict]:

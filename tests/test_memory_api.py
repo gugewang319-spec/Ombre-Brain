@@ -2803,6 +2803,97 @@ async def test_config_get_reports_portrait_api_values(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_api_portrait_state_reports_readonly_state(monkeypatch, tmp_path):
+    import server
+
+    state_path = str(tmp_path / "portrait_state.json")
+    state = {
+        "updated_at": "2026-06-07T12:00:00+00:00",
+        "last_run_date": "2026-06-07",
+        "portrait": {
+            "user": {
+                "recent_buffer": [
+                    {
+                        "text": "小雨正在看 portrait dashboard。",
+                        "evidence": [{"bucket_id": "bucket-user"}],
+                    }
+                ],
+                "staging_pool": [],
+                "mid_term": "",
+                "stable": "",
+            },
+            "persona": {"recent_buffer": [], "staging_pool": [], "mid_term": "", "stable": ""},
+            "relationship": {"recent_buffer": [], "staging_pool": [], "mid_term": "", "stable": ""},
+        },
+        "stable_candidates": [{"scope": "relationship", "text": "候选稳定画像", "status": "candidate"}],
+        "profile_fact_candidates": [{"scope": "user", "text": "候选画像事实", "status": "candidate"}],
+    }
+    monkeypatch.setattr(server, "_require_dashboard_auth", lambda request: None)
+    monkeypatch.setattr(
+        server,
+        "portrait_engine",
+        SimpleNamespace(
+            enabled=True,
+            auto_enabled=False,
+            daily_enabled=True,
+            state_path=state_path,
+            load_state=lambda: state,
+        ),
+    )
+
+    response = await server.api_portrait_state(DummyRequest())
+    payload = json.loads(response.body)
+
+    assert response.status_code == 200
+    assert payload["state_path"] == state_path
+    assert payload["enabled"] is True
+    assert payload["auto_enabled"] is False
+    assert payload["daily_enabled"] is True
+    assert payload["updated_at"] == "2026-06-07T12:00:00+00:00"
+    assert payload["last_run_date"] == "2026-06-07"
+    assert payload["portrait"]["user"]["recent_buffer"][0]["evidence"][0]["bucket_id"] == "bucket-user"
+    assert payload["stable_candidates"][0]["text"] == "候选稳定画像"
+    assert payload["profile_fact_candidates"][0]["text"] == "候选画像事实"
+
+
+@pytest.mark.asyncio
+async def test_api_portrait_maintain_runs_force_refresh(monkeypatch):
+    import server
+
+    calls = []
+
+    class FakeDecayEngine:
+        async def ensure_started(self):
+            calls.append(("decay", None))
+
+    class FakePortraitEngine:
+        async def maintain_daily(self, bucket_mgr, persona_engine, *, force=False):
+            calls.append(("maintain", force, bucket_mgr, persona_engine))
+            return {
+                "status": "updated",
+                "date": "2026-06-07",
+                "materials": {"buckets": 2, "persona_events": 1},
+                "rejected": [],
+            }
+
+    fake_bucket_mgr = object()
+    fake_persona_engine = object()
+    monkeypatch.setattr(server, "_require_dashboard_auth", lambda request: None)
+    monkeypatch.setattr(server, "decay_engine", FakeDecayEngine())
+    monkeypatch.setattr(server, "portrait_engine", FakePortraitEngine())
+    monkeypatch.setattr(server, "bucket_mgr", fake_bucket_mgr)
+    monkeypatch.setattr(server, "persona_engine", fake_persona_engine)
+
+    response = await server.api_portrait_maintain(DummyRequest(body={"force": True}))
+    payload = json.loads(response.body)
+
+    assert response.status_code == 200
+    assert payload["status"] == "updated"
+    assert calls[0] == ("decay", None)
+    assert calls[1] == ("maintain", True, fake_bucket_mgr, fake_persona_engine)
+
+
+@pytest.mark.asyncio
 async def test_config_get_reports_reflection_affect_anchor_switches(monkeypatch):
     import server
 
