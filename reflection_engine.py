@@ -1436,7 +1436,7 @@ class ReflectionEngine:
         if extras:
             line = f"{line} · {' · '.join(extras)}"
         block = (
-            f"{AFFECT_ANCHOR_HEADER}\n\n"
+            f"{AFFECT_ANCHOR_HEADER}\n"
             f"> {line}"
         )
         base = str(content or "").rstrip()

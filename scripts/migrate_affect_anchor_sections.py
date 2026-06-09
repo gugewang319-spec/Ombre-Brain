@@ -436,9 +436,15 @@ def maybe_add_body_only_moment(bucket: dict[str, Any], sections: list[Section], 
     mode = str(mode or "skip").strip().lower()
     if mode in {"skip", "wrap"}:
         return False
-    if any(section.heading_line for section in sections) or len(sections) != 1:
+    # Find the unheaded body section (first section with no heading)
+    body_index = None
+    for i, section in enumerate(sections):
+        if not section.heading_line and any(item.strip() for item in section.lines):
+            body_index = i
+            break
+    if body_index is None:
         return False
-    body = sections[0].text()
+    body = sections[body_index].text()
     if not body:
         return False
     if mode == "title":
@@ -449,7 +455,9 @@ def maybe_add_body_only_moment(bucket: dict[str, Any], sections: list[Section], 
         raise ValueError(f"unknown body_only_moment mode: {mode}")
     if not moment or is_loose_duplicate(moment, "\n\n".join(section.text() for section in sections if section.canonical == "moment")):
         return False
-    sections.append(Section("### moment", "moment", paragraphs_to_lines([moment])))
+    # Insert moment section after the body section
+    moment_section = Section("### moment", "moment", paragraphs_to_lines([moment]))
+    sections.insert(body_index + 1, moment_section)
     return True
 
 
