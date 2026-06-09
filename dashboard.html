@@ -5686,6 +5686,12 @@ async function saveConfig(persist, persistEnv) {
       base_url: document.getElementById('cfg-dream-url').value,
     };
     candidate.reflection = {
+      enabled: document.getElementById('cfg-reflection-enabled').value === 'true',
+      auto_enabled: document.getElementById('cfg-reflection-auto').value === 'true',
+      daily_enabled: document.getElementById('cfg-reflection-daily').value === 'true',
+      memory_affect_anchor_enabled: document.getElementById('cfg-reflection-memory-anchor').value === 'true',
+      relationship_weather_affect_anchor_enabled: document.getElementById('cfg-reflection-weather-anchor').value === 'true',
+      model: document.getElementById('cfg-reflection-model').value,
       base_url: document.getElementById('cfg-reflection-url').value,
     };
     candidate.portrait = {
