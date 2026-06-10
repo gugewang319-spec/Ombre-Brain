@@ -1060,14 +1060,7 @@ class DailyPortraitMaintainer:
             ),
             reverse=True,
         )
-        deduped = []
-        seen = set()
-        for row in rows:
-            key = (self._norm(row.get("text", "")), str(row.get("scope") or ""))
-            if key in seen:
-                continue
-            seen.add(key)
-            deduped.append(row)
+        deduped = self._dedupe_recent_timeline_rows(rows)
         return deduped[: self.recent_timeline_max]
 
     def _timeline_timestamp_for_evidence(
@@ -1504,6 +1497,7 @@ class DailyPortraitMaintainer:
                 ),
                 reverse=True,
             )
+            day_rows = self._dedupe_recent_timeline_rows(day_rows)
             day_limit = max(1, max_items - reserved_old_days) if day_index == 0 else 1
             char_limit = 150 if day_index == 0 else 100
             for row in day_rows[:day_limit]:
@@ -1518,6 +1512,38 @@ class DailyPortraitMaintainer:
             if emitted >= max_items:
                 break
         return "\n".join(dict.fromkeys(line for line in lines if line.strip()))
+
+    def _dedupe_recent_timeline_rows(self, rows: list[dict]) -> list[dict]:
+        deduped = []
+        seen_text = set()
+        seen_events = set()
+        for row in rows:
+            text_key = (self._norm(row.get("text", "")), str(row.get("scope") or ""))
+            if text_key[0] and text_key in seen_text:
+                continue
+            event_key = self._timeline_event_key(row)
+            if event_key and event_key in seen_events:
+                continue
+            seen_text.add(text_key)
+            if event_key:
+                seen_events.add(event_key)
+            deduped.append(row)
+        return deduped
+
+    def _timeline_event_key(self, row: dict) -> tuple:
+        evidence = self._dedupe_evidence(row.get("evidence", []))
+        ids = []
+        for item in evidence:
+            bucket_id = str(item.get("bucket_id") or "").strip()
+            session_id = str(item.get("session_id") or "").strip()
+            if bucket_id:
+                ids.append(("bucket", bucket_id))
+            if session_id:
+                ids.append(("session", session_id))
+        if not ids:
+            return ()
+        time_key = str(row.get("timestamp") or row.get("time_label") or row.get("source_date") or "").strip()
+        return (time_key, tuple(sorted(set(ids))))
 
     def _recent_timeline_scope_label(self, scope: str) -> str:
         return {

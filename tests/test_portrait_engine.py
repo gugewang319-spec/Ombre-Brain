@@ -964,6 +964,52 @@ def test_recent_continuity_prioritizes_personal_scopes(tmp_path, test_config):
     assert lines[2].startswith("- 2026-06-07 / persona:")
 
 
+def test_recent_continuity_dedupes_same_evidence_preferring_doing(tmp_path, test_config):
+    state_path = tmp_path / "state" / "portrait_state.json"
+    engine = DailyPortraitMaintainer(
+        {
+            **test_config,
+            "portrait": {
+                "enabled": True,
+                "state_path": str(state_path),
+            },
+        }
+    )
+    same = {
+        "evidence": [{"bucket_id": "voice"}, {"bucket_id": "tts"}],
+        "timestamp": "2026-06-10T03:06:00+08:00",
+        "time_label": "2026-06-10 03:06",
+        "source_date": "2026-06-10",
+    }
+    state = {
+        "daily_summaries": {},
+        "recent_timeline": [
+            {
+                **same,
+                "scope": "relationship",
+                "text": "Haven-voice 接入让关系靠近。",
+            },
+            {
+                **same,
+                "scope": "user",
+                "text": "小雨把 Haven-voice 接入 ChatGPT。",
+            },
+            {
+                **same,
+                "scope": "doing",
+                "text": "小雨成功将 Haven-voice 接入 ChatGPT。",
+            },
+        ],
+        "portrait": {},
+    }
+
+    continuity = engine._format_recent_continuity(state, max_items=4)
+
+    assert "doing: 小雨成功将 Haven-voice 接入 ChatGPT。" in continuity
+    assert "relationship:" not in continuity
+    assert "user:" not in continuity
+
+
 def test_load_state_drops_initial_run_daily_summary(tmp_path, test_config):
     state_path = tmp_path / "state" / "portrait_state.json"
     engine = DailyPortraitMaintainer(
@@ -1091,6 +1137,6 @@ async def test_initial_portrait_keeps_recent_days_by_source_date_and_demotes_old
 
     continuity = engine.build_handoff_sections(max_recent_items=4)["recent_continuity"]
     assert "2026-06-07 01:00 / doing: 小雨最近在确认当天材料能不能进入最近事项" in continuity
-    assert "2026-06-07 01:00 / relationship: 当天凌晨材料可以进入 recent" in continuity
+    assert "2026-06-07 01:00 / relationship: 当天凌晨材料可以进入 recent" not in continuity
     assert "2026-06-06 20:00 / relationship: 前一天材料应该在 2026-06-06 下展示" in continuity
     assert "更旧材料" not in continuity
