@@ -2761,6 +2761,15 @@
     </div>
 
     <div class="config-section">
+      <h3>自我入口</h3>
+      <div class="config-row">
+        <label>总入口 bucket</label>
+        <input type="text" id="cfg-self-anchor-entry" placeholder="留空按最高分自我桶 fallback" />
+      </div>
+      <div style="margin-top:-4px;margin-bottom:12px;padding-left:122px;font-size:11px;color:var(--text-light);">handoff 和画像页只读这一条；不会把它设成普通 anchor</div>
+    </div>
+
+    <div class="config-section">
       <h3>其他参数</h3>
       <div class="config-row">
         <label>合并阈值</label>
@@ -3366,7 +3375,7 @@ function renderPortraitState(data) {
     '<span class="profile-chip">state ' + esc(state.state_path || '—') + '</span>' +
   '</div>';
   content.innerHTML =
-    renderPortraitSelfAnchor() +
+    renderPortraitSelfAnchor(state.self_anchor_entry) +
     renderPortraitTimeline(state.recent_timeline, state.recent_activities) +
     '<div class="portrait-state-grid">' +
       renderPortraitScope('user', portrait.user || {}) +
@@ -3384,30 +3393,16 @@ function bucketTimeValue(bucket) {
   return Number.isFinite(time) ? time : 0;
 }
 
-function renderPortraitSelfAnchor() {
-  var rows = allBuckets
-    .filter(isSelfAnchorBucket)
-    .sort(function(a, b) {
-      var importanceDelta = Number(b.importance || 0) - Number(a.importance || 0);
-      if (importanceDelta) return importanceDelta;
-      var timeDelta = bucketTimeValue(b) - bucketTimeValue(a);
-      if (timeDelta) return timeDelta;
-      return String(b.id || '').localeCompare(String(a.id || ''));
-    })
-    .slice(0, 1)
-    .map(function(bucket) {
-      return {
-        text: bucket.content_preview || bucket.name || bucket.id || '',
-        scope: '自我',
-        confidence: bucket.confidence,
-        source_date: getBucketDate(bucket),
-        updated_at: bucket.updated_at || bucket.last_active || bucket.created || '',
-        evidence: [{ bucket_id: bucket.id }]
-      };
-    });
+function renderPortraitSelfAnchor(entry) {
+  var rows = entry && entry.bucket_id ? [{
+    text: entry.text || entry.name || entry.bucket_id || '',
+    scope: entry.configured ? '自我总入口' : '自我总入口 fallback',
+    updated_at: entry.updated_at || '',
+    evidence: [{ bucket_id: entry.bucket_id }]
+  }] : [];
   return '<section class="portrait-scope portrait-self-anchor">' +
-    '<div class="portrait-layer-title">自我 Anchor</div>' +
-    renderPortraitRows(rows, '还没有自我 anchor。') +
+    '<div class="portrait-layer-title">自我总入口</div>' +
+    renderPortraitRows(rows, '还没有自我总入口。') +
   '</section>';
 }
 
@@ -5907,6 +5902,8 @@ async function loadConfig() {
       (cfg.portrait && cfg.portrait.material_limit) ?? 18;
     document.getElementById('cfg-portrait-first-limit').value =
       (cfg.portrait && cfg.portrait.first_run_material_limit) ?? 160;
+    document.getElementById('cfg-self-anchor-entry').value =
+      (cfg.self_anchor && cfg.self_anchor.entry_bucket_id) || '';
     document.getElementById('cfg-merge').value = cfg.merge_threshold ?? 75;
     document.getElementById('config-readonly').innerHTML =
       'Transport: <strong>' + esc(cfg.transport) + '</strong><br>' +
@@ -6016,6 +6013,9 @@ async function saveConfig(persist, persistEnv) {
       material_limit: numberValue('cfg-portrait-material-limit', 18),
       first_run_material_limit: numberValue('cfg-portrait-first-limit', 160),
     };
+    candidate.self_anchor = {
+      entry_bucket_id: document.getElementById('cfg-self-anchor-entry').value.trim(),
+    };
   }
   if (activeTarget === 'memory-config') {
     candidate.gateway = {
@@ -6062,6 +6062,7 @@ async function saveConfig(persist, persistEnv) {
     'memory_diffusion',
     'reflection',
     'portrait',
+    'self_anchor',
   ].forEach(function(sectionName) {
     if (candidate[sectionName]) addChangedSection(body, sectionName, candidate[sectionName]);
   });

@@ -2936,6 +2936,12 @@ async def test_api_portrait_state_reports_readonly_state(monkeypatch, tmp_path):
         ),
     )
 
+    class EmptyBucketManager:
+        async def list_all(self, include_archive=False):
+            return []
+
+    monkeypatch.setattr(server, "bucket_mgr", EmptyBucketManager())
+
     response = await server.api_portrait_state(DummyRequest())
     payload = json.loads(response.body)
 
@@ -2951,6 +2957,7 @@ async def test_api_portrait_state_reports_readonly_state(monkeypatch, tmp_path):
     assert payload["recent_timeline"][0]["time_label"] == "2026-06-07 20:00"
     assert payload["stable_candidates"][0]["text"] == "候选稳定画像"
     assert payload["profile_fact_candidates"][0]["text"] == "候选画像事实"
+    assert payload["self_anchor_entry"] == {}
 
 
 @pytest.mark.asyncio
@@ -3133,6 +3140,7 @@ async def test_config_get_reports_gateway_recall_modes(monkeypatch):
                 "memory_detail_recall_max_ids": 2,
                 "memory_detail_recall_budget": 900,
             },
+            "self_anchor": {"entry_bucket_id": "self_total"},
         },
     )
 
@@ -3162,6 +3170,7 @@ async def test_config_get_reports_gateway_recall_modes(monkeypatch):
     assert payload["gateway"]["memory_detail_recall_max_ids"] == 2
     assert payload["gateway"]["memory_detail_recall_budget"] == 900
     assert payload["recall"]["query_resurface_enabled"] is True
+    assert payload["self_anchor"]["entry_bucket_id"] == "self_total"
 
 
 @pytest.mark.asyncio
@@ -3508,6 +3517,7 @@ async def test_config_persist_syncs_existing_runtime_yaml(monkeypatch, test_conf
                     "material_limit": 7,
                     "first_run_material_limit": 21,
                 },
+                "self_anchor": {"entry_bucket_id": "self_total_entry"},
                 "persist": True,
             }
         )
@@ -3549,6 +3559,7 @@ async def test_config_persist_syncs_existing_runtime_yaml(monkeypatch, test_conf
     assert runtime_config["gateway"]["memory_detail_recall_enabled"] is True
     assert runtime_config["gateway"]["memory_detail_recall_max_ids"] == 2
     assert runtime_config["gateway"]["memory_detail_recall_budget"] == 900
+    assert runtime_config["self_anchor"]["entry_bucket_id"] == "self_total_entry"
     assert runtime_config["recall"]["query_resurface_enabled"] is True
     assert hot_update_calls[-1] == {
         "gateway": {

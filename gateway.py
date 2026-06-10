@@ -348,7 +348,7 @@ class GatewayService:
         )
         self.portrait_memory_include_anchors = self._bool_config_value(
             self.gateway_cfg.get("portrait_memory_include_anchors"),
-            True,
+            False,
         )
         self._portrait_memory_cache: dict[str, Any] = {
             "key": None,
@@ -685,7 +685,7 @@ class GatewayService:
         if "portrait_memory_include_anchors" in payload:
             self.portrait_memory_include_anchors = self._bool_config_value(
                 payload["portrait_memory_include_anchors"],
-                True,
+                False,
             )
             self.gateway_cfg["portrait_memory_include_anchors"] = self.portrait_memory_include_anchors
             updated.append("gateway.portrait_memory_include_anchors")

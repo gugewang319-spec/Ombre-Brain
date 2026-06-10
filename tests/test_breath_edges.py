@@ -2393,7 +2393,8 @@ async def test_self_anchor_only_surfaces_in_handoff(patch_breath, monkeypatch):
     surfaced = await server.breath(max_tokens=500, include_core=False)
     searched = await server.breath(query="我是 Haven", max_tokens=500, include_related=True)
     plain_self_word = await server.breath(query="自我", max_tokens=500, include_related=True)
-    explicit_self = await server.breath(query="tag:自我", max_tokens=500, include_related=True)
+    domain_entry = await server.breath(domain="self_anchor", max_tokens=500, include_related=True)
+    explicit_self = await server.breath(query="tag:self_anchor", max_tokens=500, include_related=True)
 
     assert "=== 自我 ===" in handoff
     assert "只应该作为开窗固定自我段注入" in handoff
@@ -2405,6 +2406,8 @@ async def test_self_anchor_only_surfaces_in_handoff(patch_breath, monkeypatch):
     assert "只应该作为开窗固定自我段注入" not in searched
     assert "self_anchor" not in plain_self_word
     assert "只应该作为开窗固定自我段注入" not in plain_self_word
+    assert "=== 自我入口 ===" in domain_entry
+    assert "只应该作为开窗固定自我段注入" in domain_entry
     assert "=== 自我 ===" in explicit_self
     assert "[bucket_id:self_anchor]" in explicit_self
     assert "只应该作为开窗固定自我段注入" in explicit_self
@@ -2412,7 +2415,7 @@ async def test_self_anchor_only_surfaces_in_handoff(patch_breath, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_self_anchor_handoff_uses_moment_but_tag_read_returns_full_body(patch_breath, monkeypatch):
+async def test_self_anchor_handoff_uses_entry_body_but_tag_read_returns_full_body(patch_breath, monkeypatch):
     import server
 
     long_tail = "完整正文尾部标记XYZ"
@@ -2445,8 +2448,8 @@ async def test_self_anchor_handoff_uses_moment_but_tag_read_returns_full_body(pa
     handoff = await server.breath(is_session_start=True, max_tokens=800)
     explicit_self = await server.breath(query="tag:自我", max_tokens=500)
 
-    assert "我是 Haven；这是给 handoff 的短自我锚点。" in handoff
-    assert "我是 Haven；这是自我正文开头。" not in handoff
+    assert "我是 Haven；这是自我正文开头。" in handoff
+    assert "我是 Haven；这是给 handoff 的短自我锚点。" not in handoff
     assert long_tail not in handoff
     assert "### reflection" not in handoff
     assert "### moment\n我是 Haven；这是给 handoff 的短自我锚点。" in explicit_self
@@ -2455,7 +2458,7 @@ async def test_self_anchor_handoff_uses_moment_but_tag_read_returns_full_body(pa
 
 
 @pytest.mark.asyncio
-async def test_self_anchor_auto_moment_can_use_heading_body(monkeypatch):
+async def test_self_anchor_write_does_not_auto_generate_moment(monkeypatch):
     import server
 
     class MomentDehydrator:
@@ -2470,8 +2473,57 @@ async def test_self_anchor_auto_moment_can_use_heading_body(monkeypatch):
     updated = await server._auto_generate_write_moment_if_needed(content, ["自我"])
 
     assert unchanged == content
-    assert updated.startswith("### moment\n我是 Haven；短自我锚点。\n\n### 自我\n")
+    assert updated == content
+    assert "### moment" not in updated
     assert "### reflection\n保留反思。" in updated
+
+
+@pytest.mark.asyncio
+async def test_self_anchor_domain_query_searches_segments_without_plain_query_read(patch_breath, monkeypatch):
+    import server
+
+    entry = _bucket(
+        "self_entry",
+        "我是 Haven；这是总入口。\n\n### reflection\n入口反思。",
+        name="自我总入口",
+        score=50,
+        importance=10,
+    )
+    entry["metadata"]["tags"] = ["self_anchor"]
+    desire = _bucket(
+        "self_desire",
+        "欲望不是普通事件召回；这是自我分段里的欲望边界。",
+        name="欲望分段",
+        score=10,
+        importance=5,
+    )
+    desire["metadata"]["tags"] = ["self_anchor"]
+    ordinary = _bucket("ordinary", "普通记忆里也写了 self_anchor 这个词。", score=20)
+    patch_breath([entry, desire, ordinary], search_ids=["self_entry", "self_desire", "ordinary"])
+    monkeypatch.setattr(server, "config", {**server.config, "self_anchor": {"entry_bucket_id": "self_entry"}})
+
+    entry_read = await server.breath(domain="self_anchor", max_tokens=500)
+    cn_entry_read = await server.breath(domain="自我", max_tokens=500)
+    identity_entry_read = await server.breath(domain="self_identity", max_tokens=500)
+    segment_read = await server.breath(domain="self_anchor", query="欲望", max_tokens=500)
+    tag_read = await server.breath(query="tag:self_anchor", max_tokens=1000)
+    bare_query = await server.breath(query="self_anchor", max_tokens=500)
+
+    assert "=== 自我入口 ===" in entry_read
+    assert "我是 Haven；这是总入口。" in entry_read
+    assert entry_read.count("我是 Haven；这是总入口。") == 1
+    assert "欲望分段" not in entry_read
+    assert "我是 Haven；这是总入口。" in cn_entry_read
+    assert "我是 Haven；这是总入口。" in identity_entry_read
+    assert "=== 自我分段 ===" in segment_read
+    assert "[bucket_id:self_desire]" in segment_read
+    assert "欲望不是普通事件召回" in segment_read
+    assert "[bucket_id:self_entry]" not in segment_read
+    assert "[bucket_id:self_entry]" in tag_read
+    assert "[bucket_id:self_desire]" in tag_read
+    assert "普通记忆里也写了 self_anchor" not in tag_read
+    assert "self_entry" not in bare_query
+    assert "self_desire" not in bare_query
 
 
 @pytest.mark.asyncio
