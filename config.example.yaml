@@ -464,6 +464,7 @@ persona:
   max_personality_delta: 0.01
   max_relationship_delta: 0.03
   max_affect_delta: 0.18
+  rule_evaluation_enabled: true      # local cue-based numeric deltas first; LLM only handles uncertain high-signal turns
   # Recent Persona Events is a sparse log, not a per-message transcript.
   # Strong relationship/personality/affect signals write immediately; ordinary turns batch.
   # Turn this off to keep evaluating numeric state without writing persona_events.
@@ -474,6 +475,7 @@ persona:
   event_similarity_threshold: 0.82
   event_force_after_minutes: 30
   event_excerpt_chars: 220          # short evidence snippets for future date traces, not full transcripts
+  evaluation_context_turns: 3       # previous same-session turns sent to the post-reply Persona evaluator
   initial_personality:
     openness: 0.56
     conscientiousness: 0.50

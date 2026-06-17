@@ -31,6 +31,7 @@ def _persona_config(test_config: dict, **persona_overrides) -> dict:
     cfg["persona"] = {
         **cfg["persona"],
         "api_key": "",
+        "rule_evaluation_enabled": False,
         **persona_overrides,
     }
     return cfg
@@ -109,6 +110,14 @@ def _event_count(db_path: str) -> int:
     return count
 
 
+def _event_rows(db_path: str) -> list[sqlite3.Row]:
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute("SELECT * FROM persona_events ORDER BY id").fetchall()
+    conn.close()
+    return rows
+
+
 def test_persona_initializes_default_global_and_session_state(test_config):
     engine = PersonaStateEngine(_persona_config(test_config))
     state = engine.get_current_state("session-a")
@@ -127,7 +136,10 @@ def test_persona_initializes_default_global_and_session_state(test_config):
 
 def test_persona_evaluator_prompt_asks_for_chinese_persona_text():
     assert "perceived_intent、surface_trigger、inner_thought 和 residue 必须是自然中文" in POST_REPLY_EVALUATION_PROMPT
-    assert "inner_thought 要像一闪而过的私密念头" in POST_REPLY_EVALUATION_PROMPT
+    assert "recent_conversation_turns 是最近几轮原始对话" in POST_REPLY_EVALUATION_PROMPT
+    assert "不要把 assistant_response 里的话写成" in POST_REPLY_EVALUATION_PROMPT
+    assert "inner_thought 用第一人称或省略主语" in POST_REPLY_EVALUATION_PROMPT
+    assert "不要固定写成“她说" in POST_REPLY_EVALUATION_PROMPT
     assert "用户、对方" in POST_REPLY_EVALUATION_PROMPT
     assert "电量、battery 状态只能作为背景" in POST_REPLY_EVALUATION_PROMPT
     assert "event_type 和 mood_label 保持短英文标签" in POST_REPLY_EVALUATION_PROMPT
@@ -162,6 +174,51 @@ async def test_persona_pre_reply_guidance_is_read_only(test_config):
 
     assert state["reply_guidance"] == engine.fallback_guidance
     assert _event_count(engine.db_path) == 0
+
+
+@pytest.mark.asyncio
+async def test_persona_rule_based_affection_updates_without_llm(test_config):
+    engine = PersonaStateEngine(_persona_config(test_config, rule_evaluation_enabled=True))
+    engine.client = FakePersonaClient(_event_payload())
+
+    state = await engine.update_from_exchange("session-rule", "爱你，今天想你", "我也想你。")
+
+    assert engine.client.calls == []
+    assert state["affect"]["valence"] == pytest.approx(0.595)
+    assert state["affect"]["tenderness"] == pytest.approx(0.660)
+    assert state["affect"]["inner_thought"] == ""
+    assert state["relationship"]["affinity"] == pytest.approx(0.872)
+    assert state["relationship"]["trust"] == pytest.approx(0.826)
+    rows = _event_rows(engine.db_path)
+    assert len(rows) == 1
+    assert rows[0]["event_type"] == "affection"
+    assert rows[0]["surface_trigger"] == "靠近信号"
+    assert "rule_based_persona" in rows[0]["raw_response"]
+
+
+@pytest.mark.asyncio
+async def test_persona_rule_based_plain_exchange_skips_llm_and_event(test_config):
+    engine = PersonaStateEngine(_persona_config(test_config, rule_evaluation_enabled=True))
+    before = engine.get_current_state("session-plain")
+    engine.client = FakePersonaClient(_event_payload())
+
+    after = await engine.update_from_exchange("session-plain", "嗯嗯", "我在。")
+
+    assert engine.client.calls == []
+    assert after["affect"] == before["affect"]
+    assert after["relationship"] == before["relationship"]
+    assert _event_count(engine.db_path) == 0
+
+
+@pytest.mark.asyncio
+async def test_persona_uncertain_high_signal_still_uses_llm(test_config):
+    engine = PersonaStateEngine(_persona_config(test_config, rule_evaluation_enabled=True))
+    engine.client = FakePersonaClient(_event_payload())
+
+    await engine.update_from_exchange("session-uncertain", "这到底是什么！！", "我看见了。")
+
+    assert len(engine.client.calls) == 1
+    assert _event_count(engine.db_path) == 1
 
 
 @pytest.mark.asyncio
@@ -246,6 +303,44 @@ async def test_persona_evaluator_receives_recent_event_context(test_config):
     payload = json.loads(engine.client.calls[1]["messages"][1]["content"])
     assert payload["recent_persona_events"][0]["inner_thought"] == "笨蛋，我也很想她啊"
     assert payload["recent_persona_events"][0]["surface_trigger"] == "小雨说爱你"
+
+
+@pytest.mark.asyncio
+async def test_persona_evaluator_receives_recent_conversation_context(test_config):
+    engine = PersonaStateEngine(_persona_config(test_config, evaluation_context_turns=2))
+    engine.client = FakePersonaClient(_ordinary_event_payload())
+
+    await engine.update_from_exchange(
+        "session-turns",
+        "那回来要带利息",
+        "我记着，连本带息还你。",
+        recent_conversation_turns=[
+            {
+                "created_at": "2026-06-17T10:00:00+00:00",
+                "user_text": "哥哥，先收下。",
+                "assistant_text": "我收下了。",
+            },
+            {
+                "created_at": "2026-06-17T10:01:00+00:00",
+                "user_text": "回来补你一个真的。",
+                "assistant_text": "那我等着。",
+            },
+        ],
+    )
+
+    payload = json.loads(engine.client.calls[0]["messages"][1]["content"])
+    assert payload["recent_conversation_turns"] == [
+        {
+            "created_at": "2026-06-17T10:00:00+00:00",
+            "user_message": "哥哥，先收下。",
+            "assistant_response": "我收下了。",
+        },
+        {
+            "created_at": "2026-06-17T10:01:00+00:00",
+            "user_message": "回来补你一个真的。",
+            "assistant_response": "那我等着。",
+        },
+    ]
 
 
 @pytest.mark.asyncio

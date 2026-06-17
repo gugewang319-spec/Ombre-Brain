@@ -2911,6 +2911,11 @@ class GatewayService:
             )
             return
         tool_summary = self._summarize_assistant_tool_calls(assistant_message)
+        recent_conversation_turns = self._recent_persona_conversation_turns(
+            session_id,
+            user_message,
+            assistant_response,
+        )
         try:
             await self.persona_engine.update_from_exchange(
                 session_id=session_id,
@@ -2918,9 +2923,52 @@ class GatewayService:
                 assistant_response=assistant_response,
                 recalled_memory_ids=recalled_ids,
                 tool_summary=tool_summary,
+                recent_conversation_turns=recent_conversation_turns,
             )
         except Exception as exc:
             logger.warning("Persona post-reply update failed | session=%s error=%s", session_id, exc)
+
+    def _recent_persona_conversation_turns(
+        self,
+        session_id: str,
+        user_message: str,
+        assistant_response: str,
+    ) -> list[dict[str, Any]]:
+        try:
+            max_turns = int(getattr(self.persona_engine, "evaluation_context_turns", 3))
+        except (TypeError, ValueError):
+            max_turns = 3
+        max_turns = max(0, min(8, max_turns))
+        if max_turns <= 0:
+            return []
+
+        profile_id = str(getattr(self.persona_engine, "profile_id", "") or "default")
+        turns = self.state_store.list_recent_conversation_turns(
+            profile_id=profile_id,
+            session_id=session_id,
+            limit=max_turns + 4,
+            hours=168,
+        )
+        current_user = self._clean_conversation_turn_text(user_message)
+        current_assistant = self._clean_conversation_turn_text(assistant_response)
+        selected: list[dict[str, Any]] = []
+        for turn in turns:
+            user_text = self._clean_conversation_turn_text(turn.get("user_text", ""))
+            assistant_text = self._clean_conversation_turn_text(turn.get("assistant_text", ""))
+            if user_text == current_user and assistant_text == current_assistant:
+                continue
+            if not user_text and not assistant_text:
+                continue
+            selected.append(
+                {
+                    "created_at": turn.get("created_at", ""),
+                    "user_text": user_text,
+                    "assistant_text": assistant_text,
+                }
+            )
+            if len(selected) >= max_turns:
+                break
+        return list(reversed(selected))
 
     async def _finalize_stream_turn(
         self,

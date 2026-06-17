@@ -167,6 +167,7 @@ class DummyPersonaEngine:
         assistant_response: str,
         recalled_memory_ids: list[str] | None = None,
         tool_summary: str = "",
+        recent_conversation_turns: list[dict] | None = None,
     ) -> dict:
         return self._state()
 
@@ -207,6 +208,7 @@ class RecordingPersonaEngine(DummyPersonaEngine):
         assistant_response: str,
         recalled_memory_ids: list[str] | None = None,
         tool_summary: str = "",
+        recent_conversation_turns: list[dict] | None = None,
     ) -> dict:
         self.post_calls.append({"session_id": session_id, "user_message": user_message})
         self.post_event.set()
@@ -216,6 +218,7 @@ class RecordingPersonaEngine(DummyPersonaEngine):
             assistant_response,
             recalled_memory_ids,
             tool_summary,
+            recent_conversation_turns,
         )
 
     async def build_pre_reply_guidance(self, session_id: str, latest_user_message: str = "") -> dict:
@@ -937,6 +940,62 @@ async def test_gateway_skips_persona_post_update_when_persona_disabled(
 
     assert persona_engine.post_calls == []
     assert not persona_engine.post_event.is_set()
+
+
+def test_gateway_persona_recent_context_uses_same_session_previous_turns(
+    monkeypatch,
+    test_config,
+    bucket_mgr,
+):
+    _, service, state_store, _ = _build_service(
+        monkeypatch,
+        _gateway_config(test_config),
+        bucket_mgr,
+    )
+    service.persona_engine.evaluation_context_turns = 2
+    state_store.record_conversation_turn(
+        profile_id="haven_xiaoyu",
+        session_id="sess-persona",
+        round_id=1,
+        user_text="哥哥，先收下。",
+        assistant_text="我收下了。",
+        model="dummy",
+        client="unit-test",
+        route="/v1/chat/completions",
+        created_at=datetime.now(timezone.utc) - timedelta(minutes=3),
+    )
+    state_store.record_conversation_turn(
+        profile_id="haven_xiaoyu",
+        session_id="other-window",
+        round_id=1,
+        user_text="别的窗口不该进来。",
+        assistant_text="嗯。",
+        model="dummy",
+        client="unit-test",
+        route="/v1/chat/completions",
+        created_at=datetime.now(timezone.utc) - timedelta(minutes=2),
+    )
+    state_store.record_conversation_turn(
+        profile_id="haven_xiaoyu",
+        session_id="sess-persona",
+        round_id=2,
+        user_text="那回来要带利息",
+        assistant_text="我记着，连本带息还你。",
+        model="dummy",
+        client="unit-test",
+        route="/v1/chat/completions",
+        created_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+    )
+
+    turns = service._recent_persona_conversation_turns(
+        "sess-persona",
+        "那回来要带利息",
+        "我记着，连本带息还你。",
+    )
+
+    assert len(turns) == 1
+    assert turns[0]["user_text"] == "哥哥，先收下。"
+    assert turns[0]["assistant_text"] == "我收下了。"
 
 
 def test_gateway_accepts_anthropic_messages(monkeypatch, test_config, bucket_mgr):
