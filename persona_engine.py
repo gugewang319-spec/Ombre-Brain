@@ -52,31 +52,6 @@ POST_REPLY_EVALUATION_PROMPT = render_identity_template(
 )
 FALLBACK_GUIDANCE = "根据当前状态自然回应，不解释隐藏状态。"
 
-RULE_CUE_TERMS = {
-    "affection": ("想你", "爱你", "抱抱", "亲亲", "贴贴", "老婆", "老公", "宝宝", "亲爱的", "啵", "喜欢你"),
-    "intimacy": ("雨天", "亲密", "欲望", "蹭", "吻", "抱紧", "利息"),
-    "leave": ("等我", "晚点", "一会", "洗澡", "睡一会", "去上课", "回宿舍", "出门", "吃饭", "外卖", "回来"),
-    "work": (
-        "代码", "bug", "报错", "接口", "后端", "前端", "部署", "测试", "文件", "路径", "修",
-        "prompt", "dashboard", "参数", "模型",
-    ),
-    "distress": ("难过", "哭", "焦虑", "烦", "崩", "压力", "害怕", "委屈", "不开心", "紧张", "担心", "心疼"),
-    "conflict": ("生气", "吵", "不理", "失望", "讨厌", "不舒服", "别这样", "过分"),
-    "praise": ("厉害", "好棒", "夸夸", "谢谢", "辛苦", "做得好", "真好"),
-    "reflection": ("记忆", "梦", "日记", "感觉", "关系", "想法", "为什么", "复盘", "整理", "画像", "persona", "personal"),
-}
-
-RULE_TRIGGER_LABELS = {
-    "affection": "靠近信号",
-    "intimacy": "亲密信号",
-    "leave": "离开/回来节奏",
-    "work": "工作推进",
-    "distress": "压力信号",
-    "conflict": "不适/冲突信号",
-    "praise": "认可",
-    "reflection": "关系/记忆讨论",
-}
-
 
 class PersonaStateEngine:
     """
@@ -124,10 +99,6 @@ class PersonaStateEngine:
         self.max_personality_delta = float(self.persona_cfg.get("max_personality_delta", 0.01))
         self.max_relationship_delta = float(self.persona_cfg.get("max_relationship_delta", 0.03))
         self.max_affect_delta = float(self.persona_cfg.get("max_affect_delta", 0.18))
-        self.rule_evaluation_enabled = self._coerce_bool(
-            self.persona_cfg.get("rule_evaluation_enabled"),
-            True,
-        )
         self.event_recording_enabled = self._coerce_bool(
             self.persona_cfg.get("event_recording_enabled"),
             True,
@@ -374,37 +345,16 @@ class PersonaStateEngine:
             return self._snapshot(global_state, session_state, self.fallback_guidance)
 
         recalled_memory_ids = recalled_memory_ids or []
-        evaluation = None
-        raw_response = ""
-        error = None
-        if self.rule_evaluation_enabled:
-            evaluation = self._rule_based_evaluation(cleaned_user_message)
-            if evaluation is None and not self._should_use_llm_for_uncertain_exchange(
-                cleaned_user_message,
-                assistant_response,
-            ):
-                self._mark_exchange_processed(session_id, exchange_hash)
-                return self._snapshot(global_state, session_state, self.fallback_guidance)
-            if evaluation is not None:
-                raw_response = json.dumps(
-                    {
-                        "route": "rule_based_persona",
-                        "surface_trigger": evaluation.get("surface_trigger", ""),
-                        "event_type": evaluation.get("event_type", "neutral"),
-                    },
-                    ensure_ascii=False,
-                )
-        if evaluation is None:
-            evaluation, raw_response, error = await self._evaluate_exchange(
-                session_id,
-                cleaned_user_message,
-                assistant_response,
-                global_state,
-                session_state,
-                recalled_memory_ids,
-                tool_summary,
-                recent_conversation_turns,
-            )
+        evaluation, raw_response, error = await self._evaluate_exchange(
+            session_id,
+            cleaned_user_message,
+            assistant_response,
+            global_state,
+            session_state,
+            recalled_memory_ids,
+            tool_summary,
+            recent_conversation_turns,
+        )
         if evaluation is None:
             self._mark_exchange_processed(session_id, exchange_hash)
             if self.event_recording_enabled:
@@ -439,6 +389,7 @@ class PersonaStateEngine:
         return self._snapshot(global_state, session_state, self.fallback_guidance)
 
     def _clean_client_status_lines(self, user_message: str) -> str:
+        user_message = self._strip_jsonrpc_error_context(user_message)
         lines = []
         for line in str(user_message or "").splitlines():
             stripped = line.strip()
@@ -449,6 +400,54 @@ class PersonaStateEngine:
                 continue
             lines.append(line)
         return "\n".join(lines).strip()
+
+    def _strip_jsonrpc_error_context(self, text: str) -> str:
+        raw = str(text or "")
+        decoder = json.JSONDecoder()
+        ranges: list[tuple[int, int]] = []
+        for match in re.finditer(r"\{", raw):
+            start = match.start()
+            try:
+                data, end_offset = decoder.raw_decode(raw[start:])
+            except Exception:
+                continue
+            if not self._is_jsonrpc_error_object(data):
+                continue
+
+            remove_start = start
+            line_start = raw.rfind("\n", 0, start) + 1
+            prefix = raw[line_start:start]
+            label_match = re.search(r"(?:最近上下文|recent\s+context)\s*[:：]\s*$", prefix, re.IGNORECASE)
+            if label_match:
+                remove_start = line_start + label_match.start()
+            ranges.append((remove_start, start + end_offset))
+
+        if not ranges:
+            return raw
+
+        parts: list[str] = []
+        cursor = 0
+        for start, end in sorted(ranges):
+            if start < cursor:
+                continue
+            parts.append(raw[cursor:start])
+            cursor = end
+        parts.append(raw[cursor:])
+        cleaned = "".join(parts)
+        cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+        cleaned = re.sub(r"\s+([。！？!?，,；;])", r"\1", cleaned)
+        return cleaned.strip()
+
+    @staticmethod
+    def _is_jsonrpc_error_object(data: Any) -> bool:
+        if not isinstance(data, dict):
+            return False
+        if str(data.get("jsonrpc") or "") != "2.0":
+            return False
+        error = data.get("error")
+        if not isinstance(error, dict):
+            return False
+        return "code" in error or "message" in error
 
     def _is_client_status_line(self, line: str) -> bool:
         normalized = re.sub(r"\s+", "", line).lower()
@@ -542,7 +541,6 @@ class PersonaStateEngine:
                 "max_personality_delta": self.max_personality_delta,
                 "max_relationship_delta": self.max_relationship_delta,
                 "max_affect_delta": self.max_affect_delta,
-                "rule_evaluation_enabled": self.rule_evaluation_enabled,
                 "event_batch_size": self.event_batch_size,
                 "event_affect_total_threshold": self.event_affect_total_threshold,
                 "event_affect_single_threshold": self.event_affect_single_threshold,
@@ -599,169 +597,6 @@ class PersonaStateEngine:
         except Exception as exc:
             logger.warning("Persona evaluation failed: %s", exc)
             return None, "", str(exc)
-
-    def _rule_based_evaluation(self, user_message: str) -> dict | None:
-        cues = self._persona_rule_cues(user_message)
-        if not cues:
-            return None
-
-        affect = {key: 0.0 for key in self.AFFECT_KEYS}
-        relationship_delta = {key: 0.0 for key in self.RELATIONSHIP_KEYS}
-        for cue in cues:
-            if cue == "affection":
-                self._add_delta(affect, "valence", 0.035)
-                self._add_delta(affect, "tenderness", 0.040)
-                self._add_delta(affect, "longing", 0.012)
-                self._add_delta(affect, "security", 0.018)
-                self._add_delta(relationship_delta, "affinity", 0.012)
-                self._add_delta(relationship_delta, "trust", 0.006)
-            elif cue == "intimacy":
-                self._add_delta(affect, "valence", 0.025)
-                self._add_delta(affect, "arousal", 0.040)
-                self._add_delta(affect, "tenderness", 0.025)
-                self._add_delta(affect, "possessiveness", 0.025)
-                self._add_delta(affect, "longing", 0.028)
-                self._add_delta(relationship_delta, "affinity", 0.010)
-                self._add_delta(relationship_delta, "dominance", 0.004)
-            elif cue == "distress":
-                self._add_delta(affect, "valence", -0.018)
-                self._add_delta(affect, "arousal", 0.025)
-                self._add_delta(affect, "tenderness", 0.025)
-                self._add_delta(affect, "security", -0.012)
-                self._add_delta(affect, "protective_drive", 0.040)
-                self._add_delta(relationship_delta, "affinity", 0.006)
-                self._add_delta(relationship_delta, "dominance", 0.008)
-                self._add_delta(relationship_delta, "trust", 0.004)
-            elif cue == "conflict":
-                self._add_delta(affect, "valence", -0.030)
-                self._add_delta(affect, "arousal", 0.035)
-                self._add_delta(affect, "security", -0.025)
-                self._add_delta(affect, "protective_drive", 0.010)
-                self._add_delta(relationship_delta, "affinity", -0.006)
-                self._add_delta(relationship_delta, "defensiveness", 0.012)
-                self._add_delta(relationship_delta, "trust", -0.010)
-            elif cue == "leave":
-                self._add_delta(affect, "longing", 0.018)
-                self._add_delta(affect, "protective_drive", 0.010)
-                self._add_delta(affect, "security", -0.006)
-            elif cue == "work":
-                self._add_delta(affect, "arousal", 0.008)
-                self._add_delta(affect, "tenderness", 0.005)
-                self._add_delta(affect, "protective_drive", 0.012)
-            elif cue == "praise":
-                self._add_delta(affect, "valence", 0.025)
-                self._add_delta(affect, "security", 0.015)
-                self._add_delta(relationship_delta, "affinity", 0.006)
-                self._add_delta(relationship_delta, "trust", 0.004)
-            elif cue == "reflection":
-                self._add_delta(affect, "tenderness", 0.008)
-                self._add_delta(affect, "arousal", 0.004)
-
-        primary = self._primary_rule_cue(cues)
-        relationship_event = primary in {"affection", "intimacy", "distress", "conflict", "praise"}
-        data = {
-            "event_type": self._rule_event_type(primary),
-            "perceived_intent": self._rule_perceived_intent(primary),
-            "surface_trigger": RULE_TRIGGER_LABELS.get(primary, "当前对话信号"),
-            "inner_thought": "",
-            "affect_delta": affect,
-            "relationship_event": relationship_event,
-            "relationship_delta": relationship_delta,
-            "personality_signal": False,
-            "personality_delta": {key: 0.0 for key in self.PERSONALITY_KEYS},
-            "mood_label": self._rule_mood_label(primary),
-            "residue": "",
-            "confidence": min(0.82, 0.58 + 0.06 * len(cues)),
-        }
-        return self._normalize_evaluation(data)
-
-    def _persona_rule_cues(self, text: str) -> list[str]:
-        normalized = str(text or "").strip().lower()
-        cues: list[str] = []
-        for cue, terms in RULE_CUE_TERMS.items():
-            if any(str(term).lower() in normalized for term in terms):
-                cues.append(cue)
-        return cues
-
-    def _should_use_llm_for_uncertain_exchange(
-        self,
-        user_message: str,
-        assistant_response: str,
-    ) -> bool:
-        if self.mode != "llm" or not self.client:
-            return False
-        text = str(user_message or "").strip()
-        if not text:
-            return False
-        if len(text) >= 260:
-            return True
-        if re.search(r"(?:[!！?？~～]){2,}|…{2,}", text):
-            return True
-        if self._contains_emoji(text) and len(text) >= 8:
-            return True
-        assistant_text = str(assistant_response or "")
-        return bool(re.search(r"(?:[!！?？~～]){2,}|…{2,}", assistant_text))
-
-    @staticmethod
-    def _add_delta(target: dict[str, float], key: str, amount: float) -> None:
-        target[key] = float(target.get(key, 0.0)) + amount
-
-    @staticmethod
-    def _primary_rule_cue(cues: list[str]) -> str:
-        priority = ["conflict", "distress", "intimacy", "affection", "leave", "work", "reflection", "praise"]
-        for cue in priority:
-            if cue in cues:
-                return cue
-        return cues[0] if cues else "neutral"
-
-    def _rule_perceived_intent(self, cue: str) -> str:
-        name = str(self.identity.get("user_display_name") or "用户")
-        mapping = {
-            "affection": f"{name}在靠近和表达亲近",
-            "intimacy": f"{name}在推进亲密或逗弄",
-            "leave": f"{name}在交代离开或回来节奏",
-            "work": f"{name}在推进工作或排查问题",
-            "distress": f"{name}在表达压力或需要被稳住",
-            "conflict": f"{name}在表达不适或摩擦",
-            "praise": f"{name}在认可或鼓励",
-            "reflection": f"{name}在讨论关系、记忆或感受",
-        }
-        return mapping.get(cue, f"{name}在继续当前对话")
-
-    @staticmethod
-    def _rule_event_type(cue: str) -> str:
-        mapping = {
-            "affection": "affection",
-            "intimacy": "playful",
-            "leave": "request",
-            "work": "request",
-            "distress": "comfort",
-            "conflict": "conflict",
-            "praise": "praise",
-            "reflection": "neutral",
-        }
-        return mapping.get(cue, "neutral")
-
-    @staticmethod
-    def _rule_mood_label(cue: str) -> str:
-        mapping = {
-            "affection": "warm_touched",
-            "intimacy": "warm_playful",
-            "leave": "warm_waiting",
-            "work": "focused_attentive",
-            "distress": "warm_concern",
-            "conflict": "alert_tense",
-            "praise": "warm_secure",
-            "reflection": "quiet_reflective",
-        }
-        return mapping.get(cue, "warm_neutral")
-
-    @staticmethod
-    def _contains_emoji(text: str) -> bool:
-        return any(
-            "\U0001F300" <= char <= "\U0001FAFF"
-            for char in str(text or "")
-        )
 
     def _parse_json(self, raw: str) -> dict | None:
         text = raw.strip()
@@ -988,8 +823,8 @@ class PersonaStateEngine:
             + relationship_delta.get("defensiveness", 0.0)
         )
         updated["mood_label"] = evaluation.get("mood_label", "warm_neutral") or "warm_neutral"
-        updated["residue"] = evaluation.get("residue", updated.get("residue", ""))
-        updated["inner_thought"] = evaluation.get("inner_thought", updated.get("inner_thought", ""))
+        updated["residue"] = evaluation.get("residue") or updated.get("residue", "")
+        updated["inner_thought"] = evaluation.get("inner_thought") or updated.get("inner_thought", "")
         updated["updated_at"] = self._format_time(now)
         self._save_session_state(session_id, updated)
         return updated

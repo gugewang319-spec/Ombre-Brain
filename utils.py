@@ -324,7 +324,6 @@ def load_config(config_path: str = None) -> dict:
             "max_personality_delta": 0.01,
             "max_relationship_delta": 0.03,
             "max_affect_delta": 0.18,
-            "rule_evaluation_enabled": True,
             "event_batch_size": 2,
             "event_affect_total_threshold": 0.45,
             "event_affect_single_threshold": 0.14,

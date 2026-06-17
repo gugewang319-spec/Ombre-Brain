@@ -464,7 +464,6 @@ persona:
   max_personality_delta: 0.01
   max_relationship_delta: 0.03
   max_affect_delta: 0.18
-  rule_evaluation_enabled: true      # local cue-based numeric deltas first; LLM only handles uncertain high-signal turns
   # Recent Persona Events is a sparse log, not a per-message transcript.
   # Strong relationship/personality/affect signals write immediately; ordinary turns batch.
   # Turn this off to keep evaluating numeric state without writing persona_events.

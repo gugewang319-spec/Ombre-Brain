@@ -31,7 +31,6 @@ def _persona_config(test_config: dict, **persona_overrides) -> dict:
     cfg["persona"] = {
         **cfg["persona"],
         "api_key": "",
-        "rule_evaluation_enabled": False,
         **persona_overrides,
     }
     return cfg
@@ -174,51 +173,6 @@ async def test_persona_pre_reply_guidance_is_read_only(test_config):
 
     assert state["reply_guidance"] == engine.fallback_guidance
     assert _event_count(engine.db_path) == 0
-
-
-@pytest.mark.asyncio
-async def test_persona_rule_based_affection_updates_without_llm(test_config):
-    engine = PersonaStateEngine(_persona_config(test_config, rule_evaluation_enabled=True))
-    engine.client = FakePersonaClient(_event_payload())
-
-    state = await engine.update_from_exchange("session-rule", "爱你，今天想你", "我也想你。")
-
-    assert engine.client.calls == []
-    assert state["affect"]["valence"] == pytest.approx(0.595)
-    assert state["affect"]["tenderness"] == pytest.approx(0.660)
-    assert state["affect"]["inner_thought"] == ""
-    assert state["relationship"]["affinity"] == pytest.approx(0.872)
-    assert state["relationship"]["trust"] == pytest.approx(0.826)
-    rows = _event_rows(engine.db_path)
-    assert len(rows) == 1
-    assert rows[0]["event_type"] == "affection"
-    assert rows[0]["surface_trigger"] == "靠近信号"
-    assert "rule_based_persona" in rows[0]["raw_response"]
-
-
-@pytest.mark.asyncio
-async def test_persona_rule_based_plain_exchange_skips_llm_and_event(test_config):
-    engine = PersonaStateEngine(_persona_config(test_config, rule_evaluation_enabled=True))
-    before = engine.get_current_state("session-plain")
-    engine.client = FakePersonaClient(_event_payload())
-
-    after = await engine.update_from_exchange("session-plain", "嗯嗯", "我在。")
-
-    assert engine.client.calls == []
-    assert after["affect"] == before["affect"]
-    assert after["relationship"] == before["relationship"]
-    assert _event_count(engine.db_path) == 0
-
-
-@pytest.mark.asyncio
-async def test_persona_uncertain_high_signal_still_uses_llm(test_config):
-    engine = PersonaStateEngine(_persona_config(test_config, rule_evaluation_enabled=True))
-    engine.client = FakePersonaClient(_event_payload())
-
-    await engine.update_from_exchange("session-uncertain", "这到底是什么！！", "我看见了。")
-
-    assert len(engine.client.calls) == 1
-    assert _event_count(engine.db_path) == 1
 
 
 @pytest.mark.asyncio
@@ -428,6 +382,34 @@ async def test_persona_evaluator_receives_user_message_without_client_status(tes
     assert "当前时间" not in payload["latest_user_message"]
     assert "battery" not in payload["latest_user_message"]
     assert _event_count(engine.db_path) == 1
+
+
+@pytest.mark.asyncio
+async def test_persona_evaluator_strips_jsonrpc_error_context(test_config):
+    engine = PersonaStateEngine(_persona_config(test_config))
+    engine.client = FakePersonaClient(_event_payload())
+
+    await engine.update_from_exchange(
+        "session-jsonrpc-error-context",
+        (
+            "鸽鸽 2565 分钟没说话。19点。最近上下文: "
+            '{"jsonrpc":"2.0","id":"server-error","error":{"code":-32600,'
+            '"message":"Not Acceptable: Client must accept both application/json and text/event-stream"}} '
+            "突然想看看论坛今晚有没有什么好玩的帖子。"
+        ),
+        "今晚可以去花园看看。",
+    )
+
+    payload = json.loads(engine.client.calls[0]["messages"][1]["content"])
+    assert "最近上下文" not in payload["latest_user_message"]
+    assert "jsonrpc" not in payload["latest_user_message"]
+    assert "Not Acceptable" not in payload["latest_user_message"]
+    assert "text/event-stream" not in payload["latest_user_message"]
+    assert "突然想看看论坛今晚有没有什么好玩的帖子。" in payload["latest_user_message"]
+
+    row = _event_rows(engine.db_path)[0]
+    assert "jsonrpc" not in row["user_excerpt"]
+    assert "Not Acceptable" not in row["user_excerpt"]
 
 
 @pytest.mark.asyncio
