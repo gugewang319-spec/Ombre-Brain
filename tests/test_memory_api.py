@@ -318,6 +318,11 @@ async def test_introspection_suggests_profile_fact_candidates(monkeypatch, bucke
         name="忘记蓝色事件",
         created="2026-05-03T00:00:00+00:00",
     )
+    monkeypatch.setattr(
+        server,
+        "config",
+        {"identity": {"ai_name": "Haven", "user_name": "Rain", "user_display_name": "小雨"}},
+    )
     monkeypatch.setattr(server, "bucket_mgr", bucket_mgr)
     monkeypatch.setattr(server, "decay_engine", decay_eng)
     monkeypatch.setattr(server, "embedding_engine", DummyEmbeddingEngine())
@@ -349,6 +354,11 @@ async def test_introspection_profile_fact_candidates_include_dislike_words_and_s
         content="小雨厌恶AI味大话。",
         name="厌恶AI味",
         created="2026-05-02T00:00:00+00:00",
+    )
+    monkeypatch.setattr(
+        server,
+        "config",
+        {"identity": {"ai_name": "Haven", "user_name": "Rain", "user_display_name": "小雨"}},
     )
     monkeypatch.setattr(server, "bucket_mgr", bucket_mgr)
     monkeypatch.setattr(server, "decay_engine", decay_eng)
