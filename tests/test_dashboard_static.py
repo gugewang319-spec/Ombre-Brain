@@ -457,6 +457,22 @@ def test_dashboard_exposes_reflection_affect_anchor_switches():
     assert "body.reflection.api_key = reflectionKeyVal;" in html
 
 
+def test_dashboard_exposes_chat_memory_tab_module():
+    html = Path("dashboard.html").read_text(encoding="utf-8")
+    module = Path("dashboard_assets/chat-memory.js").read_text(encoding="utf-8")
+
+    assert 'data-tab="chat-memory"' in html
+    assert 'id="chat-memory-view"' in html
+    assert 'id="daily-chat-memory-pending"' in html
+    assert "document.getElementById('chat-memory-view').style.display = target === 'chat-memory' ? '' : 'none';" in html
+    assert "window.initDailyChatMemoryTab" in module
+    assert "loadDashboardModule('/dashboard-assets/chat-memory.js');" in html
+    assert "BASE + '/api/daily-chat-memory/run'" not in html
+    assert "dailyChatMemoryApiBase() + '/api/daily-chat-memory/run'" in module
+    assert "dailyChatMemoryApiBase() + '/api/daily-chat-memory/pending?limit=20'" in module
+    assert "dailyChatMemoryApiBase() + '/api/daily-chat-memory/confirm'" in module
+
+
 def test_dashboard_exposes_portrait_maintainer_controls():
     html = Path("dashboard.html").read_text(encoding="utf-8")
     load_block = html.split("async function loadConfig()", 1)[1].split("async function saveConfig", 1)[0]

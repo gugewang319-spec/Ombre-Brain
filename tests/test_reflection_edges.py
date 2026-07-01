@@ -819,6 +819,64 @@ async def test_reflect_daily_conversation_turns_replace_persona_events_material(
 
 
 @pytest.mark.asyncio
+async def test_daily_chat_memory_review_requires_confirmation(test_config):
+    cfg = _no_api_config(test_config)
+    cfg["identity"] = {
+        "ai_name": "Haven",
+        "user_name": "Xiaoyu",
+        "user_display_name": "池又雨",
+        "user_aliases": ["小雨"],
+    }
+    cfg["reflection"]["daily_chat_memory_mode"] = "review"
+    cfg["reflection"]["daily_chat_memory_turn_limit"] = 5
+    bucket_mgr = BucketManager(cfg)
+    engine = ReflectionEngine(cfg)
+    now = datetime(2026, 5, 21, 23, 59, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    class ConversationTurnStore:
+        def list_conversation_turns_between(self, *, profile_id, start_at, end_at, limit):
+            return [
+                {
+                    "id": 7,
+                    "session_id": "daily-chat",
+                    "round_id": 7,
+                    "created_at": "2026-05-21T20:00:00+08:00",
+                    "user_text": "我希望以后解释代码先说风险，再说怎么改。",
+                    "assistant_text": "记住，先讲风险再讲改法。",
+                    "model": "test",
+                    "client": "gateway",
+                    "route": "/v1/chat/completions",
+                }
+            ]
+
+    class Persona:
+        profile_id = "haven_xiaoyu"
+
+    result = await engine.run_daily_chat_memory(
+        bucket_mgr,
+        conversation_turn_store=ConversationTurnStore(),
+        persona_engine=Persona(),
+        now=now,
+    )
+    pending = engine.list_daily_chat_memory_pending()
+    candidate_id = pending[0]["id"]
+
+    assert result["status"] == "pending"
+    assert result["added"] == 1
+    assert pending[0]["candidate"]["kind"] == "stable_preference"
+    assert "池又雨" in pending[0]["candidate"]["content"]
+    assert await bucket_mgr.get(candidate_id) is None
+
+    confirmed = await engine.confirm_daily_chat_memory([candidate_id], bucket_mgr)
+    bucket = await bucket_mgr.get(candidate_id)
+
+    assert confirmed["created"] == 1
+    assert bucket is not None
+    assert bucket["metadata"]["source"] == "daily_chat_memory"
+    assert bucket["metadata"]["source_conversation_turn_ids"] == [7]
+
+
+@pytest.mark.asyncio
 async def test_reflect_daily_extracts_diary_memory_when_no_ordinary_memory(test_config, monkeypatch):
     cfg = _no_api_config(test_config)
     bucket_mgr = BucketManager(cfg)

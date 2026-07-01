@@ -3459,19 +3459,6 @@ async def _refresh_bucket_embedding(bucket_id: str) -> bool:
     return await embedding_engine.generate_and_store(bucket_id, bucket_text_for_embedding(bucket))
 
 
-def _bucket_delete_skip_reason(bucket: dict) -> str:
-    meta = bucket.get("metadata", {}) if isinstance(bucket, dict) else {}
-    if meta.get("protected"):
-        return "protected"
-    if meta.get("pinned"):
-        return "pinned"
-    if meta.get("anchor"):
-        return "anchor"
-    if meta.get("type") == "permanent":
-        return "permanent"
-    return ""
-
-
 def _delete_bucket_indexes(bucket_id: str) -> tuple[dict, list[str]]:
     cleanup: dict = {}
     errors: list[str] = []
@@ -9768,7 +9755,7 @@ async def api_identity_semantics_rebuild(request):
 
 @mcp.custom_route("/api/buckets/delete", methods=["POST"])
 async def api_buckets_delete(request):
-    """Bulk-delete ordinary dashboard buckets and clean their indexes."""
+    """Bulk-delete dashboard buckets and clean their indexes."""
     from starlette.responses import JSONResponse
     err = _require_dashboard_auth(request)
     if err:
@@ -9810,12 +9797,6 @@ async def api_buckets_delete(request):
         if not bucket:
             summary["not_found"] += 1
             results.append({"id": bucket_id, "status": "not_found", "reason": "not_found"})
-            continue
-
-        reason = _bucket_delete_skip_reason(bucket)
-        if reason:
-            summary["skipped"] += 1
-            results.append({"id": bucket_id, "status": "skipped", "reason": reason})
             continue
 
         result = await _delete_bucket_and_indexes(bucket_id)
@@ -10456,6 +10437,79 @@ async def api_reflection_run(request):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+@mcp.custom_route("/api/daily-chat-memory/run", methods=["POST"])
+async def api_daily_chat_memory_run(request):
+    """Run daily Gateway chat memory extraction; review mode writes pending candidates only."""
+    from starlette.responses import JSONResponse
+    err = _require_dashboard_auth(request)
+    if err:
+        return err
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    try:
+        result = await reflection_engine.run_daily_chat_memory(
+            bucket_mgr,
+            conversation_turn_store=gateway_state_store,
+            persona_engine=persona_engine,
+            embedding_engine=embedding_engine,
+            key=str(body.get("date") or ""),
+            mode=str(body.get("mode") or ""),
+            force=_bool_value(body.get("force"), False),
+        )
+        return JSONResponse(result)
+    except Exception as e:
+        logger.warning("Daily chat memory API failed: %s", e)
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/daily-chat-memory/pending", methods=["GET"])
+async def api_daily_chat_memory_pending(request):
+    """List pending daily chat memory candidates."""
+    from starlette.responses import JSONResponse
+    err = _require_dashboard_auth(request)
+    if err:
+        return err
+    params = request.query_params
+    items = reflection_engine.list_daily_chat_memory_pending(
+        status=str(params.get("status") or "pending"),
+        limit=_int_between(params.get("limit"), 50, 1, 200),
+    )
+    return JSONResponse({"status": "ok", "items": items})
+
+
+@mcp.custom_route("/api/daily-chat-memory/confirm", methods=["POST"])
+async def api_daily_chat_memory_confirm(request):
+    """Confirm or reject pending daily chat memory candidates."""
+    from starlette.responses import JSONResponse
+    err = _require_dashboard_auth(request)
+    if err:
+        return err
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid json body"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "json body must be an object"}, status_code=400)
+    action = str(body.get("action") or "confirm").strip().lower()
+    required = "REJECT" if action == "reject" else "WRITE"
+    if body.get("confirm") != required:
+        return JSONResponse({"error": f"confirmation required: {required}"}, status_code=400)
+    ids = body.get("candidate_ids", [])
+    if not isinstance(ids, list) or not ids:
+        return JSONResponse({"error": "candidate_ids must be a non-empty list"}, status_code=400)
+    result = await reflection_engine.confirm_daily_chat_memory(
+        [str(item or "") for item in ids],
+        bucket_mgr,
+        embedding_engine=embedding_engine,
+        action=action,
+    )
+    return JSONResponse(result)
+
+
 @mcp.custom_route("/dashboard", methods=["GET"])
 async def dashboard(request):
     """Serve the dashboard HTML page."""
@@ -10467,6 +10521,18 @@ async def dashboard(request):
             return HTMLResponse(f.read())
     except FileNotFoundError:
         return HTMLResponse("<h1>dashboard.html not found</h1>", status_code=404)
+
+
+@mcp.custom_route("/dashboard-assets/{path:path}", methods=["GET"])
+async def dashboard_assets(request):
+    """Serve small dashboard modules without turning dashboard.html into a bundle."""
+    from starlette.responses import FileResponse, PlainTextResponse
+    asset_path = str(request.path_params.get("path") or "").strip().replace("\\", "/")
+    base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "dashboard_assets"))
+    target = os.path.abspath(os.path.join(base_dir, asset_path))
+    if not target.startswith(base_dir + os.sep) or not os.path.isfile(target):
+        return PlainTextResponse("dashboard asset not found", status_code=404)
+    return FileResponse(target)
 
 
 @mcp.custom_route("/api/persona", methods=["GET"])
@@ -10697,6 +10763,31 @@ async def api_config_get(request):
                 reflection_cfg.get(
                     "daily_conversation_turn_limit",
                     getattr(reflection_engine, "daily_conversation_turn_limit", 0),
+                )
+            ),
+            "daily_chat_memory_mode": str(
+                reflection_cfg.get(
+                    "daily_chat_memory_mode",
+                    getattr(reflection_engine, "daily_chat_memory_mode", "review"),
+                )
+                or "review"
+            ),
+            "daily_chat_memory_hour": int(
+                reflection_cfg.get(
+                    "daily_chat_memory_hour",
+                    getattr(reflection_engine, "daily_chat_memory_hour", 0),
+                )
+            ),
+            "daily_chat_memory_turn_limit": int(
+                reflection_cfg.get(
+                    "daily_chat_memory_turn_limit",
+                    getattr(reflection_engine, "daily_chat_memory_turn_limit", 80),
+                )
+            ),
+            "daily_chat_memory_max_per_day": int(
+                reflection_cfg.get(
+                    "daily_chat_memory_max_per_day",
+                    getattr(reflection_engine, "daily_chat_memory_max_per_day", 3),
                 )
             ),
             "model": getattr(reflection_engine, "model", reflection_cfg.get("model", "")),
@@ -11169,6 +11260,36 @@ async def api_config_update(request):
                 80,
             )
             updated.append("reflection.daily_conversation_turn_limit")
+        if "daily_chat_memory_mode" in r:
+            mode = str(r.get("daily_chat_memory_mode") or "review").strip().lower()
+            if mode not in {"auto", "review", "off"}:
+                mode = "review"
+            reflection_cfg["daily_chat_memory_mode"] = mode
+            updated.append("reflection.daily_chat_memory_mode")
+        if "daily_chat_memory_hour" in r:
+            reflection_cfg["daily_chat_memory_hour"] = _int_between(
+                r.get("daily_chat_memory_hour"),
+                0,
+                0,
+                23,
+            )
+            updated.append("reflection.daily_chat_memory_hour")
+        if "daily_chat_memory_turn_limit" in r:
+            reflection_cfg["daily_chat_memory_turn_limit"] = _int_between(
+                r.get("daily_chat_memory_turn_limit"),
+                80,
+                0,
+                200,
+            )
+            updated.append("reflection.daily_chat_memory_turn_limit")
+        if "daily_chat_memory_max_per_day" in r:
+            reflection_cfg["daily_chat_memory_max_per_day"] = _int_between(
+                r.get("daily_chat_memory_max_per_day"),
+                3,
+                0,
+                10,
+            )
+            updated.append("reflection.daily_chat_memory_max_per_day")
         if "api_key" in r and r["api_key"]:
             reflection_cfg["api_key"] = str(r["api_key"])
             os.environ["OMBRE_REFLECTION_API_KEY"] = reflection_cfg["api_key"]
@@ -11543,6 +11664,30 @@ async def api_config_update(request):
                         0,
                         0,
                         80,
+                    )
+                if "daily_chat_memory_mode" in body["reflection"]:
+                    mode = str(body["reflection"].get("daily_chat_memory_mode") or "review").strip().lower()
+                    sc_reflection["daily_chat_memory_mode"] = mode if mode in {"auto", "review", "off"} else "review"
+                if "daily_chat_memory_hour" in body["reflection"]:
+                    sc_reflection["daily_chat_memory_hour"] = _int_between(
+                        body["reflection"].get("daily_chat_memory_hour"),
+                        0,
+                        0,
+                        23,
+                    )
+                if "daily_chat_memory_turn_limit" in body["reflection"]:
+                    sc_reflection["daily_chat_memory_turn_limit"] = _int_between(
+                        body["reflection"].get("daily_chat_memory_turn_limit"),
+                        80,
+                        0,
+                        200,
+                    )
+                if "daily_chat_memory_max_per_day" in body["reflection"]:
+                    sc_reflection["daily_chat_memory_max_per_day"] = _int_between(
+                        body["reflection"].get("daily_chat_memory_max_per_day"),
+                        3,
+                        0,
+                        10,
                     )
                 # Never persist api_key to yaml (use env var)
 
@@ -11927,6 +12072,28 @@ if __name__ == "__main__":
                         0,
                         0,
                         80,
+                    )
+                    mode = str(reflection_cfg.get("daily_chat_memory_mode") or "review").strip().lower()
+                    local_reflection_engine.daily_chat_memory_mode = (
+                        mode if mode in {"auto", "review", "off"} else "review"
+                    )
+                    local_reflection_engine.daily_chat_memory_hour = _int_between(
+                        reflection_cfg.get("daily_chat_memory_hour"),
+                        0,
+                        0,
+                        23,
+                    )
+                    local_reflection_engine.daily_chat_memory_turn_limit = _int_between(
+                        reflection_cfg.get("daily_chat_memory_turn_limit"),
+                        80,
+                        0,
+                        200,
+                    )
+                    local_reflection_engine.daily_chat_memory_max_per_day = _int_between(
+                        reflection_cfg.get("daily_chat_memory_max_per_day"),
+                        3,
+                        0,
+                        10,
                     )
                     results = await local_reflection_engine.run_due(
                         local_bucket_mgr,

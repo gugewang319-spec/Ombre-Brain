@@ -2926,7 +2926,7 @@ async def test_import_review_delete_writes_tombstone_and_clears_embedding(
 
 
 @pytest.mark.asyncio
-async def test_dashboard_bulk_delete_skips_protected_and_cleans_indexes(
+async def test_dashboard_bulk_delete_removes_pinned_and_cleans_indexes(
     monkeypatch, bucket_mgr, test_config
 ):
     import server
@@ -2984,19 +2984,22 @@ async def test_dashboard_bulk_delete_skips_protected_and_cleans_indexes(
     )
     payload = json.loads(response.body)
     tombstone_path = os.path.join(test_config["buckets_dir"], ".tombstones", f"{regular_id}.json")
+    pinned_tombstone_path = os.path.join(test_config["buckets_dir"], ".tombstones", f"{pinned_id}.json")
 
     assert response.status_code == 200
-    assert payload["deleted"] == 1
-    assert payload["skipped"] == 1
+    assert payload["deleted"] == 2
+    assert payload["skipped"] == 0
     assert payload["not_found"] == 1
-    assert payload["results"][1]["status"] == "skipped"
-    assert payload["results"][1]["reason"] == "pinned"
+    assert payload["results"][1]["status"] == "deleted"
     assert await bucket_mgr.get(regular_id) is None
-    assert await bucket_mgr.get(pinned_id) is not None
+    assert await bucket_mgr.get(pinned_id) is None
     assert os.path.exists(tombstone_path)
-    assert embedding_engine.deleted == [regular_id]
+    assert os.path.exists(pinned_tombstone_path)
+    assert embedding_engine.deleted == [regular_id, pinned_id]
     assert moment_store.list_for_bucket(regular_id) == []
+    assert moment_store.list_for_bucket(pinned_id) == []
     assert node_store.get(regular_id) is None
+    assert node_store.get(pinned_id) is None
     assert not [
         edge for edge in moment_store.list_edges()
         if edge["source"] == regular_moment or edge["target"] == regular_moment

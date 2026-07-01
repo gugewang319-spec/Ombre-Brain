@@ -2298,6 +2298,11 @@
     font-size: 13px;
     margin-bottom: 4px;
   }
+  .word-map-card-meta {
+    margin-top: 6px;
+    color: var(--text-light);
+    font-size: 11px;
+  }
 
   @media (max-width: 768px) {
     .header { padding: 20px; flex-wrap: wrap; }
@@ -2380,6 +2385,7 @@
   <div class="tab" data-tab="todos">待办</div>
   <div class="tab" data-tab="breath">Breath 模拟</div>
   <div class="tab" data-tab="reflection">日印象</div>
+  <div class="tab" data-tab="chat-memory">自动记忆</div>
   <div class="tab" data-tab="dreams">梦境</div>
   <div class="tab" data-tab="persona">Persona</div>
   <div class="tab" data-tab="profile">画像</div>
@@ -2658,6 +2664,39 @@
         <div class="reflection-calendar" id="reflection-calendar"></div>
       </section>
       <section class="reflection-card reflection-day-panel" id="reflection-day-panel"></section>
+    </div>
+  </div>
+</div>
+
+<div class="content" id="chat-memory-view" style="display:none">
+  <div class="reflection-shell">
+    <div class="reflection-toolbar">
+      <div class="reflection-title">
+        <h2>自动记忆</h2>
+        <p>每天从 Gateway 原文里挑长期记忆候选；review 模式下确认后才写入 bucket。</p>
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+        <input type="date" id="daily-chat-memory-date" />
+        <select id="daily-chat-memory-run-mode">
+          <option value="">使用配置</option>
+          <option value="review">挑选后确认</option>
+          <option value="auto">自动存</option>
+          <option value="off">关闭</option>
+        </select>
+        <button type="button" onclick="runDailyChatMemory()">立即整理</button>
+        <button type="button" onclick="loadDailyChatMemoryPending()">刷新候选</button>
+      </div>
+    </div>
+    <div class="bucket-bulk-message" id="daily-chat-memory-message"></div>
+    <div class="reflection-board">
+      <section class="reflection-card">
+        <div class="reflection-card-head">
+          <h3>待确认</h3>
+        </div>
+        <div class="word-map-list" id="daily-chat-memory-pending">
+          <div class="loading">暂无待确认候选。</div>
+        </div>
+      </section>
     </div>
   </div>
 </div>
@@ -3065,6 +3104,20 @@
       </div>
       <div style="margin-top:-4px;margin-bottom:12px;padding-left:122px;font-size:11px;color:var(--text-light);">默认 0；大于 0 时读取当天短期对话原文作为日印象材料</div>
       <div class="config-row">
+        <label>自动记忆</label>
+        <select id="cfg-reflection-chat-memory-mode">
+          <option value="review">挑选后确认</option>
+          <option value="auto">自动存</option>
+          <option value="off">关闭</option>
+        </select>
+      </div>
+      <div style="margin-top:-4px;margin-bottom:12px;padding-left:122px;font-size:11px;color:var(--text-light);">默认 review；零点后从 Gateway 对话原文挑长期记忆候选</div>
+      <div class="config-row">
+        <label>自动记忆轮次</label>
+        <input type="number" id="cfg-reflection-chat-memory-turns" min="0" max="200" />
+      </div>
+      <div style="margin-top:-4px;margin-bottom:12px;padding-left:122px;font-size:11px;color:var(--text-light);">默认 80；只影响自动记忆候选，不影响日印象材料</div>
+      <div class="config-row">
         <label>普通记忆和弦</label>
         <select id="cfg-reflection-memory-anchor"><option value="true">开启</option><option value="false">关闭</option></select>
       </div>
@@ -3310,6 +3363,7 @@ document.querySelectorAll('.tab').forEach(tab => {
     document.getElementById('breath-view').style.display = target === 'breath' ? '' : 'none';
     document.getElementById('memory-config-view').style.display = target === 'memory-config' ? '' : 'none';
     document.getElementById('reflection-view').style.display = target === 'reflection' ? '' : 'none';
+    document.getElementById('chat-memory-view').style.display = target === 'chat-memory' ? '' : 'none';
     document.getElementById('dreams-view').style.display = target === 'dreams' ? '' : 'none';
     document.getElementById('persona-view').style.display = target === 'persona' ? '' : 'none';
     document.getElementById('profile-view').style.display = target === 'profile' ? '' : 'none';
@@ -3322,6 +3376,7 @@ document.querySelectorAll('.tab').forEach(tab => {
     if (target === 'breath') loadGatewayInjections();
     if (target === 'memory-config') loadConfig();
     if (target === 'reflection') renderReflectionReview();
+    if (target === 'chat-memory' && window.initDailyChatMemoryTab) window.initDailyChatMemoryTab();
     if (target === 'dreams') loadDreams();
     if (target === 'persona') loadPersona();
     if (target === 'profile') {
@@ -3362,6 +3417,7 @@ async function loadBuckets(options) {
     });
     renderBuckets(filterBuckets(allBuckets));
     if (getActiveTab() === 'reflection') renderReflectionReview();
+    if (getActiveTab() === 'chat-memory' && window.loadDailyChatMemoryPending) loadDailyChatMemoryPending();
     if (getActiveTab() === 'todos') loadTodos();
     if (getActiveTab() === 'dreams') loadDreams();
     if (getActiveTab() === 'profile' && !options.skipProfileRefresh) {
@@ -4710,10 +4766,6 @@ function filterBuckets(buckets) {
 }
 
 function bucketBulkDeleteBlockReason(bucket) {
-  if (bucket.protected) return 'protected';
-  if (bucket.pinned) return 'pinned';
-  if (bucket.anchor) return 'anchor';
-  if (bucket.type === 'permanent') return 'permanent';
   return '';
 }
 
@@ -4803,7 +4855,7 @@ function selectCurrentBuckets() {
       added += 1;
     }
   });
-  setBucketBulkMessage(added ? '已选择当前筛选里的普通记忆桶。' : '当前筛选没有可批量删除的记忆桶。', added ? 'ok' : '');
+  setBucketBulkMessage(added ? '已选择当前筛选里的记忆桶。' : '当前筛选没有可批量删除的记忆桶。', added ? 'ok' : '');
   renderBuckets(renderedBuckets);
 }
 
@@ -4821,7 +4873,7 @@ async function deleteSelectedBuckets() {
     return '· ' + (bucket.name || bucket.id);
   }).join('\n');
   var extra = ids.length > 5 ? '\n...' : '';
-  if (!confirm('准备删除 ' + ids.length + ' 个普通记忆桶：\n' + names + extra + '\n\n会写 tombstone 并清理索引。')) return;
+  if (!confirm('准备删除 ' + ids.length + ' 个记忆桶：\n' + names + extra + '\n\n会写 tombstone 并清理索引。')) return;
   var token = prompt('输入 DELETE 确认删除 ' + ids.length + ' 个记忆桶');
   if (token !== 'DELETE') {
     setBucketBulkMessage('已取消删除。', '');
@@ -6791,6 +6843,10 @@ async function loadConfig() {
       (cfg.reflection && cfg.reflection.daily_min_memory_items) ?? 5;
     document.getElementById('cfg-reflection-daily-turns').value =
       (cfg.reflection && cfg.reflection.daily_conversation_turn_limit) ?? 0;
+    document.getElementById('cfg-reflection-chat-memory-mode').value =
+      (cfg.reflection && cfg.reflection.daily_chat_memory_mode) || 'review';
+    document.getElementById('cfg-reflection-chat-memory-turns').value =
+      (cfg.reflection && cfg.reflection.daily_chat_memory_turn_limit) ?? 80;
     document.getElementById('cfg-reflection-memory-anchor').value =
       (cfg.reflection && cfg.reflection.memory_affect_anchor_enabled) === false ? 'false' : 'true';
     document.getElementById('cfg-reflection-weather-anchor').value =
@@ -6932,6 +6988,8 @@ async function saveConfig(persist, persistEnv) {
       daily_enabled: document.getElementById('cfg-reflection-daily').value === 'true',
       daily_min_memory_items: numberValue('cfg-reflection-daily-min-memory', 5),
       daily_conversation_turn_limit: numberValue('cfg-reflection-daily-turns', 0),
+      daily_chat_memory_mode: document.getElementById('cfg-reflection-chat-memory-mode').value || 'review',
+      daily_chat_memory_turn_limit: numberValue('cfg-reflection-chat-memory-turns', 80),
       memory_affect_anchor_enabled: document.getElementById('cfg-reflection-memory-anchor').value === 'true',
       relationship_weather_affect_anchor_enabled: document.getElementById('cfg-reflection-weather-anchor').value === 'true',
       model: document.getElementById('cfg-reflection-model').value,
@@ -7249,6 +7307,15 @@ async function batchReview(idsJson, action) {
     detectPatterns();
   } catch(e) {}
 }
+
+function loadDashboardModule(path) {
+  const script = document.createElement('script');
+  script.src = BASE + path;
+  script.defer = true;
+  document.body.appendChild(script);
+}
+
+loadDashboardModule('/dashboard-assets/chat-memory.js');
 </script>
 </body>
 </html>

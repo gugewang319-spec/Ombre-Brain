@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import os
@@ -17,6 +18,7 @@ from utils import bucket_text_for_embedding, strip_wikilinks
 logger = logging.getLogger("ombre_brain.reflection")
 
 DEFAULT_DAILY_REFLECTION_MIN_BUCKETS = 5
+DAILY_CHAT_MEMORY_MODES = {"auto", "review", "off"}
 
 
 CLASSIFY_PROMPT = """你是 Ombre-Brain 的记忆关系整理器。
@@ -132,6 +134,45 @@ DIARY_MEMORY_PROMPT_TEMPLATE = """你是 Ombre-Brain 的日记长期记忆筛选
 如果不值得写入，返回 {"should_write": false, "reason": "..."}。"""
 
 
+DAILY_CHAT_MEMORY_PROMPT_TEMPLATE = """你是 Ombre-Brain 的每日聊天长期记忆筛选器。
+输入是 {ai_name} 与 {user_display_name} 当天的 Gateway 对话原文。请挑选最多 {max_candidates} 条值得写入长期记忆的候选。
+
+只允许写这些类型：
+- stable_preference：稳定偏好
+- boundary：边界或明确不喜欢的表达
+- signal：暗号、称呼、模式切换信号
+- commitment：承诺、未完成约定
+- project_state：仍会影响未来执行的项目状态
+- relationship_anchor：关系连续性锚点
+
+输出纯 JSON：
+{
+  "candidates": [
+    {
+      "should_write": true,
+      "kind": "stable_preference",
+      "title": "短标题",
+      "content": "可直接写入长期记忆的一小段正文",
+      "tags": ["communication_preference"],
+      "importance": 5,
+      "valence": 0.55,
+      "arousal": 0.3,
+      "confidence": 0.72,
+      "source_turn_ids": [1, 2],
+      "reason": "为什么值得以后召回"
+    }
+  ]
+}
+
+规则：
+- 不要写日报，不要总结整天，不要把普通聊天、调情、临时情绪、工具注入、系统上下文写成长期记忆。
+- content 必须只写一个可未来召回的点，60 到 180 字。
+- 不硬编码姓名；如果用户指的是当前用户，写作 {user_display_name}；如果 assistant/AI 指的是当前回应者，写作 {ai_name}。
+- 用户偏好、边界、暗号适合第三人称；{ai_name} 自己的关系锚点可以用第一人称；项目状态用中性第三人称。
+- 只根据原文能证明的内容写，不编造。
+- 没有候选时返回 {"candidates": []}。"""
+
+
 REFLECT_PROMPT = render_identity_template(REFLECT_PROMPT_TEMPLATE, generic_identity_names())
 DIARY_MEMORY_PROMPT = render_identity_template(DIARY_MEMORY_PROMPT_TEMPLATE, generic_identity_names())
 
@@ -227,6 +268,21 @@ class ReflectionEngine:
         self.diary_memory_extract_enabled = bool(cfg.get("diary_memory_extract_enabled", True))
         self.diary_memory_extract_max_per_day = max(0, int(cfg.get("diary_memory_extract_max_per_day", 1)))
         self.diary_memory_extract_min_confidence = float(cfg.get("diary_memory_extract_min_confidence", 0.68))
+        self.daily_chat_memory_mode = self._normalize_daily_chat_memory_mode(
+            cfg.get("daily_chat_memory_mode", "review")
+        )
+        self.daily_chat_memory_hour = max(0, min(23, int(cfg.get("daily_chat_memory_hour", 0))))
+        self.daily_chat_memory_turn_limit = max(0, min(200, int(cfg.get("daily_chat_memory_turn_limit", 80))))
+        self.daily_chat_memory_max_per_day = max(0, min(10, int(cfg.get("daily_chat_memory_max_per_day", 3))))
+        self.daily_chat_memory_min_confidence = float(cfg.get("daily_chat_memory_min_confidence", 0.68))
+        state_dir = config.get("state_dir") or os.path.join(
+            os.path.dirname(os.path.abspath(config.get("buckets_dir", "buckets"))),
+            "state",
+        )
+        self.daily_chat_memory_pending_path = str(
+            cfg.get("daily_chat_memory_pending_path")
+            or os.path.join(state_dir, "daily_chat_memory_candidates.json")
+        )
 
         self.client = None
         if self.enabled and self.api_key and self.base_url:
@@ -237,6 +293,13 @@ class ReflectionEngine:
 
     def _diary_memory_prompt(self) -> str:
         return render_identity_template(DIARY_MEMORY_PROMPT_TEMPLATE, self.identity)
+
+    def _daily_chat_memory_prompt(self) -> str:
+        prompt = DAILY_CHAT_MEMORY_PROMPT_TEMPLATE.replace(
+            "{max_candidates}",
+            str(max(1, self.daily_chat_memory_max_per_day)),
+        )
+        return render_identity_template(prompt, self.identity)
 
     async def enrich_bucket(
         self,
@@ -587,6 +650,18 @@ class ReflectionEngine:
             return []
         now_local = self._local_now()
         results = []
+        if self.daily_chat_memory_mode != "off" and now_local.hour >= self.daily_chat_memory_hour:
+            chat_date = (now_local - timedelta(days=1)).date()
+            chat_target = datetime.combine(chat_date, time.max, tzinfo=self.tz)
+            chat_result = await self.run_daily_chat_memory(
+                bucket_mgr,
+                conversation_turn_store=conversation_turn_store,
+                persona_engine=persona_engine,
+                embedding_engine=embedding_engine,
+                now=chat_target,
+            )
+            if chat_result.get("status") not in {"disabled", "skipped"}:
+                results.append(chat_result)
         if self.daily_enabled and now_local.hour >= self.daily_hour:
             daily_date = (now_local - timedelta(days=1)).date()
             daily_target = datetime.combine(daily_date, time.max, tzinfo=self.tz)
@@ -1092,6 +1167,422 @@ class ReflectionEngine:
             )
         selected.sort(key=lambda item: str(item.get("created_at") or ""))
         return selected[-limit:]
+
+    async def run_daily_chat_memory(
+        self,
+        bucket_mgr,
+        *,
+        conversation_turn_store=None,
+        persona_engine=None,
+        embedding_engine=None,
+        key: str = "",
+        mode: str = "",
+        force: bool = False,
+        now: datetime | None = None,
+    ) -> dict:
+        effective_mode = self._normalize_daily_chat_memory_mode(mode or self.daily_chat_memory_mode)
+        if effective_mode == "off" or self.daily_chat_memory_max_per_day <= 0:
+            return {"status": "disabled", "reason": "daily_chat_memory_off", "mode": effective_mode}
+        if not conversation_turn_store:
+            return {"status": "skipped", "reason": "no_conversation_turn_store", "mode": effective_mode}
+
+        now_local = self._daily_chat_memory_target(key, now)
+        key = now_local.date().isoformat()
+        start, end = self._period_window("daily", now_local)
+        profile_id = str(getattr(persona_engine, "profile_id", "") or "default")
+        try:
+            raw_turns = conversation_turn_store.list_conversation_turns_between(
+                profile_id=profile_id,
+                start_at=start,
+                end_at=end,
+                limit=self.daily_chat_memory_turn_limit,
+            )
+        except Exception as exc:
+            logger.warning("Daily chat memory turn read failed: %s", exc)
+            raw_turns = []
+        turns = self._conversation_turn_payloads(raw_turns, limit=self.daily_chat_memory_turn_limit)
+        if not turns:
+            return {"status": "skipped", "reason": "no_conversation_turns", "date": key, "mode": effective_mode}
+
+        raw_candidates = await self._extract_daily_chat_memory_candidates(key, turns)
+        candidates = self._normalize_daily_chat_memory_candidates(key, raw_candidates, turns)
+        if not candidates:
+            return {
+                "status": "skipped",
+                "reason": "no_candidates",
+                "date": key,
+                "mode": effective_mode,
+                "turns": len(turns),
+            }
+
+        if effective_mode == "review":
+            pending = self._store_daily_chat_memory_pending(candidates, force=force)
+            return {
+                "status": "pending",
+                "date": key,
+                "mode": effective_mode,
+                "turns": len(turns),
+                **pending,
+            }
+
+        write_result = await self._write_daily_chat_memory_candidates(
+            candidates,
+            bucket_mgr,
+            embedding_engine=embedding_engine,
+        )
+        return {
+            "status": "created" if write_result.get("created") else "exists",
+            "date": key,
+            "mode": effective_mode,
+            "turns": len(turns),
+            **write_result,
+        }
+
+    def list_daily_chat_memory_pending(self, *, status: str = "pending", limit: int = 50) -> list[dict]:
+        safe_status = str(status or "pending").strip()
+        safe_limit = max(1, min(200, int(limit or 50)))
+        items = self._load_daily_chat_memory_pending()
+        if safe_status and safe_status != "all":
+            items = [item for item in items if str(item.get("status") or "") == safe_status]
+        items.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
+        return items[:safe_limit]
+
+    async def confirm_daily_chat_memory(
+        self,
+        candidate_ids: list[str],
+        bucket_mgr,
+        *,
+        embedding_engine=None,
+        action: str = "confirm",
+    ) -> dict:
+        ids = {str(candidate_id or "").strip() for candidate_id in candidate_ids if str(candidate_id or "").strip()}
+        if not ids:
+            return {"status": "skipped", "reason": "no_candidate_ids", "created": 0, "rejected": 0, "missing": 0}
+        safe_action = "reject" if str(action or "").strip().lower() == "reject" else "confirm"
+        items = self._load_daily_chat_memory_pending()
+        changed = False
+        created = rejected = missing = 0
+        results: list[dict] = []
+        seen: set[str] = set()
+        for item in items:
+            item_id = str(item.get("id") or "").strip()
+            if item_id not in ids:
+                continue
+            seen.add(item_id)
+            if str(item.get("status") or "") != "pending":
+                results.append({"id": item_id, "status": item.get("status") or "skipped"})
+                continue
+            if safe_action == "reject":
+                item["status"] = "rejected"
+                item["rejected_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                rejected += 1
+                changed = True
+                results.append({"id": item_id, "status": "rejected"})
+                continue
+
+            write_result = await self._write_daily_chat_memory_candidates(
+                [item.get("candidate") or {}],
+                bucket_mgr,
+                embedding_engine=embedding_engine,
+            )
+            candidate_result = (write_result.get("results") or [{}])[0]
+            if candidate_result.get("status") in {"created", "exists"}:
+                item["status"] = "confirmed"
+                item["confirmed_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                item["bucket_id"] = candidate_result.get("id") or item_id
+                created += 1 if candidate_result.get("status") == "created" else 0
+                changed = True
+            results.append(candidate_result)
+        missing = len(ids - seen)
+        if changed:
+            self._save_daily_chat_memory_pending(items)
+        return {
+            "status": "ok",
+            "action": safe_action,
+            "created": created,
+            "rejected": rejected,
+            "missing": missing,
+            "results": results,
+        }
+
+    async def _extract_daily_chat_memory_candidates(self, key: str, turns: list[dict]) -> list[dict]:
+        if self.client:
+            payload = {
+                "date": key,
+                "identity": {
+                    "ai_name": self.identity["ai_name"],
+                    "user_name": self.identity["user_name"],
+                    "user_display_name": self.identity["user_display_name"],
+                },
+                "conversation_turns": turns,
+            }
+            try:
+                response = await self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": self._daily_chat_memory_prompt()},
+                        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                    ],
+                    **self._completion_options(max_tokens=min(self.max_tokens, 700), temperature=self.temperature),
+                )
+                raw = response.choices[0].message.content if response.choices else ""
+                parsed = self._parse_json_object(raw or "")
+                candidates = parsed.get("candidates") if isinstance(parsed, dict) else []
+                if isinstance(candidates, list):
+                    return [item for item in candidates if isinstance(item, dict)]
+            except Exception as exc:
+                logger.warning("Daily chat memory extraction failed, using heuristic: %s", exc)
+        return self._heuristic_daily_chat_memory_candidates(key, turns)
+
+    def _heuristic_daily_chat_memory_candidates(self, key: str, turns: list[dict]) -> list[dict]:
+        lines = []
+        for turn in turns:
+            user_text = str(turn.get("user_text") or "").strip()
+            assistant_text = str(turn.get("assistant_text") or "").strip()
+            if user_text:
+                lines.append(user_text)
+            if assistant_text:
+                lines.append(assistant_text)
+        normalized = re.sub(r"\s+", " ", " ".join(lines)).strip()
+        if not normalized:
+            return []
+        keyword_map = [
+            ("boundary", ["不喜欢", "不要", "别再", "边界"]),
+            ("signal", ["暗号", "称呼", "模式", "信号", "切换"]),
+            ("commitment", ["承诺", "约定", "答应", "以后要", "下次要"]),
+            ("project_state", ["项目", "仓库", "分支", "部署", "MCP", "API", "网关"]),
+            ("stable_preference", ["喜欢", "偏好", "希望", "默认", "习惯"]),
+            ("relationship_anchor", ["记得", "认出", "连续", "关系", "想你"]),
+        ]
+        candidates = []
+        turn_ids = [turn.get("id") for turn in turns if turn.get("id") is not None]
+        for kind, keywords in keyword_map:
+            if not any(keyword in normalized for keyword in keywords):
+                continue
+            excerpt = self._diary_excerpt(normalized, keywords)
+            content = self._daily_chat_memory_content(kind, key, excerpt)
+            candidates.append(
+                {
+                    "should_write": True,
+                    "kind": kind,
+                    "title": f"{key} 自动记忆",
+                    "content": content,
+                    "tags": [self._kind_tag(kind)],
+                    "importance": 5,
+                    "valence": 0.58,
+                    "arousal": 0.3,
+                    "confidence": 0.7,
+                    "source_turn_ids": turn_ids[:8],
+                    "reason": f"chat_contains_{kind}",
+                }
+            )
+            if len(candidates) >= self.daily_chat_memory_max_per_day:
+                break
+        return candidates
+
+    def _daily_chat_memory_content(self, kind: str, key: str, excerpt: str) -> str:
+        user_display_name = self.identity["user_display_name"]
+        ai_name = self.identity["ai_name"]
+        excerpt = self._trim_diary_memory_content(strip_wikilinks(excerpt))
+        if kind == "project_state":
+            return f"{key} 的聊天确认了一个仍会影响后续执行的项目状态：{excerpt}"
+        if kind == "relationship_anchor":
+            return f"我在 {key} 的聊天里记住了这一段关系连续性：{excerpt}"
+        if kind == "boundary":
+            return f"{user_display_name}在 {key} 的聊天里表达了一个边界：{excerpt}"
+        if kind == "signal":
+            return f"{user_display_name}与{ai_name}在 {key} 的聊天里留下一个可复用的暗号或模式信号：{excerpt}"
+        if kind == "commitment":
+            return f"{key} 的聊天里留下一个后续需要记得的承诺或约定：{excerpt}"
+        return f"{user_display_name}在 {key} 的聊天里表达了一个稳定偏好：{excerpt}"
+
+    def _normalize_daily_chat_memory_candidates(
+        self,
+        key: str,
+        candidates: list[dict],
+        turns: list[dict],
+    ) -> list[dict]:
+        fallback_turn_ids = [turn.get("id") for turn in turns if turn.get("id") is not None]
+        normalized = []
+        for candidate in candidates or []:
+            if candidate.get("should_write") is False:
+                continue
+            kind = self._normalize_diary_memory_kind(candidate.get("kind"))
+            if not kind or kind == "love_letter":
+                continue
+            confidence = self._clamp(candidate.get("confidence", 0.0))
+            if confidence < self.daily_chat_memory_min_confidence:
+                continue
+            content = self._trim_diary_memory_content(str(candidate.get("content") or "").strip())
+            if not content:
+                continue
+            source_turn_ids = [
+                int(turn_id)
+                for turn_id in self._string_list(candidate.get("source_turn_ids"), limit=20)
+                if str(turn_id).isdigit()
+            ] or [int(turn_id) for turn_id in fallback_turn_ids[:20] if str(turn_id).isdigit()]
+            item = {
+                "id": self._daily_chat_memory_candidate_id(key, kind, content),
+                "date": key,
+                "kind": kind,
+                "title": str(candidate.get("title") or f"{key} 自动记忆")[:40],
+                "content": content,
+                "tags": list(
+                    dict.fromkeys(
+                        [
+                            "from_daily_chat",
+                            "daily_chat_extract",
+                            kind,
+                            self._kind_tag(kind),
+                            *self._string_list(candidate.get("tags"), limit=8),
+                        ]
+                    )
+                )[:12],
+                "importance": max(5, min(6, self._int_between(candidate.get("importance"), 5))),
+                "valence": self._clamp(candidate.get("valence", 0.55)),
+                "arousal": self._clamp(candidate.get("arousal", 0.3)),
+                "confidence": confidence,
+                "source_turn_ids": source_turn_ids,
+                "reason": str(candidate.get("reason") or "").strip()[:160],
+            }
+            normalized.append(item)
+            if len(normalized) >= self.daily_chat_memory_max_per_day:
+                break
+        return normalized
+
+    async def _write_daily_chat_memory_candidates(
+        self,
+        candidates: list[dict],
+        bucket_mgr,
+        *,
+        embedding_engine=None,
+    ) -> dict:
+        results = []
+        created = exists = failed = 0
+        for candidate in candidates:
+            bucket_id = str(candidate.get("id") or "").strip()
+            if not bucket_id:
+                failed += 1
+                results.append({"id": "", "status": "failed", "reason": "missing_candidate_id"})
+                continue
+            if await bucket_mgr.get(bucket_id):
+                exists += 1
+                results.append({"id": bucket_id, "status": "exists"})
+                continue
+            key = str(candidate.get("date") or datetime.now(self.tz).date().isoformat())
+            created_at = self._daily_chat_memory_created_at(key)
+            try:
+                new_id = await bucket_mgr.create(
+                    bucket_id=bucket_id,
+                    content=str(candidate.get("content") or "").strip(),
+                    tags=list(candidate.get("tags") or []),
+                    importance=int(candidate.get("importance") or 5),
+                    domain=self._diary_memory_domain(str(candidate.get("kind") or "")),
+                    valence=self._clamp(candidate.get("valence", 0.55)),
+                    arousal=self._clamp(candidate.get("arousal", 0.3)),
+                    name=str(candidate.get("title") or f"{key} 自动记忆")[:40],
+                    source="daily_chat_memory",
+                    created=created_at,
+                    last_active=created_at,
+                    updated_at=created_at,
+                    confidence=self._clamp(candidate.get("confidence", 0.7)),
+                    date=key,
+                    extra_metadata={
+                        "from_daily_chat": True,
+                        "event_date": key,
+                        "source_conversation_turn_ids": candidate.get("source_turn_ids") or [],
+                        "daily_chat_memory_candidate_id": bucket_id,
+                        "daily_chat_memory_reason": str(candidate.get("reason") or "")[:160],
+                    },
+                )
+                created += 1
+                if embedding_engine and getattr(embedding_engine, "enabled", False):
+                    try:
+                        bucket = await bucket_mgr.get(new_id)
+                        if bucket:
+                            await embedding_engine.generate_and_store(
+                                new_id,
+                                bucket_text_for_embedding(bucket),
+                            )
+                    except Exception as exc:
+                        logger.warning("Daily chat memory embedding failed for %s: %s", new_id, exc)
+                results.append({"id": new_id, "status": "created"})
+            except Exception as exc:
+                failed += 1
+                logger.warning("Daily chat memory write failed for %s: %s", bucket_id, exc)
+                results.append({"id": bucket_id, "status": "failed", "reason": type(exc).__name__})
+        return {"created": created, "exists": exists, "failed": failed, "results": results}
+
+    def _store_daily_chat_memory_pending(self, candidates: list[dict], *, force: bool = False) -> dict:
+        items = self._load_daily_chat_memory_pending()
+        by_id = {str(item.get("id") or ""): item for item in items}
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        added = updated = existing = 0
+        for candidate in candidates:
+            candidate_id = str(candidate.get("id") or "").strip()
+            if not candidate_id:
+                continue
+            item = {
+                "id": candidate_id,
+                "date": candidate.get("date"),
+                "status": "pending",
+                "created_at": now,
+                "candidate": candidate,
+            }
+            if candidate_id in by_id:
+                if force and by_id[candidate_id].get("status") == "pending":
+                    by_id[candidate_id].update(item)
+                    updated += 1
+                else:
+                    existing += 1
+                continue
+            items.append(item)
+            by_id[candidate_id] = item
+            added += 1
+        self._save_daily_chat_memory_pending(items)
+        return {"added": added, "updated": updated, "existing": existing, "candidates": candidates}
+
+    def _load_daily_chat_memory_pending(self) -> list[dict]:
+        try:
+            with open(self.daily_chat_memory_pending_path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except FileNotFoundError:
+            return []
+        except Exception as exc:
+            logger.warning("Daily chat memory pending read failed: %s", exc)
+            return []
+        if isinstance(data, dict):
+            items = data.get("items")
+        else:
+            items = data
+        return [item for item in (items or []) if isinstance(item, dict)]
+
+    def _save_daily_chat_memory_pending(self, items: list[dict]) -> None:
+        os.makedirs(os.path.dirname(self.daily_chat_memory_pending_path), exist_ok=True)
+        payload = {"items": items[-500:]}
+        with open(self.daily_chat_memory_pending_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+
+    def _daily_chat_memory_target(self, key: str = "", now: datetime | None = None) -> datetime:
+        if key:
+            try:
+                parsed = datetime.strptime(str(key), "%Y-%m-%d").date()
+                return datetime.combine(parsed, time.max, tzinfo=self.tz)
+            except ValueError:
+                pass
+        return self._local_now(now)
+
+    def _daily_chat_memory_created_at(self, key: str) -> str:
+        try:
+            parsed = datetime.strptime(str(key), "%Y-%m-%d").date()
+            return datetime.combine(parsed, time.max, tzinfo=self.tz).isoformat(timespec="seconds")
+        except ValueError:
+            return datetime.now(timezone.utc).astimezone(self.tz).isoformat(timespec="seconds")
+
+    @staticmethod
+    def _daily_chat_memory_candidate_id(key: str, kind: str, content: str) -> str:
+        digest = hashlib.sha1(f"{key}|{kind}|{content}".encode("utf-8")).hexdigest()[:10]
+        return f"daily_chat_memory_{str(key).replace('-', '')}_{digest}"
 
     def _fallback_reflection(self, period: str, key: str, materials: dict) -> dict:
         weather_items = materials.get("daily_impressions", []) if period == "weekly" else []
@@ -1720,6 +2211,11 @@ class ReflectionEngine:
         except (TypeError, ValueError):
             number = default
         return max(1, min(10, number))
+
+    @staticmethod
+    def _normalize_daily_chat_memory_mode(value: Any) -> str:
+        mode = str(value or "review").strip().lower()
+        return mode if mode in DAILY_CHAT_MEMORY_MODES else "review"
 
     @staticmethod
     def _normalize_period(period: str) -> str:
