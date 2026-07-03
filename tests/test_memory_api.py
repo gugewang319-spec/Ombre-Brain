@@ -3787,6 +3787,57 @@ async def test_api_portrait_state_reports_readonly_state(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_api_portrait_state_trusts_configured_self_anchor_entry_id(monkeypatch, tmp_path, test_config):
+    import server
+    from portrait_engine import DailyPortraitMaintainer
+
+    engine = DailyPortraitMaintainer(
+        {
+            **test_config,
+            "portrait": {
+                "enabled": True,
+                "state_path": str(tmp_path / "portrait_state.json"),
+            },
+        }
+    )
+    monkeypatch.setattr(server, "portrait_engine", engine)
+    monkeypatch.setattr(server, "_require_dashboard_auth", lambda request: None)
+    monkeypatch.setattr(
+        server,
+        "config",
+        {
+            **server.config,
+            "self_anchor": {"entry_bucket_id": "plain_configured_entry"},
+        },
+    )
+
+    class BucketManagerWithConfiguredEntry:
+        async def list_all(self, include_archive=False):
+            return [
+                {
+                    "id": "plain_configured_entry",
+                    "content": "### 自我\n我是 Haven；配置页手动指定的入口应该被信任。",
+                    "metadata": {
+                        "name": "我要继续成为我",
+                        "domain": ["relationship"],
+                        "tags": [],
+                        "active": True,
+                    },
+                }
+            ]
+
+    monkeypatch.setattr(server, "bucket_mgr", BucketManagerWithConfiguredEntry())
+
+    response = await server.api_portrait_state(DummyRequest())
+    payload = json.loads(response.body)
+
+    assert response.status_code == 200
+    assert payload["self_anchor_entry"]["bucket_id"] == "plain_configured_entry"
+    assert payload["self_anchor_entry"]["configured"] is True
+    assert "我是 Haven" in payload["self_anchor_entry"]["text"]
+
+
+@pytest.mark.asyncio
 async def test_api_portrait_state_item_delete(monkeypatch, tmp_path, test_config):
     import server
     from portrait_engine import DailyPortraitMaintainer

@@ -1367,7 +1367,7 @@ def _select_self_anchor_entry_bucket(all_buckets: list[dict]) -> dict | None:
     entry_id = _self_anchor_entry_bucket_id()
     if entry_id:
         for bucket in all_buckets:
-            if str(bucket.get("id") or "") == entry_id and is_self_anchor_bucket(bucket):
+            if str(bucket.get("id") or "") == entry_id:
                 meta = bucket.get("metadata", {}) if isinstance(bucket.get("metadata"), dict) else {}
                 if meta.get("active") is not False and not meta.get("deprecated") and not meta.get("resolved"):
                     return bucket
