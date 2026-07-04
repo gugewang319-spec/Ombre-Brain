@@ -492,13 +492,14 @@ class ReflectionEngine:
                 base_url=self.daily_chat_memory_base_url,
                 timeout=self.daily_chat_memory_timeout_seconds,
             )
-        self.daily_activity_summary_dehydration_client = None
+        self.dehydration_client = None
         if self.enabled and self.dehydration_api_key and self.dehydration_base_url and self.dehydration_model:
-            self.daily_activity_summary_dehydration_client = AsyncOpenAI(
+            self.dehydration_client = AsyncOpenAI(
                 api_key=self.dehydration_api_key,
                 base_url=self.dehydration_base_url,
                 timeout=45.0,
             )
+        self.daily_activity_summary_dehydration_client = self.dehydration_client
 
     def _load_daily_chat_memory_payload(self) -> dict:
         try:
@@ -1590,14 +1591,12 @@ class ReflectionEngine:
     ) -> list[dict]:
         if not self.daily_chat_memory_summary_enabled:
             return []
-        client = self.daily_chat_memory_client or self.client
+        client, model, use_daily_client = self._daily_chat_memory_model_client(candidate=False)
         if not client:
             return []
         windows = self._daily_chat_memory_windows(turns)
         if not windows:
             return []
-        use_daily_client = client is self.daily_chat_memory_client
-        model = self.daily_chat_memory_summary_model if use_daily_client else self.model
         summaries: list[dict] = []
         for index, window_turns in enumerate(windows):
             fallback_turn_ids, fallback_event_ids = self._daily_chat_memory_window_source_ids(window_turns)
@@ -1651,6 +1650,20 @@ class ReflectionEngine:
                 if cleaned:
                     summaries.append(cleaned)
         return summaries
+
+    def _daily_chat_memory_model_client(self, *, candidate: bool) -> tuple[Any, str, bool]:
+        dehy_client = self._daily_dehydration_client()
+        if dehy_client and self.dehydration_model:
+            return dehy_client, self.dehydration_model, False
+        client = self.daily_chat_memory_client or self.client
+        if not client:
+            return None, "", False
+        use_daily_client = client is self.daily_chat_memory_client
+        if use_daily_client:
+            model = self.daily_chat_memory_candidate_model if candidate else self.daily_chat_memory_summary_model
+        else:
+            model = self.model
+        return client, str(model or "").strip(), use_daily_client
 
     def _normalize_daily_chat_memory_summary(
         self,
@@ -1790,7 +1803,7 @@ class ReflectionEngine:
             item = await self._extract_daily_activity_summary(
                 key,
                 turns,
-                client_override=self.daily_activity_summary_dehydration_client,
+                client_override=self._daily_dehydration_client(),
                 model_override=self.dehydration_model,
             )
         if not item:
@@ -1871,7 +1884,7 @@ class ReflectionEngine:
         )
 
     def _daily_activity_summary_dehydration_retry_available(self) -> bool:
-        if not self.daily_activity_summary_dehydration_client:
+        if not self._daily_dehydration_client():
             return False
         first_model = self.daily_chat_memory_summary_model if self.daily_chat_memory_client else self.model
         first_base_url = self.daily_chat_memory_base_url if self.daily_chat_memory_client else self.base_url
@@ -1881,6 +1894,9 @@ class ReflectionEngine:
             or self.dehydration_base_url != str(first_base_url or "").strip().rstrip("/")
             or self.dehydration_api_key != str(first_api_key or "").strip()
         )
+
+    def _daily_dehydration_client(self) -> Any:
+        return self.dehydration_client or self.daily_activity_summary_dehydration_client
 
     def _normalize_daily_activity_summary(
         self,
@@ -2292,10 +2308,8 @@ class ReflectionEngine:
         window_summaries: list[dict] | None = None,
         max_candidates: int | None = None,
     ) -> list[dict]:
-        client = self.daily_chat_memory_client or self.client
+        client, model, use_daily_client = self._daily_chat_memory_model_client(candidate=True)
         if client:
-            use_daily_client = client is self.daily_chat_memory_client
-            model = self.daily_chat_memory_candidate_model if use_daily_client else self.model
             summaries = window_summaries or []
             payload = {
                 "date": key,

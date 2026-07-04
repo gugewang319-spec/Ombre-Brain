@@ -1312,6 +1312,122 @@ async def test_daily_chat_memory_passes_self_anchor_entry_to_model(test_config):
 
 
 @pytest.mark.asyncio
+async def test_daily_chat_memory_prefers_dehydration_model_for_summary_and_candidates(test_config):
+    cfg = _no_api_config(test_config)
+    cfg["identity"] = {
+        "ai_name": "Haven",
+        "user_name": "Xiaoyu",
+        "user_display_name": "池又雨",
+        "user_aliases": ["宝宝"],
+    }
+    cfg["reflection"]["daily_chat_memory_mode"] = "review"
+    cfg["reflection"]["daily_chat_memory_turn_limit"] = 0
+    bucket_mgr = BucketManager(cfg)
+    engine = ReflectionEngine(cfg)
+    engine.model = "cheap-reflection-model"
+    engine.client = RecordingChatClient('{"candidates":[]}')
+    engine.daily_chat_memory_client = RecordingChatClient('{"candidates":[]}')
+    engine.dehydration_model = "dehydration-model"
+    engine.dehydration_base_url = "https://dehy.example/v1"
+    engine.dehydration_api_key = "dehy-key"
+    engine.dehydration_client = SequencedChatClient(
+        [
+            json.dumps(
+                {
+                    "summaries": [
+                        {
+                            "title": "自动记忆换模型",
+                            "summary": "池又雨确认自动记忆应从当天 raw_events 取原文，多窗口压缩后用脱水模型抽候选，避免便宜模型空返回。",
+                            "signals": ["project_state"],
+                            "source_event_ids": [701, 702],
+                            "confidence": 0.76,
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            ),
+            json.dumps(
+                {
+                    "candidates": [
+                        {
+                            "should_write": True,
+                            "kind": "project_state",
+                            "title": "自动记忆改用脱水模型",
+                            "content": "池又雨确认自动记忆应从当天 raw_events 取原文，先做窗口摘要，再用脱水模型抽候选；便宜模型只保留为无脱水配置时的后备。",
+                            "domain": "project",
+                            "tags": ["project_state"],
+                            "importance": 5,
+                            "confidence": 0.7,
+                            "source_event_ids": [701, 702],
+                            "reason": "daily_memory_model_quality",
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            ),
+        ]
+    )
+    engine.daily_activity_summary_dehydration_client = engine.dehydration_client
+    now = datetime(2026, 7, 4, 23, 59, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    class RawEventStore:
+        def list_events_between(self, *, start_at, end_at, limit):
+            return [
+                {
+                    "id": 701,
+                    "role": "user",
+                    "text": "自动记忆也改脱水模型，从 raw_events 原文多调用几次。",
+                    "created_at": "2026-07-04T21:00:00+08:00",
+                    "conversation_id": "daily-chat",
+                    "session_id": "daily-chat",
+                    "client": "gateway",
+                    "metadata": {"profile_id": "haven_xiaoyu", "round_id": 1},
+                },
+                {
+                    "id": 702,
+                    "role": "assistant",
+                    "text": "窗口摘要和候选抽取都改成 dehydration 优先。",
+                    "created_at": "2026-07-04T21:00:00+08:00",
+                    "conversation_id": "daily-chat",
+                    "session_id": "daily-chat",
+                    "client": "gateway",
+                    "metadata": {"profile_id": "haven_xiaoyu", "round_id": 1},
+                },
+            ]
+
+    class ConversationTurnStore:
+        def list_conversation_turns_between(self, **kwargs):
+            raise AssertionError("daily chat memory should use raw_events before conversation_turns")
+
+    class Persona:
+        profile_id = "haven_xiaoyu"
+
+    result = await engine.run_daily_chat_memory(
+        bucket_mgr,
+        conversation_turn_store=ConversationTurnStore(),
+        raw_event_store=RawEventStore(),
+        persona_engine=Persona(),
+        now=now,
+    )
+
+    assert result["status"] == "pending"
+    assert result["window_summaries"] == 1
+    assert result["added"] == 1
+    assert engine.client.calls == []
+    assert engine.daily_chat_memory_client.calls == []
+    calls = engine.dehydration_client.calls
+    assert len(calls) == 2
+    assert all(call["model"] == "dehydration-model" for call in calls)
+    summary_payload = json.loads(calls[0]["messages"][1]["content"])
+    assert summary_payload["conversation_turns"][0]["raw_event_ids"] == [701, 702]
+    extraction_payload = json.loads(calls[-1]["messages"][1]["content"])
+    assert extraction_payload["conversation_turns"] == []
+    assert "脱水模型" in extraction_payload["window_summaries"][0]["summary"]
+    pending = engine.list_daily_chat_memory_pending()
+    assert pending[0]["candidate"]["source_event_ids"] == [701, 702]
+
+
+@pytest.mark.asyncio
 async def test_daily_chat_memory_reads_configured_self_anchor_entry(test_config):
     cfg = _no_api_config(test_config)
     cfg["self_anchor"] = {"entry_bucket_id": "self_entry"}
