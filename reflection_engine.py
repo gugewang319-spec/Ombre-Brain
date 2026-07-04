@@ -86,7 +86,9 @@ REFLECT_PROMPT_TEMPLATE = """你是 {ai_name} 的记忆反思器。请根据给�
 - content 不要自己写 Markdown affect_anchor 块；affect_anchor 单独放字段里。
 - 日印象只写当天关系温度，不写日报式事件清单；日记可作为当天关系天气来源之一。
 - conversation_turns 是当天短期对话原文，只当关系天气材料，不要把口头上下文直接写成稳定画像事实。
+- daily_chat_memories 是当天自动记忆已经挑出的候选或已写入记忆，可作为当天关系天气和近期事项的主要材料。
 - 有 conversation_turns 时，优先用普通记忆和对话原文；persona_events 只是没有原文时的轻量补充。
+- 有 daily_chat_memories 时，优先参考它们；它们已经过筛选，比原始聊天流水更适合作为日印象素材。
 - 周印象优先总结本周 daily_impressions，再参考高重要普通记忆和未完成承诺；不要直接吞整周日记。
 - 写 affect_anchor 前，先在内部感受这段关系天气的情绪运动：起点是什么、转折在哪里、最后落到哪里。不要输出思考过程，只输出 JSON。
 - affect_anchor 默认必须给，用一个具体情境和 2 到 4 个和弦表达这段关系天气的温度。
@@ -706,6 +708,7 @@ class ReflectionEngine:
         force: bool = False,
         now: datetime | None = None,
         conversation_turn_store=None,
+        daily_chat_memory_candidates: list[dict] | None = None,
     ) -> dict:
         if not self.enabled:
             return {
@@ -750,9 +753,15 @@ class ReflectionEngine:
             bucket_mgr,
             persona_engine,
             conversation_turn_store=conversation_turn_store,
+            daily_chat_memory_candidates=daily_chat_memory_candidates,
         )
         min_daily_buckets = self.daily_min_memory_items
-        if period == "daily" and min_daily_buckets > 0 and len(materials["buckets"]) < min_daily_buckets:
+        if (
+            period == "daily"
+            and min_daily_buckets > 0
+            and len(materials["buckets"]) < min_daily_buckets
+            and not materials.get("daily_chat_memories")
+        ):
             diary_memory = await self._maybe_extract_diary_memory(
                 period,
                 key,
@@ -775,6 +784,7 @@ class ReflectionEngine:
                 "materials": {
                     "buckets": len(materials["buckets"]),
                     "daily_impressions": len(materials["daily_impressions"]),
+                    "daily_chat_memories": len(materials["daily_chat_memories"]),
                     "persona_events": len(materials["persona_events"]),
                     "conversation_turns": len(materials["conversation_turns"]),
                     "commitments": len(materials["commitments"]),
@@ -784,6 +794,7 @@ class ReflectionEngine:
         if (
             not materials["buckets"]
             and not materials["daily_impressions"]
+            and not materials["daily_chat_memories"]
             and not materials["persona_events"]
             and not materials["conversation_turns"]
             and not materials["diary"]
@@ -844,6 +855,11 @@ class ReflectionEngine:
             "source_bucket_ids": source_bucket_ids[:40],
             "source_persona_event_ids": source_persona_event_ids[:40],
             "source_conversation_turn_ids": source_conversation_turn_ids[:80],
+            "source_daily_chat_memory_candidate_ids": [
+                str(item.get("id") or "")
+                for item in materials.get("daily_chat_memories", [])
+                if item.get("id")
+            ][:40],
         }
 
         if existing:
@@ -916,9 +932,16 @@ class ReflectionEngine:
                 "diary_id": materials.get("diary", {}).get("id") if materials.get("diary") else None,
             },
             "diary_memory": diary_memory,
+            "daily_impression": {
+                "id": bucket_id,
+                "content": content,
+                "confidence": confidence,
+                "date": key,
+            },
             "materials": {
                 "buckets": len(materials["buckets"]),
                 "daily_impressions": len(materials["daily_impressions"]),
+                "daily_chat_memories": len(materials["daily_chat_memories"]),
                 "persona_events": len(materials["persona_events"]),
                 "conversation_turns": len(materials["conversation_turns"]),
                 "commitments": len(materials["commitments"]),
@@ -938,6 +961,7 @@ class ReflectionEngine:
             return []
         now_local = self._local_now()
         results = []
+        chat_candidates: list[dict] = []
         if self.daily_chat_memory_mode != "off" and now_local.hour >= self.daily_chat_memory_hour:
             chat_date = (now_local - timedelta(days=1)).date()
             chat_target = datetime.combine(chat_date, time.max, tzinfo=self.tz)
@@ -951,6 +975,9 @@ class ReflectionEngine:
             )
             if chat_result.get("status") not in {"disabled", "skipped"}:
                 results.append(chat_result)
+            chat_candidates = [
+                item for item in (chat_result.get("candidates") or []) if isinstance(item, dict)
+            ]
         if self.daily_enabled and now_local.hour >= self.daily_hour:
             daily_date = (now_local - timedelta(days=1)).date()
             daily_target = datetime.combine(daily_date, time.max, tzinfo=self.tz)
@@ -963,6 +990,7 @@ class ReflectionEngine:
                     force=False,
                     now=daily_target,
                     conversation_turn_store=conversation_turn_store,
+                    daily_chat_memory_candidates=chat_candidates,
                 )
             )
         if self.weekly_enabled and now_local.weekday() == self.weekly_day and now_local.hour >= self.weekly_hour:
@@ -1344,10 +1372,12 @@ class ReflectionEngine:
         bucket_mgr,
         persona_engine,
         conversation_turn_store=None,
+        daily_chat_memory_candidates: list[dict] | None = None,
     ) -> dict:
         start, end = self._period_window(period, now_local)
         buckets = []
         daily_impressions = []
+        daily_chat_memories = []
         commitments = []
         conversation_turns = []
         try:
@@ -1372,6 +1402,8 @@ class ReflectionEngine:
                     and not is_profile_fact
                 ):
                     buckets.append(self._memory_payload(bucket, content_limit=420))
+                    if meta.get("source") == "daily_chat_memory" or meta.get("from_daily_chat"):
+                        daily_chat_memories.append(self._daily_chat_memory_material_from_bucket(bucket))
             elif meta.get("type") != "feel" and (created_in_window or updated_in_window):
                 buckets.append(self._memory_payload(bucket, content_limit=420))
             if tags & {"commitment", "todo", "wish"} and not meta.get("resolved"):
@@ -1396,6 +1428,18 @@ class ReflectionEngine:
             conversation_turns = self._conversation_turn_payloads(
                 raw_turns,
                 limit=self.daily_conversation_turn_limit,
+            )
+
+        if period == "daily":
+            key = now_local.date().isoformat()
+            daily_chat_memories = self._dedupe_daily_chat_memory_materials(
+                [
+                    *daily_chat_memories,
+                    *self._daily_chat_memory_materials_for_date(
+                        key,
+                        daily_chat_memory_candidates=daily_chat_memory_candidates,
+                    ),
+                ]
             )
 
         persona_events = []
@@ -1439,6 +1483,7 @@ class ReflectionEngine:
         return {
             "buckets": buckets[:30],
             "daily_impressions": daily_impressions[:7],
+            "daily_chat_memories": daily_chat_memories[:12],
             "persona_events": persona_events[: self.persona_events_limit],
             "conversation_turns": conversation_turns,
             "commitments": commitments[:12],
@@ -1708,6 +1753,93 @@ class ReflectionEngine:
             "confidence": confidence,
         }
 
+    def _daily_chat_memory_materials_for_date(
+        self,
+        key: str,
+        *,
+        daily_chat_memory_candidates: list[dict] | None = None,
+    ) -> list[dict]:
+        materials: list[dict] = []
+        for candidate in daily_chat_memory_candidates or []:
+            material = self._daily_chat_memory_material(candidate)
+            if material and (not key or material.get("date") == key):
+                materials.append(material)
+        for item in self._load_daily_chat_memory_pending():
+            if str(item.get("date") or "") != key:
+                continue
+            if str(item.get("status") or "pending") not in {"pending", "confirmed"}:
+                continue
+            material = self._daily_chat_memory_material(item.get("candidate") or {})
+            if material:
+                materials.append(material)
+        return self._dedupe_daily_chat_memory_materials(materials)
+
+    @staticmethod
+    def _dedupe_daily_chat_memory_materials(materials: list[dict]) -> list[dict]:
+        deduped: dict[str, dict] = {}
+        for item in materials:
+            item_id = str(item.get("id") or "")
+            key_value = item_id or re.sub(r"\s+", "", str(item.get("content") or "")).lower()
+            if key_value and key_value not in deduped:
+                deduped[key_value] = item
+        return list(deduped.values())
+
+    def _daily_chat_memory_material_from_bucket(self, bucket: dict) -> dict:
+        if not isinstance(bucket, dict):
+            return {}
+        meta = bucket.get("metadata", {}) if isinstance(bucket.get("metadata"), dict) else {}
+        candidate_id = str(meta.get("daily_chat_memory_candidate_id") or bucket.get("id") or "").strip()
+        source_turn_ids = meta.get("source_conversation_turn_ids") or []
+        source_event_ids = meta.get("source_raw_event_ids") or []
+        return self._daily_chat_memory_material(
+            {
+                "id": candidate_id,
+                "date": meta.get("event_date") or meta.get("date") or "",
+                "kind": meta.get("kind") or "",
+                "title": meta.get("name") or "",
+                "content": bucket.get("content") or "",
+                "tags": meta.get("tags") or [],
+                "domain": meta.get("domain") or [],
+                "confidence": meta.get("confidence", 0.7),
+                "source_turn_ids": source_turn_ids,
+                "source_event_ids": source_event_ids,
+                "reason": meta.get("daily_chat_memory_reason") or "",
+            }
+        )
+
+    def _daily_chat_memory_material(self, candidate: dict) -> dict:
+        if not isinstance(candidate, dict):
+            return {}
+        content = re.sub(
+            r"\s+",
+            " ",
+            strip_wikilinks(str(candidate.get("content") or candidate.get("summary") or "")).strip(),
+        )
+        if not content:
+            return {}
+        title = str(candidate.get("title") or "").strip()
+        return {
+            "id": str(candidate.get("id") or "").strip(),
+            "date": str(candidate.get("date") or "").strip(),
+            "kind": str(candidate.get("kind") or "").strip(),
+            "title": title[:40],
+            "content": content[:420],
+            "tags": self._string_list(candidate.get("tags"), limit=12),
+            "domain": self._string_list(candidate.get("domain"), limit=6),
+            "confidence": self._clamp(candidate.get("confidence", 0.65)),
+            "source_turn_ids": [
+                int(turn_id)
+                for turn_id in self._string_list(candidate.get("source_turn_ids"), limit=80)
+                if str(turn_id).isdigit()
+            ],
+            "source_event_ids": [
+                int(event_id)
+                for event_id in self._string_list(candidate.get("source_event_ids"), limit=160)
+                if str(event_id).isdigit()
+            ],
+            "reason": str(candidate.get("reason") or "").strip()[:160],
+        }
+
     @staticmethod
     def _max_daily_chat_memory_raw_event_id(turns: list[dict]) -> int:
         max_id = 0
@@ -1775,17 +1907,38 @@ class ReflectionEngine:
         conversation_turn_store=None,
         raw_event_store=None,
         persona_engine=None,
+        daily_chat_memory_candidates: list[dict] | None = None,
+        daily_impressions: list[dict] | None = None,
         key: str = "",
         force: bool = False,
         now: datetime | None = None,
     ) -> dict:
         if not self.enabled or not self.daily_activity_summary_enabled:
             return {"status": "disabled", "reason": "daily_activity_summary_off"}
-        if not conversation_turn_store and not raw_event_store:
-            return {"status": "skipped", "reason": "no_conversation_source"}
 
         now_local = self._daily_chat_memory_target(key, now)
         key = now_local.date().isoformat()
+        memory_item = self._daily_activity_summary_from_memory_materials(
+            key,
+            daily_chat_memories=self._daily_chat_memory_materials_for_date(
+                key,
+                daily_chat_memory_candidates=daily_chat_memory_candidates,
+            ),
+            daily_impressions=daily_impressions or [],
+        )
+        if memory_item:
+            return {
+                "status": "ready",
+                "date": key,
+                "turns": 0,
+                "turn_source": "daily_memory_materials",
+                "force": bool(force),
+                "activity_summary": memory_item,
+            }
+
+        if not conversation_turn_store and not raw_event_store:
+            return {"status": "skipped", "reason": "no_conversation_source"}
+
         start, end = self._period_window("daily", now_local)
         profile_id = str(getattr(persona_engine, "profile_id", "") or "default")
         turns, turn_source = self._daily_activity_summary_turns(
@@ -1824,6 +1977,79 @@ class ReflectionEngine:
             "force": bool(force),
             "activity_summary": item,
         }
+
+    def _daily_activity_summary_from_memory_materials(
+        self,
+        key: str,
+        *,
+        daily_chat_memories: list[dict],
+        daily_impressions: list[dict],
+    ) -> dict:
+        snippets: list[str] = []
+        source_event_ids: list[int] = []
+        source_turn_ids: list[int] = []
+        evidence: list[dict] = []
+        confidences: list[float] = []
+        for item in daily_chat_memories or []:
+            title = str(item.get("title") or "").strip()
+            content = str(item.get("content") or "").strip()
+            text = content or title
+            if title and content and title not in content:
+                text = f"{title}：{content}"
+            text = re.sub(r"\s+", " ", strip_wikilinks(text)).strip()
+            if text:
+                snippets.append(self._clip_activity_material(text))
+            source_event_ids.extend(
+                int(event_id)
+                for event_id in (item.get("source_event_ids") or [])
+                if str(event_id).isdigit()
+            )
+            source_turn_ids.extend(
+                int(turn_id)
+                for turn_id in (item.get("source_turn_ids") or [])
+                if str(turn_id).isdigit()
+            )
+            if item.get("id"):
+                evidence.append({"candidate_id": str(item.get("id"))})
+            confidences.append(self._clamp(item.get("confidence", 0.65)))
+        for item in daily_impressions or []:
+            content = re.sub(
+                r"\s+",
+                " ",
+                strip_wikilinks(str(item.get("content") or item.get("text") or "")).strip(),
+            )
+            content = re.split(r"\n?### affect_anchor\b", content, maxsplit=1)[0].strip()
+            if content:
+                snippets.append(self._clip_activity_material(content, limit=80))
+            if item.get("id"):
+                evidence.append({"bucket_id": str(item.get("id"))})
+            confidences.append(self._clamp(item.get("confidence", 0.7)))
+        snippets = list(dict.fromkeys(snippets))[:4]
+        if not snippets:
+            return {}
+        text = "；".join(snippets)
+        if len(text) > 140:
+            text = text[:137].rstrip("，,；;、 ") + "..."
+        return {
+            "timeline_id": f"daily_activity_summary:{key}",
+            "source": "daily_activity_summary",
+            "scope": "doing",
+            "text": text,
+            "evidence": evidence[:4],
+            "source_date": key,
+            "source_dates": [key],
+            "timestamp": self._daily_chat_memory_created_at(key),
+            "confidence": max(confidences or [0.65]),
+            "source_turn_ids": list(dict.fromkeys(source_turn_ids))[:80],
+            "source_event_ids": list(dict.fromkeys(source_event_ids))[:160],
+        }
+
+    @staticmethod
+    def _clip_activity_material(text: str, *, limit: int = 72) -> str:
+        text = re.sub(r"\s+", " ", str(text or "")).strip(" -\t\r\n")
+        if len(text) <= limit:
+            return text
+        return text[: limit - 3].rstrip("，,；;、 ") + "..."
 
     async def _extract_daily_activity_summary(
         self,
@@ -2139,6 +2365,7 @@ class ReflectionEngine:
                 "window_summaries": len(window_summaries),
                 "last_raw_event_id": max_seen_raw_event_id or raw_event_cursor_id,
                 "cursor_updated": cursor_updated,
+                "candidates": candidates,
                 **pending,
             }
 
@@ -2161,6 +2388,7 @@ class ReflectionEngine:
             "window_summaries": len(window_summaries),
             "last_raw_event_id": max_seen_raw_event_id or raw_event_cursor_id,
             "cursor_updated": cursor_updated,
+            "candidates": candidates,
             **write_result,
         }
 
@@ -2970,6 +3198,7 @@ class ReflectionEngine:
         names = [item.get("name") or item.get("id") for item in weather_items[:7]]
         if not names:
             names = [item.get("name") or item.get("id") for item in materials.get("buckets", [])[:6]]
+        daily_chat_memories = materials.get("daily_chat_memories", [])
         conversation_turns = materials.get("conversation_turns", [])
         commitments = [item.get("name") or item.get("id") for item in materials.get("commitments", [])[:4]]
         label = "今天" if period == "daily" else "本周"
@@ -2979,6 +3208,9 @@ class ReflectionEngine:
             main = "、".join([name for name in names if name])
             owed = "；仍需记住：" + "、".join(commitments) if commitments else ""
             content = f"{label}的关系天气：围绕{main or '几件轻小的事'}留下痕迹{owed}。"
+        elif daily_chat_memories:
+            first = daily_chat_memories[0].get("content") or daily_chat_memories[0].get("title") or "自动记忆挑出的线头"
+            content = f"{label}的关系天气先从自动记忆挑出的 {len(daily_chat_memories)} 个线头里成形，最清楚的是：{first}。"
         elif conversation_turns:
             content = f"{label}的关系天气从 {len(conversation_turns)} 轮短期对话里留下一点原声，先只记温度，不把流水账写成事件清单。"
         elif diary:
@@ -2987,9 +3219,13 @@ class ReflectionEngine:
         else:
             content = f"{label}的关系天气很轻，暂时没有明显需要带走的脉络。"
         anchor_scene = names[0] if names else (
+            daily_chat_memories[0].get("title") or daily_chat_memories[0].get("content")
+            if daily_chat_memories
+            else (
             "当天短期对话的原声"
             if conversation_turns
             else (diary.get("title") if diary else ("这一段关系天气很轻" if period == "daily" else "这一周的关系天气慢慢落下"))
+            )
         )
         return {
             "title": title,

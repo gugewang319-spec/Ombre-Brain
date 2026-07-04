@@ -754,6 +754,80 @@ async def test_reflect_daily_requires_five_memory_or_update_items(test_config):
 
 
 @pytest.mark.asyncio
+async def test_reflect_daily_uses_auto_memory_candidates_without_min_bucket_gate(test_config):
+    cfg = _no_api_config(test_config)
+    bucket_mgr = BucketManager(cfg)
+    engine = ReflectionEngine(cfg)
+    now = datetime(2026, 5, 21, 20, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    result = await engine.reflect(
+        "daily",
+        bucket_mgr,
+        force=True,
+        now=now,
+        daily_chat_memory_candidates=[
+            {
+                "id": "daily_chat_memory_20260521_auto",
+                "date": "2026-05-21",
+                "kind": "project_state",
+                "title": "自动记忆作为日印象素材",
+                "content": "小雨确认自动记忆挑出的候选可以直接作为日印象素材，不再被普通记忆数量限制卡住。",
+                "domain": ["project"],
+                "tags": ["project_state"],
+                "confidence": 0.8,
+                "source_event_ids": [701, 702],
+            }
+        ],
+    )
+    bucket = await bucket_mgr.get("reflection_daily_2026-05-21")
+
+    assert result["status"] == "created"
+    assert result["materials"]["buckets"] == 0
+    assert result["materials"]["daily_chat_memories"] == 1
+    assert result["materials"]["min_buckets"] == 5
+    assert bucket is not None
+    assert "自动记忆" in bucket["content"]
+    assert bucket["metadata"]["source_daily_chat_memory_candidate_ids"] == ["daily_chat_memory_20260521_auto"]
+
+
+@pytest.mark.asyncio
+async def test_reflect_daily_uses_written_daily_chat_memory_without_min_bucket_gate(test_config):
+    cfg = _no_api_config(test_config)
+    bucket_mgr = BucketManager(cfg)
+    engine = ReflectionEngine(cfg)
+    await bucket_mgr.create(
+        bucket_id="daily_chat_memory_20260521_written",
+        content="小雨确认自动记忆直接写入后，也应该作为日印象素材，不再被普通记忆数量限制卡住。",
+        tags=["from_daily_chat", "project_state"],
+        importance=5,
+        domain=["project"],
+        name="自动记忆直写日印象素材",
+        source="daily_chat_memory",
+        created="2026-05-21T23:59:59+08:00",
+        last_active="2026-05-21T23:59:59+08:00",
+        updated_at="2026-05-21T23:59:59+08:00",
+        confidence=0.78,
+        date="2026-05-21",
+        extra_metadata={
+            "from_daily_chat": True,
+            "event_date": "2026-05-21",
+            "source_raw_event_ids": [811, 812],
+            "daily_chat_memory_candidate_id": "daily_chat_memory_20260521_written",
+        },
+    )
+    now = datetime(2026, 5, 21, 20, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    result = await engine.reflect("daily", bucket_mgr, force=True, now=now)
+    bucket = await bucket_mgr.get("reflection_daily_2026-05-21")
+
+    assert result["status"] == "created"
+    assert result["materials"]["buckets"] == 1
+    assert result["materials"]["daily_chat_memories"] == 1
+    assert bucket is not None
+    assert bucket["metadata"]["source_daily_chat_memory_candidate_ids"] == ["daily_chat_memory_20260521_written"]
+
+
+@pytest.mark.asyncio
 async def test_reflect_daily_uses_configured_min_memory_items(test_config):
     cfg = _no_api_config(test_config)
     cfg["reflection"]["daily_min_memory_items"] = 3
@@ -1599,6 +1673,61 @@ async def test_daily_activity_summary_prefers_raw_events_not_auto_memory_candida
     assert "window_summaries" not in payload
     assert "candidates" not in payload
     assert payload["conversation_turns"][0]["raw_event_ids"] == [301, 302]
+
+
+@pytest.mark.asyncio
+async def test_daily_activity_summary_prefers_auto_memory_materials_without_model_call(test_config):
+    cfg = _no_api_config(test_config)
+    engine = ReflectionEngine(cfg)
+    engine.daily_chat_memory_client = RecordingChatClient(
+        json.dumps(
+            {
+                "summary": "这条不应该被调用。",
+                "confidence": 0.99,
+            },
+            ensure_ascii=False,
+        )
+    )
+
+    class RawEventStore:
+        def list_events_between(self, *, start_at, end_at, limit):
+            raise AssertionError("activity summary should not read raw_events when memory materials exist")
+
+    result = await engine.run_daily_activity_summary(
+        raw_event_store=RawEventStore(),
+        key="2026-07-04",
+        daily_chat_memory_candidates=[
+            {
+                "id": "daily_chat_memory_20260704_plan",
+                "date": "2026-07-04",
+                "kind": "project_state",
+                "title": "自动记忆到handoff",
+                "content": "小雨确认 handoff doing 摘要应等自动记忆挑完候选后，从候选和日印象材料里取，不再单独扫全量原文。",
+                "confidence": 0.82,
+                "source_event_ids": [801, 802],
+            }
+        ],
+        daily_impressions=[
+            {
+                "id": "reflection_daily_2026-07-04",
+                "content": "今天的关系天气围绕自动记忆和 handoff 材料收束。",
+                "confidence": 0.77,
+            }
+        ],
+    )
+
+    assert result["status"] == "ready"
+    assert result["turn_source"] == "daily_memory_materials"
+    item = result["activity_summary"]
+    assert item["timeline_id"] == "daily_activity_summary:2026-07-04"
+    assert item["source_event_ids"] == [801, 802]
+    assert item["evidence"] == [
+        {"candidate_id": "daily_chat_memory_20260704_plan"},
+        {"bucket_id": "reflection_daily_2026-07-04"},
+    ]
+    assert "自动记忆到handoff" in item["text"]
+    assert "关系天气" in item["text"]
+    assert engine.daily_chat_memory_client.calls == []
 
 
 @pytest.mark.asyncio

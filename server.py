@@ -10961,10 +10961,16 @@ async def api_daily_chat_memory_run(request):
             force=_bool_value(body.get("force"), False),
         )
         try:
+            activity_date = str(body.get("date") or result.get("date") or "")
+            daily_impression = await _daily_impression_material_for_date(activity_date)
             activity_result = await reflection_engine.run_daily_activity_summary(
                 conversation_turn_store=gateway_state_store,
                 raw_event_store=raw_event_store,
                 persona_engine=persona_engine,
+                daily_chat_memory_candidates=[
+                    item for item in (result.get("candidates") or []) if isinstance(item, dict)
+                ],
+                daily_impressions=[daily_impression] if daily_impression else [],
                 key=str(body.get("date") or ""),
                 force=_bool_value(body.get("force"), False),
             )
@@ -10996,6 +11002,39 @@ def _store_daily_activity_summary_result(result: dict, portrait_engine_arg=None)
     return {**result, "status": "stored", "portrait": stored}
 
 
+def _daily_activity_materials_from_reflection_results(results: list[dict]) -> tuple[list[dict], list[dict]]:
+    candidates: list[dict] = []
+    daily_impressions: list[dict] = []
+    for result in results or []:
+        if not isinstance(result, dict):
+            continue
+        candidates.extend(item for item in (result.get("candidates") or []) if isinstance(item, dict))
+        daily_impression = result.get("daily_impression")
+        if isinstance(daily_impression, dict):
+            daily_impressions.append(daily_impression)
+    return candidates, daily_impressions
+
+
+async def _daily_impression_material_for_date(date_key: str, bucket_mgr_arg=None) -> dict:
+    safe_date = _date_key(date_key)
+    if not safe_date:
+        return {}
+    manager = bucket_mgr_arg or bucket_mgr
+    try:
+        bucket = await manager.get(f"reflection_daily_{safe_date}")
+    except Exception:
+        bucket = None
+    if not bucket:
+        return {}
+    meta = bucket.get("metadata", {}) if isinstance(bucket.get("metadata"), dict) else {}
+    return {
+        "id": bucket.get("id") or f"reflection_daily_{safe_date}",
+        "content": bucket.get("content") or "",
+        "confidence": meta.get("confidence", 0.7),
+        "date": safe_date,
+    }
+
+
 @mcp.custom_route("/api/daily-activity-summary/run", methods=["POST"])
 async def api_daily_activity_summary_run(request):
     """Summarize what happened that day into portrait recent_timeline."""
@@ -11010,10 +11049,13 @@ async def api_daily_activity_summary_run(request):
     if not isinstance(body, dict):
         body = {}
     try:
+        activity_date = str(body.get("date") or "")
+        daily_impression = await _daily_impression_material_for_date(activity_date)
         result = await reflection_engine.run_daily_activity_summary(
             conversation_turn_store=gateway_state_store,
             raw_event_store=raw_event_store,
             persona_engine=persona_engine,
+            daily_impressions=[daily_impression] if daily_impression else [],
             key=str(body.get("date") or ""),
             force=_bool_value(body.get("force"), False),
         )
@@ -12894,10 +12936,22 @@ if __name__ == "__main__":
                             source="daily_activity_summary",
                             timeline_id=timeline_id,
                         ):
+                            activity_candidates, activity_daily_impressions = (
+                                _daily_activity_materials_from_reflection_results(results)
+                            )
+                            if not activity_daily_impressions:
+                                existing_daily_impression = await _daily_impression_material_for_date(
+                                    activity_date,
+                                    local_bucket_mgr,
+                                )
+                                if existing_daily_impression:
+                                    activity_daily_impressions.append(existing_daily_impression)
                             activity_result = await local_reflection_engine.run_daily_activity_summary(
                                 conversation_turn_store=local_gateway_state_store,
                                 raw_event_store=raw_event_store,
                                 persona_engine=local_persona_engine,
+                                daily_chat_memory_candidates=activity_candidates,
+                                daily_impressions=activity_daily_impressions,
                                 key=activity_date,
                             )
                             stored_activity = _store_daily_activity_summary_result(
