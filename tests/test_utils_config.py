@@ -63,6 +63,9 @@ def test_load_config_defaults_relationship_weather_off(tmp_path):
     assert config["portrait"]["state_path"] == ""
     assert config["dream"]["old_echo_enabled"] is True
     assert config["dream"]["old_echo_min_age_hours"] == 72
+    assert config["dream"]["raw_residue_enabled"] is False
+    assert config["dream"]["raw_residue_turns"] == 4
+    assert config["dream"]["raw_residue_max_chars"] == 1500
 
 
 def test_load_config_reads_runtime_config_before_env_override(tmp_path, monkeypatch):

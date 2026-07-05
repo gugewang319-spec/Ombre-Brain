@@ -745,6 +745,9 @@ dream:
   material_limit: 5
   old_echo_enabled: true           # add one old memory echo without counting it as recent material
   old_echo_min_age_hours: 72       # old echo must be older than this many hours
+  raw_residue_enabled: false       # true lets dreams sample a few original turns from the previous local day
+  raw_residue_turns: 4             # complete user/assistant turns, sampled across the day
+  raw_residue_max_chars: 1500      # cap original dialogue sent to the dream model
   identity_anchor_id: "c0b8ddb7423e"
   min_surface_age_hours: 3
   surface_threshold: 0.62

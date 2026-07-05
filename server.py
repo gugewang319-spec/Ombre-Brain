@@ -11355,6 +11355,9 @@ async def api_config_get(request):
             "daily_probability": dream_cfg.get("daily_probability", 0.4),
             "min_material_count": dream_cfg.get("min_material_count", 5),
             "material_window_hours": dream_cfg.get("material_window_hours", 48),
+            "raw_residue_enabled": _bool_value(dream_cfg.get("raw_residue_enabled"), False),
+            "raw_residue_turns": int(dream_cfg.get("raw_residue_turns", 4)),
+            "raw_residue_max_chars": int(dream_cfg.get("raw_residue_max_chars", 1500)),
             "identity_anchor_id": dream_cfg.get("identity_anchor_id", ""),
         },
         "reflection": {
@@ -12101,6 +12104,9 @@ async def api_config_update(request):
             "daily_probability",
             "min_material_count",
             "material_window_hours",
+            "raw_residue_enabled",
+            "raw_residue_turns",
+            "raw_residue_max_chars",
             "identity_anchor_id",
         ):
             if key in d:
@@ -12539,6 +12545,9 @@ async def api_config_update(request):
                     "daily_probability",
                     "min_material_count",
                     "material_window_hours",
+                    "raw_residue_enabled",
+                    "raw_residue_turns",
+                    "raw_residue_max_chars",
                     "identity_anchor_id",
                 ):
                     if key in body["dream"]:
@@ -13061,6 +13070,7 @@ if __name__ == "__main__":
                     result = await local_dream_engine.run_due(
                         local_bucket_mgr,
                         local_embedding_engine,
+                        raw_event_store=raw_event_store,
                     )
                     if result and result.get("status") == "created":
                         logger.info("Dream run-due result / 夜梦定时结果: %s", result)

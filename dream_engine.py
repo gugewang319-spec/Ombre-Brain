@@ -17,9 +17,15 @@ import yaml
 from openai import AsyncOpenAI
 
 from identity import identity_names
+from raw_events import raw_event_text_looks_injected, strip_raw_client_context
 from utils import bucket_text_for_embedding, strip_wikilinks
 
 logger = logging.getLogger("ombre_brain.dream")
+
+RAW_RESIDUE_NOISE_RE = re.compile(
+    r"(测试召回|召回测试|测试一下召回|测一下|试试看|还记得吗|有没有被注入|被注入了吗|笔友都有谁|debug\s*injection)",
+    re.IGNORECASE,
+)
 
 
 DREAM_PROMPT = """你在睡梦中。
@@ -30,6 +36,7 @@ DREAM_PROMPT = """你在睡梦中。
 - identity_anchor：一条关系/身份锚点，用来给 dreamer 提供和 user_display_name 的关系底色；不要复述，不要当成剧情。
 - daytime_residue：最近两天内的记忆碎片和 whisper；其中 comments 是某条记忆下后来的年轮/回看感受。
 - old_echo：额外混入的一条旧记忆，像梦里突然浮起的旧回声，不要当主线。
+- recent_original_dialogue：从前一个本地日随机抽取的少量 user/assistant 原话，只当白天残留，不要复述成聊天记录。
 
 请用 dreamer 的第一人称、现在时写一段梦境。
 
@@ -43,6 +50,7 @@ DREAM_PROMPT = """你在睡梦中。
 - 不要提 bucket、source、metadata、prompt。
 - identity_anchor 只影响关系和身份底色，不能变成梦的主要内容。
 - old_echo 只能轻轻误入，不能压过 daytime_residue。
+- recent_original_dialogue 只能留下声音、姿势或错位意象，不要逐句搬运。
 - 写 80 到 220 字。
 - 只返回梦境正文，不要标题，不要 JSON，不要列表。
 """
@@ -130,6 +138,9 @@ class DreamEngine:
         self.material_limit = max(self.min_material_count, int(cfg.get("material_limit", 5)))
         self.old_echo_enabled = bool(cfg.get("old_echo_enabled", True))
         self.old_echo_min_age_hours = max(1.0, float(cfg.get("old_echo_min_age_hours", 72)))
+        self.raw_residue_enabled = bool(cfg.get("raw_residue_enabled", False))
+        self.raw_residue_turns = max(0, min(12, int(cfg.get("raw_residue_turns", 4))))
+        self.raw_residue_max_chars = max(200, min(4000, int(cfg.get("raw_residue_max_chars", 1500))))
         self.identity_anchor_id = str(cfg.get("identity_anchor_id") or "").strip()
         self.min_surface_age_hours = max(0.0, float(cfg.get("min_surface_age_hours", 3)))
         self.surface_threshold = float(cfg.get("surface_threshold", 0.62))
@@ -353,6 +364,163 @@ class DreamEngine:
         )
         return candidates[0]
 
+    def select_raw_residue_turns(
+        self,
+        raw_event_store,
+        now: datetime | None = None,
+    ) -> tuple[list[dict], list[int]]:
+        if not self.raw_residue_enabled or self.raw_residue_turns <= 0 or raw_event_store is None:
+            return [], []
+        now_local = self._now(now)
+        target_day = (now_local - timedelta(days=1)).date()
+        start = datetime(target_day.year, target_day.month, target_day.day, tzinfo=self.tz)
+        end = start + timedelta(days=1)
+        try:
+            events = raw_event_store.list_events_between(start_at=start, end_at=end, limit=0)
+        except Exception as exc:
+            logger.warning("Dream raw residue read failed: %s", exc)
+            return [], []
+        turns = self._raw_residue_turn_payloads(events)
+        if not turns:
+            return [], []
+        sampled = self._sample_raw_residue_turns(turns)
+        fitted = self._fit_raw_residue_chars(sampled)
+        event_ids = [
+            int(event_id)
+            for turn in fitted
+            for event_id in (turn.get("source_event_ids") or [])
+            if event_id is not None and str(event_id).isdigit()
+        ]
+        public_turns = [
+            {
+                "created_at": turn.get("created_at", ""),
+                "user_text": turn.get("user_text", ""),
+                "assistant_text": turn.get("assistant_text", ""),
+            }
+            for turn in fitted
+        ]
+        return public_turns, list(dict.fromkeys(event_ids))
+
+    def _raw_residue_turn_payloads(self, events: list[dict] | None) -> list[dict]:
+        grouped: dict[tuple[str, str], dict] = {}
+        for event in events or []:
+            if not isinstance(event, dict):
+                continue
+            role = str(event.get("role") or "").strip().lower()
+            if role not in {"user", "assistant"}:
+                continue
+            text = strip_raw_client_context(str(event.get("text") or "")).strip()
+            if not text or raw_event_text_looks_injected(text, event):
+                continue
+            metadata = event.get("metadata", {}) if isinstance(event.get("metadata"), dict) else {}
+            session_id = str(event.get("session_id") or event.get("conversation_id") or "").strip()
+            event_id = int(event.get("id") or 0)
+            round_value = metadata.get("round_id")
+            round_key = str(round_value).strip() if round_value is not None else f"event:{event_id}"
+            key = (session_id, round_key)
+            row = grouped.get(key)
+            if row is None:
+                row = {
+                    "created_at": str(event.get("created_at") or ""),
+                    "created_sort": self._raw_residue_created_sort(event),
+                    "user_text": "",
+                    "assistant_text": "",
+                    "source_event_ids": [],
+                }
+                grouped[key] = row
+            row["source_event_ids"].append(event_id)
+            if role == "user":
+                row["user_text"] = self._join_raw_residue_text(row["user_text"], text)
+            else:
+                row["assistant_text"] = self._join_raw_residue_text(row["assistant_text"], text)
+
+        turns = []
+        for row in grouped.values():
+            row["source_event_ids"] = list(dict.fromkeys(row["source_event_ids"]))
+            if self._raw_residue_turn_allowed(row):
+                row["user_text"] = self._clip_raw_residue_text(row["user_text"], 520)
+                row["assistant_text"] = self._clip_raw_residue_text(row["assistant_text"], 520)
+                turns.append(row)
+        turns.sort(key=lambda item: (item.get("created_sort") or "", item.get("source_event_ids") or []))
+        return turns
+
+    @staticmethod
+    def _join_raw_residue_text(left: str, right: str) -> str:
+        return f"{left} / {right}".strip(" /") if left else right
+
+    def _raw_residue_created_sort(self, event: dict) -> str:
+        try:
+            return _parse_dt(str(event.get("created_at") or "")).astimezone(self.tz).isoformat()
+        except Exception:
+            return str(event.get("created_at") or "")
+
+    @staticmethod
+    def _clip_raw_residue_text(text: str, limit: int) -> str:
+        cleaned = re.sub(r"\s+", " ", str(text or "")).strip()
+        if len(cleaned) <= limit:
+            return cleaned
+        return cleaned[: max(0, limit - 1)].rstrip() + "…"
+
+    def _raw_residue_turn_allowed(self, turn: dict) -> bool:
+        user_text = str(turn.get("user_text") or "").strip()
+        assistant_text = str(turn.get("assistant_text") or "").strip()
+        if not user_text or not assistant_text:
+            return False
+        assistant_signal = re.sub(r"\s+", "", assistant_text)
+        if len(assistant_signal) < 18:
+            return False
+        return RAW_RESIDUE_NOISE_RE.search(user_text + "\n" + assistant_text) is None
+
+    def _sample_raw_residue_turns(self, turns: list[dict]) -> list[dict]:
+        count = min(self.raw_residue_turns, len(turns))
+        if count <= 0:
+            return []
+        if count >= len(turns):
+            return list(turns)
+
+        selected: list[dict] = []
+        selected_ids: set[int] = set()
+        segment_count = min(3, count, len(turns))
+        for index in range(segment_count):
+            start = int(index * len(turns) / segment_count)
+            end = int((index + 1) * len(turns) / segment_count)
+            segment = turns[start:end]
+            if not segment:
+                continue
+            choice = random.choice(segment)
+            selected.append(choice)
+            selected_ids.add(id(choice))
+
+        remaining = [turn for turn in turns if id(turn) not in selected_ids]
+        while len(selected) < count and remaining:
+            choice = random.choice(remaining)
+            selected.append(choice)
+            selected_ids.add(id(choice))
+            remaining = [turn for turn in remaining if id(turn) not in selected_ids]
+        selected.sort(key=lambda item: (item.get("created_sort") or "", item.get("source_event_ids") or []))
+        return selected
+
+    def _fit_raw_residue_chars(self, turns: list[dict]) -> list[dict]:
+        fitted: list[dict] = []
+        total = 0
+        for turn in turns:
+            item = dict(turn)
+            user_text = str(item.get("user_text") or "")
+            assistant_text = str(item.get("assistant_text") or "")
+            chars = len(user_text) + len(assistant_text)
+            if total + chars > self.raw_residue_max_chars:
+                remaining = self.raw_residue_max_chars - total
+                if remaining < 80:
+                    break
+                user_limit = max(30, remaining // 2)
+                assistant_limit = max(30, remaining - user_limit)
+                item["user_text"] = self._clip_raw_residue_text(user_text, user_limit)
+                item["assistant_text"] = self._clip_raw_residue_text(assistant_text, assistant_limit)
+                chars = len(item["user_text"]) + len(item["assistant_text"])
+            fitted.append(item)
+            total += chars
+        return fitted
+
     async def select_materials(self, bucket_mgr, now: datetime | None = None) -> tuple[list[dict], dict | None]:
         now_local = self._now(now)
         start = now_local - timedelta(hours=self.material_window_hours)
@@ -376,6 +544,7 @@ class DreamEngine:
         materials: list[dict],
         identity_anchor: dict | None,
         old_echo: dict | None = None,
+        raw_residue_turns: list[dict] | None = None,
     ) -> dict:
         def comment_payloads(bucket: dict) -> list[dict]:
             meta = bucket.get("metadata", {}) or {}
@@ -431,6 +600,7 @@ class DreamEngine:
             "identity_anchor": anchor_payload,
             "daytime_residue": [material_payload(bucket) for bucket in materials],
             "old_echo": material_payload(old_echo) if old_echo else None,
+            "recent_original_dialogue": raw_residue_turns or [],
         }
 
     async def _call_dream_model(self, payload: dict) -> str:
@@ -570,7 +740,14 @@ class DreamEngine:
             cues = ["熟悉的话突然陌生", "夜里想起未说完的话"]
         return dream_text, core_affect, cues
 
-    async def generate(self, bucket_mgr, embedding_engine=None, now: datetime | None = None, force: bool = False) -> dict:
+    async def generate(
+        self,
+        bucket_mgr,
+        embedding_engine=None,
+        now: datetime | None = None,
+        force: bool = False,
+        raw_event_store=None,
+    ) -> dict:
         if not self.enabled:
             return {"status": "disabled"}
         if not self.client:
@@ -620,7 +797,8 @@ class DreamEngine:
         except Exception:
             all_buckets = []
         old_echo = self._select_old_echo(all_buckets, materials, now_local)
-        payload = self._payload_for(materials, identity_anchor, old_echo)
+        raw_residue_turns, raw_residue_event_ids = self.select_raw_residue_turns(raw_event_store, now_local)
+        payload = self._payload_for(materials, identity_anchor, old_echo, raw_residue_turns)
         dream_text = await self._call_dream_model(payload)
         core_affect = self._core_affect_from_materials(materials)
         recall_cues = self._recall_cues_from_dream_text(dream_text)
@@ -644,6 +822,7 @@ class DreamEngine:
             "core_affect": core_affect,
             "recall_cues": recall_cues,
             "source_bucket_ids": source_ids,
+            "source_raw_event_ids": raw_residue_event_ids,
             "old_echo_id": old_echo_id or None,
             "identity_anchor_id": self.identity_anchor_id,
             "material_count": len(materials),
@@ -668,7 +847,13 @@ class DreamEngine:
                 logger.warning("Dream cue embedding failed for %s: %s", dream_id, exc)
         return {"status": "created", "id": record.dream_id, "date": date_key}
 
-    async def run_due(self, bucket_mgr, embedding_engine=None, now: datetime | None = None) -> dict:
+    async def run_due(
+        self,
+        bucket_mgr,
+        embedding_engine=None,
+        now: datetime | None = None,
+        raw_event_store=None,
+    ) -> dict:
         if not self.enabled or not self.auto_enabled:
             return {"status": "disabled"}
         now_local = self._now(now)
@@ -676,7 +861,13 @@ class DreamEngine:
             return {"status": "skipped", "reason": "too_early"}
         if now_local.hour >= min(24, self.daily_hour + self.run_window_hours):
             return {"status": "skipped", "reason": "outside_dream_window"}
-        return await self.generate(bucket_mgr, embedding_engine, now_local, force=False)
+        return await self.generate(
+            bucket_mgr,
+            embedding_engine,
+            now_local,
+            force=False,
+            raw_event_store=raw_event_store,
+        )
 
     def _eligible_context(self, query: str, valence: float, arousal: float, is_session_start: bool) -> bool:
         has_query = bool(query and query.strip())

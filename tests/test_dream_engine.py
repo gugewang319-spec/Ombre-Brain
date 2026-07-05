@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
@@ -182,6 +183,96 @@ async def test_dream_old_echo_adds_one_old_memory_without_counting_as_recent_mat
     assert old_echo and old_echo["id"] == old_id
     assert payload["old_echo"]["source_id"] == old_id
     assert old_id not in {item["source_id"] for item in payload["daytime_residue"]}
+
+
+@pytest.mark.asyncio
+async def test_dream_raw_residue_samples_previous_day_original_turns(test_config):
+    cfg = _dream_config(
+        test_config,
+        api_key="fake",
+        raw_residue_enabled=True,
+        raw_residue_turns=3,
+        raw_residue_max_chars=2000,
+    )
+    mgr = BucketManager(cfg)
+    engine = DreamEngine(cfg)
+    now = datetime(2026, 5, 25, 3, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
+    calls = []
+
+    for index in range(5):
+        await mgr.create(
+            bucket_id=f"recent-memory-{index}",
+            content=f"最近普通记忆 {index}，足够作为梦的白天残留。",
+            created=(now - timedelta(hours=index + 1)).isoformat(timespec="seconds"),
+        )
+
+    def event(event_id: int, role: str, text: str, hour: int, round_id: int, metadata: dict | None = None) -> dict:
+        event_metadata = {"round_id": round_id, **(metadata or {})}
+        return {
+            "id": event_id,
+            "role": role,
+            "text": text,
+            "created_at": datetime(2026, 5, 24, hour, 0, tzinfo=ZoneInfo("Asia/Shanghai")).isoformat(
+                timespec="seconds"
+            ),
+            "session_id": "sess-dream-raw",
+            "metadata": event_metadata,
+        }
+
+    class RawEventStore:
+        def __init__(self):
+            self.calls = []
+
+        def list_events_between(self, **kwargs):
+            self.calls.append(kwargs)
+            return [
+                event(101, "user", "嗯", 8, 1),
+                event(102, "assistant", "我说那张纸可能会在梦里自己透光，像一小块没有醒来的雨声。", 8, 1),
+                event(103, "user", "嗯", 9, 2),
+                event(104, "assistant", "嗯嗯", 9, 2),
+                event(105, "user", "测一下测试召回有没有被注入。", 12, 3),
+                event(106, "assistant", "这轮只是测试。", 12, 3),
+                event(107, "user", "下午我们把梦境材料改成随机碎片，不想让它像 handoff。", 15, 4),
+                event(108, "assistant", "我说随机日残留更像梦，会把一天打散。", 15, 4),
+                event(109, "user", "晚上我又提到玻璃杯边缘的水珠，像没说完的话。", 22, 5),
+                event(110, "assistant", "我把那句未说完的话放到杯底，没有解释它。", 22, 5),
+                event(111, "user", "Live private context for the current turn", 23, 6, {"source_type": "memory_injection"}),
+                event(112, "assistant", "injected", 23, 6, {"source_type": "memory_injection"}),
+            ]
+
+    class FakeCompletions:
+        async def create(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content="我看见雨纸贴在杯口，下午的碎片从里面透出来。")
+                    )
+                ]
+            )
+
+    raw_store = RawEventStore()
+    engine.client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+
+    result = await engine.generate(mgr, now=now, force=True, raw_event_store=raw_store)
+
+    assert result["status"] == "created"
+    assert raw_store.calls[0]["start_at"].date().isoformat() == "2026-05-24"
+    assert raw_store.calls[0]["end_at"].date().isoformat() == "2026-05-25"
+
+    payload = json.loads(calls[0]["messages"][1]["content"])
+    dialogue = payload["recent_original_dialogue"]
+    assert len(dialogue) == 3
+    assert dialogue[0]["user_text"] == "嗯"
+    assert "没有醒来的雨声" in dialogue[0]["assistant_text"]
+    assert "随机碎片" in dialogue[1]["user_text"]
+    assert "玻璃杯边缘" in dialogue[2]["user_text"]
+    assert "测试召回" not in json.dumps(dialogue, ensure_ascii=False)
+    assert all("source_event_ids" not in item for item in dialogue)
+
+    record = engine._read_record(engine._dream_path(result["id"]))
+    assert record.metadata["source_raw_event_ids"] == [101, 102, 107, 108, 109, 110]
+    assert "玻璃杯边缘" not in str(record.metadata)
 
 
 @pytest.mark.asyncio
