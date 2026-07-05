@@ -1,4 +1,12 @@
+import asyncio
+import json
+
 from entity_edges import EntityEdgeStore, entity_query_hints, extract_entity_edges_from_bucket
+from scripts import audit_entity_edges
+
+
+def _run(coro):
+    return asyncio.run(coro)
 
 
 def test_extract_entity_edges_from_bucket_uses_configured_names(test_config):
@@ -129,3 +137,62 @@ def test_extract_entity_edges_rejects_unstructured_ai_participation_fragments(te
     ]
 
     assert participation_objects == []
+
+
+def test_audit_entity_edges_reports_dry_run_backfill_gap(tmp_path, test_config, bucket_mgr):
+    test_config["identity"] = {
+        "ai_name": "Haven",
+        "user_name": "Xiaoyu",
+        "user_display_name": "小雨",
+        "user_aliases": ["宝宝"],
+    }
+    bucket_with_edges = _run(
+        bucket_mgr.create(
+            "小雨喜欢暗色故事。Haven参与Ombre-Brain记忆系统开发。",
+            name="有实体边的桶",
+            tags=["偏好", "项目"],
+            domain=["relationship"],
+        )
+    )
+    bucket_without_edges = _run(
+        bucket_mgr.create(
+            "这是一条普通观察，没有明确偏好或参与对象。",
+            name="无实体边的桶",
+            tags=["观察"],
+            domain=["general"],
+        )
+    )
+    cases_path = tmp_path / "cases.jsonl"
+    cases_path.write_text(
+        json.dumps(
+            {
+                "query": "我喜欢的故事和你参与的项目",
+                "expected_bucket_ids": [bucket_with_edges, bucket_without_edges],
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    args = audit_entity_edges.parse_args(
+        [
+            "--buckets-dir",
+            test_config["buckets_dir"],
+            "--state-dir",
+            test_config["state_dir"],
+            "--cases-file",
+            str(cases_path),
+        ]
+    )
+    report = _run(audit_entity_edges.audit(args))
+
+    assert report["summary"]["total_buckets"] == 2
+    assert report["summary"]["existing_edges"] == 0
+    assert report["summary"]["dry_run_edge_buckets"] == 1
+    assert report["summary"]["missing_backfill_bucket_count"] == 1
+    assert report["summary"]["dry_run_no_edge_bucket_count"] == 1
+    assert report["missing_backfill_buckets"][0]["bucket_id"] == bucket_with_edges
+    assert report["dry_run_no_edge_buckets"][0]["bucket_id"] == bucket_without_edges
+    assert report["case_coverage"][0]["expected_with_dry_run_edges"] == [bucket_with_edges]
+    assert report["case_coverage"][0]["expected_missing_dry_run_edges"] == [bucket_without_edges]
