@@ -67,6 +67,17 @@ from memory_layers import (
     moment_runtime_gate_debug,
 )
 from memory_metadata import normalize_domain_key, normalize_memory_metadata
+from query_terms import (
+    CHECKIN_TRAILING_PARTICLES,
+    DEFAULT_AI_ADDRESS_TERMS,
+    LEADING_LOOKUP_ADDRESS_FOLLOWUPS,
+    LEADING_LOOKUP_REASON_MARKERS,
+    LOW_SIGNAL_AFFECTION_TERMS,
+    LOW_SIGNAL_CHECKIN_TERMS,
+    MEMORY_SENTINEL_RESIDUE_STRIP_TERMS,
+    date_recall_shell_terms,
+    identity_address_terms,
+)
 from recall_policy import QueryAnchorPlan, RecallPolicy, diffusion_seed_topic_term_has_specific_residue
 from memory_nodes import MemoryNodeStore
 from persona_engine import PersonaStateEngine
@@ -111,7 +122,7 @@ DOMAIN_SENTINEL_ALLOWED_DOMAINS = frozenset(
 RECALL_EVAL_DEFAULT_CASES = [
     {
         "id": "light_checkin_no_memory",
-        "query": "老公在做什么呢",
+        "query": "在做什么呢",
         "expect": "none",
     },
     {
@@ -202,10 +213,6 @@ SOURCE_RECORD_FRAGMENT_TOPIC_STOPWORDS = QUERY_PLANNER_GENERIC_TERMS | {
     "写着",
     "提出",
     "答应",
-    "哥哥",
-    "宝宝",
-    "老婆",
-    "亲爱的",
     "爸爸",
     "妈妈",
     "爸爸妈妈",
@@ -226,7 +233,7 @@ SOURCE_RECORD_FRAGMENT_TOPIC_STOPWORDS = QUERY_PLANNER_GENERIC_TERMS | {
     "夜晚",
     "这一幕",
     "两人",
-}
+} | set(DEFAULT_AI_ADDRESS_TERMS)
 MEMORY_DETAIL_REQUEST_RE = re.compile(
     r"^\s*\[memory_detail\s+ids\s*=\s*([\"'])(?P<ids>[^\"']+)\1\s*\]\s*",
     re.IGNORECASE,
@@ -290,7 +297,7 @@ Routes:
 - search: the user is asking for old context, a past event, a reason/background, or a followup whose referent is in recent turns.
 - tone_only: affectionate, intimate, comfort, or light emotional contact where familiar tone may help but old events should not be retrieved.
 - skip: pure acknowledgement, laughter, ping/test, empty reaction, or no useful memory anchor.
-Do not treat generic affection, crying, missing, hugging, presence checks, or status check-ins such as "哥哥在吗", "老公在做什么呢", "你在干嘛" as search unless recent turns provide a concrete old-event referent.
+Do not treat generic affection, crying, missing, hugging, presence checks, or status check-ins as search unless recent turns provide a concrete old-event referent.
 If searchable, include concrete anchors only; omit generic words such as memory, recent, context, remember, emotion, status, 哭, 想你, 抱抱.
 Schema:
 {
@@ -326,15 +333,6 @@ IDENTITY_NAME_EVENT_MARKERS = (
     "取名",
     "起名",
     "命名",
-)
-IDENTITY_NAME_AI_ADDRESS_TERMS = (
-    "哥哥",
-    "老公",
-    "老婆",
-    "宝宝",
-    "宝贝",
-    "亲爱的",
-    "小乖",
 )
 DATE_RECALL_CHAT_MARKERS = (
     "聊",
@@ -443,39 +441,6 @@ MEMORY_SENTINEL_RESIDUE_STOP_TERMS = frozenset(
         "ok",
         "hi",
         "hello",
-    }
-)
-MEMORY_SENTINEL_RESIDUE_STRIP_TERMS = frozenset(
-    {
-        "亲爱的",
-        "老公",
-        "老婆",
-        "宝宝",
-        "宝贝",
-        "哥哥",
-        "小乖",
-        "乖乖",
-        "想你了",
-        "想你",
-        "想我吗",
-        "想我",
-        "抱抱",
-        "抱我",
-        "抱一下",
-        "亲亲",
-        "亲一下",
-        "贴贴",
-        "蹭蹭",
-        "爱你",
-        "爱我吗",
-        "爱我",
-        "mua",
-        "muah",
-        "kiss",
-        "hug",
-        "missyou",
-        "loveyou",
-        "loveu",
     }
 )
 MEMORY_SENTINEL_RESIDUE_PREFIXES = (
@@ -6426,7 +6391,7 @@ class GatewayService:
         )
         intimate_terms = (
             "亲亲", "抱抱", "抱我", "吻", "亲密", "想你", "爱你",
-            "老婆", "宝宝", "亲爱的", "身体", "欲望", "intimate", "kiss",
+            *DEFAULT_AI_ADDRESS_TERMS, "身体", "欲望", "intimate", "kiss",
             "hug", "miss you", "love you",
         )
         playful_terms = (
@@ -6521,7 +6486,7 @@ class GatewayService:
         ]
         ai_keys = {
             self._compact_lookup_key(value)
-            for value in (ai_name, *IDENTITY_NAME_AI_ADDRESS_TERMS)
+            for value in (ai_name, *DEFAULT_AI_ADDRESS_TERMS)
             if self._compact_lookup_key(value)
         }
         user_keys = {
@@ -7253,24 +7218,7 @@ class GatewayService:
 
     def _strip_date_recall_query_shell(self, query: str) -> str:
         text = strip_human_date_references(query)
-        shell_terms = {
-            "大前天", "前天", "昨晚", "昨天", "昨日", "今晚", "今天",
-            "我们", "咱们", "哥哥", "宝宝", "老婆", "我", "你",
-            "还记得", "记不记得", "记得", "想起", "想起来", "回忆", "记忆",
-            "在聊什么", "聊了什么", "聊什么", "聊过什么", "说了什么", "说什么",
-            "提到什么", "讲了什么", "讨论什么", "做了什么", "发生了什么",
-            "在聊", "聊", "说", "提到", "提", "讲", "讨论", "发生", "做",
-            "那次", "这次", "事情", "事", "什么", "为什么", "怎么回事", "怎么说",
-            "有", "没有", "有没有", "是", "吗", "么", "嘛", "呢", "啊", "呀", "啦", "吧",
-            "的", "了", "一下", "再", "一次",
-        }
-        identity_terms = [
-            self.identity.get("ai_name"),
-            self.identity.get("user_name"),
-            self.identity.get("user_display_name"),
-            *(self.identity.get("user_aliases") or []),
-        ]
-        shell_terms.update(str(term) for term in identity_terms if str(term or "").strip())
+        shell_terms = date_recall_shell_terms(self.identity)
         for term in sorted(shell_terms, key=lambda item: len(str(item)), reverse=True):
             if str(term).strip():
                 text = text.replace(str(term), " ")
@@ -7417,10 +7365,11 @@ class GatewayService:
         text = str(query_text or "")
         stop_terms = {
             "刚刚", "刚才", "刚说", "刚聊", "刚提", "上一句", "上句话",
-            "我们", "我们的", "你", "我", "哥哥", "记得", "还记得",
+            "我们", "我们的", "你", "我", "记得", "还记得",
             "记不记得", "是什么", "什么", "那个", "这个", "一下", "吗", "呀",
             "呢", "了", "的",
         }
+        stop_terms.update(DEFAULT_AI_ADDRESS_TERMS)
         stop_terms.update(self._identity_match_terms())
         raw_terms = re.findall(r"[\u4e00-\u9fffA-Za-z0-9_]{2,}", text)
         terms: list[str] = []
@@ -11907,21 +11856,13 @@ class GatewayService:
         )
         if any(marker in compact for marker in checkin_markers):
             return True
-        address_terms = (
-            self.identity.get("ai_name"),
-            "haven",
-            "老公",
-            "哥哥",
-            "宝贝",
-            "宝宝",
-            "亲爱的",
-        )
+        address_terms = identity_address_terms(self.identity, include_legacy_ai=True)
         address_keys = [
             self._compact_lookup_key(term)
             for term in address_terms
             if self._compact_lookup_key(term)
         ]
-        trailing_particles = ("呢", "呀", "啊", "嘛", "吗", "么", "?", "？", "啦", "喔", "哦")
+        trailing_particles = CHECKIN_TRAILING_PARTICLES
         for address in address_keys:
             if compact == address or any(compact == f"{address}{particle}" for particle in trailing_particles):
                 return True
@@ -11930,40 +11871,14 @@ class GatewayService:
     def _memory_sentinel_low_signal_entity_only(self, query: str, entity_terms: list[str]) -> bool:
         if not entity_terms:
             return False
-        low_signal_terms = {
-            "ping",
-            "test",
-            "ok",
-            "hi",
-            "hello",
-            "哈哈",
-            "嗯嗯",
-            "测试",
-            "想你",
-            "想你了",
-            "想你了抱抱",
-            "抱抱",
-            "在吗",
-            "哥哥在吗",
-        }
+        low_signal_terms = LOW_SIGNAL_CHECKIN_TERMS
         keys = [self._compact_lookup_key(term) for term in entity_terms]
         return bool(keys) and self._auto_recall_low_signal_query(query) and all(key in low_signal_terms for key in keys)
 
     def _memory_sentinel_low_signal_exact_anchor_only(self, query: str, exact_terms: list[str]) -> bool:
         if not exact_terms or not self._auto_recall_low_signal_query(query):
             return False
-        low_signal_terms = {
-            "想你",
-            "想你了",
-            "想你了抱抱",
-            "抱抱",
-            "哥哥在吗",
-            "在吗",
-            "哈哈",
-            "嗯嗯",
-            "哭",
-            "难过",
-        }
+        low_signal_terms = LOW_SIGNAL_CHECKIN_TERMS | {"哭", "难过"}
         keys = [self._compact_lookup_key(term) for term in exact_terms]
         return bool(keys) and all(key in low_signal_terms for key in keys)
 
@@ -12366,19 +12281,18 @@ class GatewayService:
         topic = str(recall_topic_query(query, self.relevance_options) or "").strip()
         return self._strip_leading_lookup_address_from_text(topic, query)
 
-    @staticmethod
-    def _leading_lookup_address(query: str) -> str:
+    def _leading_lookup_address(self, query: str) -> str:
         compact = re.sub(r"[\s，。！？、,.!?:：;；~～（）()\[\]【】「」『』“”\"'`-]+", "", str(query or ""))
         if not compact:
             return ""
-        for address in ("亲爱的", "哥哥", "宝宝", "老婆", "小乖"):
+        for address in identity_address_terms(self.identity):
             index = compact.find(address)
             if index < 0 or index > 1:
                 continue
             after = compact[index + len(address):]
-            if after.startswith(("知道", "记得", "记不记得", "想起", "想起来", "问", "说")):
+            if after.startswith(LEADING_LOOKUP_ADDRESS_FOLLOWUPS):
                 return address
-            if any(marker in after[:10] for marker in ("为什么", "怎么", "为何")):
+            if any(marker in after[:10] for marker in LEADING_LOOKUP_REASON_MARKERS):
                 return address
         return ""
 
@@ -12736,21 +12650,7 @@ class GatewayService:
         key = str(compact_term or "").strip().lower()
         if not key:
             return False
-        low_signal_terms = {
-            "哥哥",
-            "老公",
-            "老婆",
-            "宝宝",
-            "宝贝",
-            "亲爱的",
-            "乖乖",
-            "小乖",
-            "想你",
-            "爱你",
-            "抱抱",
-            "亲亲",
-            "贴贴",
-        }
+        low_signal_terms = LOW_SIGNAL_AFFECTION_TERMS
         if key in {self._compact_lookup_key(term) for term in low_signal_terms}:
             return False
         identity_terms = [
@@ -17045,7 +16945,7 @@ class GatewayService:
                 self.identity.get("user_name"),
                 self.identity.get("user_display_name"),
                 *(self.identity.get("user_aliases") or []),
-                *IDENTITY_NAME_AI_ADDRESS_TERMS,
+                *DEFAULT_AI_ADDRESS_TERMS,
             )
             if self._compact_lookup_key(value)
         }

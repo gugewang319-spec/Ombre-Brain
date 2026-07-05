@@ -1,0 +1,175 @@
+from __future__ import annotations
+
+from typing import Any
+
+
+DEFAULT_AI_ADDRESS_TERMS = (
+    "哥哥",
+    "老公",
+    "老婆",
+    "宝宝",
+    "宝贝",
+    "亲爱的",
+    "小乖",
+)
+
+LEGACY_AI_NAME_ALIASES = ("haven",)
+
+DATE_RECALL_QUERY_SHELL_TERMS = frozenset(
+    {
+        "大前天",
+        "前天",
+        "昨晚",
+        "昨天",
+        "昨日",
+        "今晚",
+        "今天",
+        "我们",
+        "咱们",
+        "我",
+        "你",
+        "还记得",
+        "记不记得",
+        "记得",
+        "想起",
+        "想起来",
+        "回忆",
+        "记忆",
+        "在聊什么",
+        "聊了什么",
+        "聊什么",
+        "聊过什么",
+        "说了什么",
+        "说什么",
+        "提到什么",
+        "讲了什么",
+        "讨论什么",
+        "做了什么",
+        "发生了什么",
+        "在聊",
+        "聊",
+        "说",
+        "提到",
+        "提",
+        "讲",
+        "讨论",
+        "发生",
+        "做",
+        "那次",
+        "这次",
+        "事情",
+        "事",
+        "什么",
+        "为什么",
+        "怎么回事",
+        "怎么说",
+        "有",
+        "没有",
+        "有没有",
+        "是",
+        "吗",
+        "么",
+        "嘛",
+        "呢",
+        "啊",
+        "呀",
+        "啦",
+        "吧",
+        "的",
+        "了",
+        "一下",
+        "再",
+        "一次",
+    }
+)
+
+MEMORY_SENTINEL_RESIDUE_STRIP_TERMS = frozenset(
+    {
+        *DEFAULT_AI_ADDRESS_TERMS,
+        "乖乖",
+        "想你了",
+        "想你",
+        "想我吗",
+        "想我",
+        "抱抱",
+        "抱我",
+        "抱一下",
+        "亲亲",
+        "亲一下",
+        "贴贴",
+        "蹭蹭",
+        "爱你",
+        "爱我吗",
+        "爱我",
+        "mua",
+        "muah",
+        "kiss",
+        "hug",
+        "missyou",
+        "loveyou",
+        "loveu",
+    }
+)
+
+LOW_SIGNAL_AFFECTION_TERMS = frozenset(
+    {
+        *DEFAULT_AI_ADDRESS_TERMS,
+        "乖乖",
+        "想你",
+        "爱你",
+        "抱抱",
+        "亲亲",
+        "贴贴",
+    }
+)
+
+LOW_SIGNAL_CHECKIN_TERMS = frozenset(
+    {
+        "ping",
+        "test",
+        "ok",
+        "hi",
+        "hello",
+        "哈哈",
+        "嗯嗯",
+        "测试",
+        "想你",
+        "想你了",
+        "想你了抱抱",
+        "抱抱",
+        "在吗",
+        *(f"{address}在吗" for address in DEFAULT_AI_ADDRESS_TERMS),
+    }
+)
+
+CHECKIN_TRAILING_PARTICLES = ("呢", "呀", "啊", "嘛", "吗", "么", "?", "？", "啦", "喔", "哦")
+LEADING_LOOKUP_ADDRESS_FOLLOWUPS = ("知道", "记得", "记不记得", "想起", "想起来", "问", "说")
+LEADING_LOOKUP_REASON_MARKERS = ("为什么", "怎么", "为何")
+
+
+def configured_identity_terms(identity: dict[str, Any] | None) -> tuple[str, ...]:
+    source = identity or {}
+    values = (
+        source.get("ai_name"),
+        source.get("user_name"),
+        source.get("user_display_name"),
+        *(source.get("user_aliases") or []),
+    )
+    return tuple(str(value).strip() for value in values if str(value or "").strip())
+
+
+def identity_address_terms(
+    identity: dict[str, Any] | None,
+    *,
+    include_legacy_ai: bool = False,
+) -> tuple[str, ...]:
+    values = [
+        *(LEGACY_AI_NAME_ALIASES if include_legacy_ai else ()),
+        *DEFAULT_AI_ADDRESS_TERMS,
+        *configured_identity_terms(identity),
+    ]
+    return tuple(dict.fromkeys(str(value).strip() for value in values if str(value or "").strip()))
+
+
+def date_recall_shell_terms(identity: dict[str, Any] | None) -> set[str]:
+    return set(DATE_RECALL_QUERY_SHELL_TERMS) | set(identity_address_terms(identity))
