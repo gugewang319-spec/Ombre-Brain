@@ -95,7 +95,7 @@ def test_morning_evening_uses_fixed_slots_and_default_daily_limit(tmp_path):
     assert updated["next_due_at"] == "2026-07-03T20:00:00+08:00"
 
     updated = store.mark_reminded(item["id"], round_id=2, reminded_at="2026-07-03T21:00:00+08:00")
-    assert updated["next_due_at"] == "2026-07-04T08:00:00+08:00"
+    assert updated["next_due_at"] == "2026-07-04T06:00:00+08:00"
 
 
 def test_reminder_store_rejects_invalid_times(tmp_path):

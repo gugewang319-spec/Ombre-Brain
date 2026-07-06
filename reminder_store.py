@@ -11,7 +11,7 @@ from utils import LOCAL_TZ, now_iso
 
 REMINDER_STATUSES = {"active", "done", "archived"}
 REMINDER_REPEAT_RULES = {"once", "none", "every_n_rounds", "daily", "morning_evening"}
-MORNING_EVENING_SLOTS = ((8, 0), (20, 0))
+MORNING_EVENING_SLOTS = ((6, 0), (20, 0))
 
 
 class ReminderStore:
