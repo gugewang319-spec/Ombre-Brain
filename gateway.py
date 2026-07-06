@@ -442,6 +442,10 @@ class GatewayService:
             128,
             min(800, int(self.gateway_cfg.get("domain_sentinel_max_tokens", 260))),
         )
+        self.domain_sentinel_timeout_seconds = max(
+            1.0,
+            min(30.0, float(self.gateway_cfg.get("domain_sentinel_timeout_seconds", 4.0))),
+        )
         self.domain_sentinel_enable_thinking = False
         self.dynamic_top_k = int(self.gateway_cfg.get("dynamic_top_k", 10))
         self.semantic_candidate_top_k = max(
@@ -717,6 +721,7 @@ class GatewayService:
                 ),
                 "domain_sentinel_enable_thinking": self.domain_sentinel_enable_thinking,
                 "domain_sentinel_max_tokens": self.domain_sentinel_max_tokens,
+                "domain_sentinel_timeout_seconds": self.domain_sentinel_timeout_seconds,
                 "date_persona_trace_enabled": self.date_persona_trace_enabled,
                 "date_persona_trace_budget": self.date_persona_trace_budget,
                 "date_persona_trace_max_events": self.date_persona_trace_max_events,
@@ -792,6 +797,7 @@ class GatewayService:
             ),
             "domain_sentinel_enable_thinking": self.domain_sentinel_enable_thinking,
             "domain_sentinel_max_tokens": self.domain_sentinel_max_tokens,
+            "domain_sentinel_timeout_seconds": self.domain_sentinel_timeout_seconds,
             "date_persona_trace_enabled": self.date_persona_trace_enabled,
             "date_persona_trace_budget": self.date_persona_trace_budget,
             "date_persona_trace_max_events": self.date_persona_trace_max_events,
@@ -1174,6 +1180,13 @@ class GatewayService:
             )
             self.gateway_cfg["domain_sentinel_max_tokens"] = self.domain_sentinel_max_tokens
             updated.append("gateway.domain_sentinel_max_tokens")
+        if "domain_sentinel_timeout_seconds" in payload:
+            self.domain_sentinel_timeout_seconds = max(
+                1.0,
+                min(30.0, float(payload["domain_sentinel_timeout_seconds"])),
+            )
+            self.gateway_cfg["domain_sentinel_timeout_seconds"] = self.domain_sentinel_timeout_seconds
+            updated.append("gateway.domain_sentinel_timeout_seconds")
         if "date_persona_trace_enabled" in payload:
             self.date_persona_trace_enabled = self._bool_config_value(
                 payload["date_persona_trace_enabled"],
@@ -11906,13 +11919,16 @@ class GatewayService:
         }
 
         try:
-            response = await self.http_client.post(
-                f"{self.domain_sentinel_base_url}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {self.domain_sentinel_api_key}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
+            response = await asyncio.wait_for(
+                self.http_client.post(
+                    f"{self.domain_sentinel_base_url}/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {self.domain_sentinel_api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                ),
+                timeout=self.domain_sentinel_timeout_seconds,
             )
             if response.status_code >= 400:
                 debug["errors"].append(f"domain_sentinel_upstream_status:{response.status_code}")
