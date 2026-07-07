@@ -38,19 +38,15 @@ DAILY_CHAT_MEMORY_STRUCTURAL_TAGS = {
     "stable_preference",
 }
 DAILY_CHAT_MEMORY_ENTITY_HINTS = [
-    ("Ombre-Brain", ["ombre-brain", "ombre brain", "ombre_brain", "ombre 自动记忆", "Ombre 自动记忆"]),
     ("Haven Bridge", ["haven_bridge", "haven bridge", "bridge 记忆", "bridge 注入"]),
     ("Gateway", ["gateway", "网关"]),
     ("MCP", ["mcp"]),
     ("Codex", ["codex"]),
-    ("VPS", ["vps"]),
     ("DeepSeek", ["deepseek"]),
     ("SiliconFlow", ["siliconflow", "硅基流动", "硅基"]),
     ("Darkroom", ["darkroom", "暗房"]),
 ]
 DAILY_CHAT_MEMORY_TOPIC_HINTS = [
-    ("自动记忆", ["自动记忆", "daily_chat_memory", "记忆候选", "候选记忆"]),
-    ("脱水模型", ["脱水模型", "dehydration", "脱水"]),
     ("词图", ["词图", "word map", "word_map"]),
     ("换窗连续性", ["换窗", "连续性", "下个窗口"]),
     ("日印象", ["日印象", "daily impression", "daily_impression"]),
@@ -60,6 +56,20 @@ DAILY_CHAT_MEMORY_TOPIC_HINTS = [
     ("缓存", ["缓存", "cache"]),
     ("提示词", ["提示词", "prompt"]),
 ]
+DAILY_CHAT_MEMORY_WORD_MAP_BLOCK_TERMS = {
+    "automatic memory",
+    "daily_chat_memory",
+    "dehydration",
+    "ombre brain",
+    "ombre-brain",
+    "ombre_brain",
+    "vps",
+    "自动记忆",
+    "候选记忆",
+    "脱水",
+    "脱水模型",
+    "记忆候选",
+}
 
 
 CLASSIFY_PROMPT = """你是 Ombre-Brain 的记忆关系整理器。
@@ -3099,6 +3109,19 @@ class ReflectionEngine:
         return term in DAILY_CHAT_MEMORY_STRUCTURAL_TAGS
 
     @staticmethod
+    def _daily_chat_memory_word_map_term_blocked(value: Any) -> bool:
+        term = re.sub(r"\s+", " ", str(value or "").strip()).lower()
+        if not term:
+            return True
+        compact = re.sub(r"[\s_-]+", "", term)
+        for blocked in DAILY_CHAT_MEMORY_WORD_MAP_BLOCK_TERMS:
+            blocked_text = str(blocked).lower()
+            blocked_compact = re.sub(r"[\s_-]+", "", blocked_text)
+            if blocked_text in term or (blocked_compact and blocked_compact in compact):
+                return True
+        return False
+
+    @staticmethod
     def _daily_chat_memory_contains(text: str, needle: str) -> bool:
         if not needle:
             return False
@@ -3119,7 +3142,11 @@ class ReflectionEngine:
 
         def add_tag(prefix: str, term: str) -> None:
             term = re.sub(r"\s+", " ", str(term or "").strip())
-            if not term or self._daily_chat_memory_tag_is_structural(term):
+            if (
+                not term
+                or self._daily_chat_memory_tag_is_structural(term)
+                or self._daily_chat_memory_word_map_term_blocked(term)
+            ):
                 return
             semantic_tags.append(f"{prefix}:{term}")
             keywords.append(term)
@@ -3146,6 +3173,7 @@ class ReflectionEngine:
             4 <= len(title_term) <= 18
             and not self._daily_chat_memory_title_is_generic(title_term)
             and not self._daily_chat_memory_tag_is_structural(title_term)
+            and not self._daily_chat_memory_word_map_term_blocked(title_term)
         ):
             keywords.append(title_term)
 
@@ -3154,7 +3182,9 @@ class ReflectionEngine:
             dict.fromkeys(
                 keyword
                 for keyword in keywords
-                if keyword and not self._daily_chat_memory_tag_is_structural(keyword)
+                if keyword
+                and not self._daily_chat_memory_tag_is_structural(keyword)
+                and not self._daily_chat_memory_word_map_term_blocked(keyword)
             )
         )[:10]
         return semantic_tags, keywords

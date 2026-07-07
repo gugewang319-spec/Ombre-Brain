@@ -43,9 +43,8 @@ def test_daily_chat_memory_adds_semantic_terms_for_word_map(test_config):
     candidate = candidates[0]
     assert "from_daily_chat" in candidate["tags"]
     assert "daily_chat_extract" in candidate["tags"]
-    assert "entity:Ombre-Brain" in candidate["tags"]
-    assert "entity:VPS" in candidate["tags"]
-    assert "topic:自动记忆" in candidate["tags"]
-    assert "topic:脱水模型" in candidate["tags"]
-    assert "自动记忆" in candidate["keywords"]
-    assert "脱水模型" in candidate["keywords"]
+    combined_terms = " ".join([*candidate["tags"], *candidate["keywords"]]).lower()
+    assert "自动记忆" not in combined_terms
+    assert "脱水模型" not in combined_terms
+    assert "ombre-brain" not in combined_terms
+    assert "vps" not in combined_terms
