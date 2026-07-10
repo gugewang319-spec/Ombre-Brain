@@ -7168,6 +7168,9 @@ function renderGatewayInjectionItem(item) {
   var diffusedMoments = payload.diffused_moment_ids || [];
   var directRender = gatewayDirectRenderSummaries(payload);
   var chainDebug = gatewayChainDebugSummaries(payload);
+  var structuralActivation = gatewayStructuralActivationSummary(payload);
+  var memoryEdgeActivation = gatewayMemoryEdgeActivationSummary(payload);
+  var momentChunkShadow = gatewayMomentChunkShadowSummary(payload);
   var dreamStatus = payload.dream_context_status || {};
   var chips = [
     { text: 'round ' + (row.round_id || '—') },
@@ -7199,6 +7202,9 @@ function renderGatewayInjectionItem(item) {
       '<div class="gateway-injection-line"><span class="label">moments:</span> ' + esc(recalledMoments.concat(diffusedMoments).slice(0, 8).join(', ') || '—') + '</div>' +
       (directRender ? '<div class="gateway-injection-line"><span class="label">direct render:</span> ' + esc(directRender) + '</div>' : '') +
       (chainDebug ? '<div class="gateway-injection-line"><span class="label">diffused chain:</span> ' + esc(chainDebug) + '</div>' : '') +
+      (structuralActivation ? '<div class="gateway-injection-line"><span class="label">activation shadow:</span> ' + esc(structuralActivation) + '</div>' : '') +
+      (memoryEdgeActivation ? '<div class="gateway-injection-line"><span class="label">memory edge shadow:</span> ' + esc(memoryEdgeActivation) + '</div>' : '') +
+      (momentChunkShadow ? '<div class="gateway-injection-line"><span class="label">moment chunk shadow:</span> ' + esc(momentChunkShadow) + '</div>' : '') +
     '</div>' +
     (contextPreview ? '<div class="gateway-context-preview">' + esc(contextPreview) + '</div>' : '') +
   '</div>';
@@ -7228,6 +7234,73 @@ function gatewayChainDebugSummaries(payload) {
     if (temps) bits.push('temp ' + temps);
     return bits.length ? label + ' -> ' + bits.join(' · ') : '';
   }).filter(Boolean).slice(0, 5).join(' / ');
+}
+
+function gatewayStructuralActivationSummary(payload) {
+  var planner = payload.query_planner_debug || {};
+  var trace = payload.structural_activation_debug || planner.structural_activation_debug || {};
+  var paths = Array.isArray(trace.paths) ? trace.paths : [];
+  if ((!trace.enabled || trace.status === 'skipped') && !paths.length) return '';
+  var summary = paths.map(function(path) {
+    var seed = path.seed_term || 'term';
+    if (path.seed_kind === 'category_seed') seed += ' [category]';
+    var matched = path.matched_term && path.matched_term !== path.seed_term
+      ? ' → ' + path.matched_term
+      : '';
+    var bucket = path.bucket_name || path.bucket_id || 'bucket';
+    var decision = path.status || 'candidate';
+    if (path.blocked_reason) decision += ': ' + path.blocked_reason;
+    return seed + matched + ' → ' + bucket + ' [' + decision + ']';
+  }).filter(Boolean).slice(0, 5).join(' / ');
+  var finalReason = trace.final && trace.final.reason ? trace.final.reason : '';
+  if (!summary) summary = 'no structural path';
+  return 'shadow · ' + summary + (finalReason ? ' · ' + finalReason : '');
+}
+
+function gatewayMemoryEdgeActivationSummary(payload) {
+  var planner = payload.query_planner_debug || {};
+  var trace = payload.structural_activation_debug || planner.structural_activation_debug || {};
+  var edges = trace.memory_edges || {};
+  var paths = Array.isArray(edges.paths) ? edges.paths : [];
+  if (!edges.status || edges.status === 'pending') return '';
+  if (!paths.length) {
+    return edges.status + (edges.reason ? ' · ' + edges.reason : '');
+  }
+  var summary = paths.map(function(path) {
+    var seed = path.seed || {};
+    var target = path.target || {};
+    var relations = (path.steps || []).map(function(step) {
+      return step.relation_type || 'relates_to';
+    }).filter(Boolean).join(' → ');
+    var final = path.final || {};
+    var decision = final.status || ((path.gate || {}).allowed ? 'eligible' : 'blocked');
+    if (final.suppression_reason) decision += ': ' + final.suppression_reason;
+    return (seed.bucket_name || seed.bucket_id || 'seed') +
+      ' → ' + (relations || 'relates_to') +
+      ' → ' + (target.bucket_name || target.bucket_id || 'target') +
+      ' [' + decision + ']';
+  }).slice(0, 4).join(' / ');
+  return edges.status + ' · ' + summary;
+}
+
+function gatewayMomentChunkShadowSummary(payload) {
+  var shadow = payload.moment_chunk_shadow_debug || {};
+  var buckets = Array.isArray(shadow.buckets) ? shadow.buckets : [];
+  if (!shadow.enabled || shadow.status === 'no_candidates') return '';
+  var changed = buckets.filter(function(bucket) { return !!bucket.changed; });
+  if (!changed.length) {
+    return buckets.length + ' candidate bucket' + (buckets.length === 1 ? '' : 's') + ' · unchanged';
+  }
+  return changed.map(function(bucket) {
+    var chunks = Array.isArray(bucket.shadow_moments)
+      ? bucket.shadow_moments.filter(function(chunk) { return !!chunk.split; })
+      : [];
+    var sizes = chunks.map(function(chunk) { return chunk.chars || 0; }).join('/');
+    return (bucket.bucket_name || bucket.bucket_id || 'bucket') +
+      ' ' + (bucket.current_content_moment_count || 0) +
+      ' → ' + (bucket.shadow_content_moment_count || 0) +
+      (sizes ? ' [' + sizes + ']' : '');
+  }).slice(0, 4).join(' / ');
 }
 
 function gatewayContextPreview(payload) {

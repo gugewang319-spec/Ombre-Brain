@@ -39,7 +39,7 @@ from memory_diffusion import (
 )
 from memory_edges import MemoryEdgeStore
 from entity_edges import EntityEdgeStore
-from memory_moments import MemoryMomentStore, parse_bucket_moments
+from memory_moments import MemoryMomentStore, parse_bucket_moments, preview_bucket_moment_chunks
 from memory_relevance import (
     active_facets,
     content_terms_for_query,
@@ -346,6 +346,9 @@ TASK_ONLY_MOMENT_SECTIONS = {"followup", "followup_log"}
 MOMENT_TEMPERATURE_SECTIONS = CONTEXT_ONLY_SECTIONS - TASK_ONLY_MOMENT_SECTIONS
 DIRECT_AUX_CONTEXT_SECTIONS = MOMENT_TEMPERATURE_SECTIONS - {"comment"}
 PROFILE_CONTEXT_SECTIONS = ("evidence_context", "context", "reflection", "feeling", "comment")
+MOMENT_CHUNK_SHADOW_TARGET_CHARS = 320
+MOMENT_CHUNK_SHADOW_MAX_CHARS = 520
+MOMENT_CHUNK_SHADOW_MIN_TAIL_CHARS = 100
 DEFAULT_AXIS_LITE_TECHNICAL_AXIS_TERMS = (
     "esp32",
     "mpr121",
@@ -12581,6 +12584,7 @@ class GatewayService:
                 "rare_name_bucket_ids": [],
                 "rare_name_terms": [],
             },
+            "structural_activation_debug": self._structural_activation_debug_base(query),
             "exact_anchor_hints": {
                 "bucket_ids": [],
                 "terms": [],
@@ -12594,6 +12598,385 @@ class GatewayService:
                 "supplemental_enabled": self.query_planner_supplemental_semantic,
             },
             "timing_ms": {},
+        }
+
+    def _structural_activation_debug_base(self, query: str) -> dict[str, Any]:
+        enabled = self._word_map_hint_available()
+        normalized_query = self._normalized_recall_query(query) if enabled else ""
+        query_terms = self._word_map_query_terms(normalized_query or query) if enabled else []
+        return {
+            "version": 1,
+            "enabled": enabled,
+            "mode": "shadow",
+            "engine": "word_map_v1",
+            "affects_recall": False,
+            "status": "disabled" if not enabled else ("no_match" if query_terms else "skipped"),
+            "query_terms": [
+                {
+                    "term": term,
+                    "kind": "category_seed" if self._word_map_category_seed_term(term) else "specific",
+                    "matched_bucket_ids": [],
+                }
+                for term in query_terms
+            ],
+            "paths": [],
+            "activated_bucket_ids": [],
+            "admitted_bucket_ids": [],
+            "blocked_bucket_ids": [],
+            "memory_edges": {
+                "enabled": bool(
+                    self.retrieval_mode == "graph"
+                    and self.related_memory_budget > 0
+                    and self.diffusion_options.enabled
+                    and self.diffusion_options.top_k > 0
+                ),
+                "status": "pending" if self.retrieval_mode == "graph" else "skipped",
+                "reason": "" if self.retrieval_mode == "graph" else "retrieval_mode_bucket",
+                "seed_bucket_ids": [],
+                "seeds": [],
+                "edge_candidates": [],
+                "paths": [],
+                "injected_path_count": 0,
+            },
+            "final": {
+                "structural_candidate_bucket_ids": [],
+                "selected_bucket_ids": [],
+                "structural_injected_bucket_ids": [],
+                "existing_injected_bucket_ids": [],
+                "reason": "no_structural_match",
+            },
+        }
+
+    def _structural_activation_shadow_debug(
+        self,
+        query: str,
+        items: list[dict],
+        final_bucket_ids: list[str],
+    ) -> dict[str, Any]:
+        payload = self._structural_activation_debug_base(query)
+        final_ids = {str(bucket_id or "") for bucket_id in final_bucket_ids if str(bucket_id or "")}
+        seeds = {
+            self._compact_lookup_key(seed.get("term")): seed
+            for seed in payload["query_terms"]
+            if self._compact_lookup_key(seed.get("term"))
+        }
+        seen_paths: set[tuple[str, str, str, str]] = set()
+        paths: list[dict[str, Any]] = []
+
+        def ensure_seed(term: str) -> dict[str, Any] | None:
+            cleaned = str(term or "").strip()
+            key = self._compact_lookup_key(cleaned)
+            if not key:
+                return None
+            seed = seeds.get(key)
+            if seed is None:
+                seed = {
+                    "term": cleaned,
+                    "kind": "category_seed" if self._word_map_category_seed_term(cleaned) else "specific",
+                    "matched_bucket_ids": [],
+                }
+                seeds[key] = seed
+                payload["query_terms"].append(seed)
+            return seed
+
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            bucket = item.get("bucket") if isinstance(item.get("bucket"), dict) else {}
+            bucket_id = str(bucket.get("id") or "")
+            if not bucket_id:
+                continue
+            metadata = bucket.get("metadata") if isinstance(bucket.get("metadata"), dict) else {}
+            bucket_name = str(metadata.get("name") or bucket_id)
+            blocked_reason = str(item.get("blocked_reason") or "")
+            status = "admitted" if bucket_id in final_ids else ("blocked" if blocked_reason else "candidate")
+            evidence_labels = self._debug_str_list(item.get("evidence_labels"))
+            hard_evidence_labels = self._debug_str_list(item.get("hard_evidence_labels"))
+            activation_rows = item.get("word_map_activation_terms") or []
+            for row in activation_rows:
+                if not isinstance(row, dict):
+                    continue
+                matched_term = str(row.get("term") or "").strip()
+                activation = str(row.get("kind") or "direct").strip() or "direct"
+                source_terms = self._debug_str_list(row.get("source_terms"))
+                if not source_terms and activation == "direct" and matched_term:
+                    source_terms = [matched_term]
+                for source_term in source_terms:
+                    seed = ensure_seed(source_term)
+                    if seed is None:
+                        continue
+                    path_key = (
+                        self._compact_lookup_key(source_term),
+                        self._compact_lookup_key(matched_term),
+                        bucket_id,
+                        activation,
+                    )
+                    if path_key in seen_paths:
+                        continue
+                    seen_paths.add(path_key)
+                    if bucket_id not in seed["matched_bucket_ids"]:
+                        seed["matched_bucket_ids"].append(bucket_id)
+                    paths.append(
+                        {
+                            "seed_term": source_term,
+                            "seed_kind": seed["kind"],
+                            "activation": activation,
+                            "matched_term": matched_term,
+                            "bucket_id": bucket_id,
+                            "bucket_name": bucket_name,
+                            "card_source": str(row.get("card_source") or ""),
+                            "score": self._safe_float(row.get("score"), 0.0),
+                            "weak_hint": bool(row.get("weak_hint")),
+                            "status": status,
+                            "evidence_labels": evidence_labels,
+                            "hard_evidence_labels": hard_evidence_labels,
+                            "blocked_reason": blocked_reason,
+                        }
+                    )
+                    if len(paths) >= 30:
+                        break
+                if len(paths) >= 30:
+                    break
+            if len(paths) >= 30:
+                break
+
+        payload["paths"] = paths
+        payload["activated_bucket_ids"] = list(dict.fromkeys(path["bucket_id"] for path in paths))
+        payload["admitted_bucket_ids"] = list(
+            dict.fromkeys(path["bucket_id"] for path in paths if path["status"] == "admitted")
+        )
+        payload["blocked_bucket_ids"] = list(
+            dict.fromkeys(path["bucket_id"] for path in paths if path["status"] == "blocked")
+        )
+        payload["status"] = "matched" if paths else payload["status"]
+        payload["final"] = {
+            "structural_candidate_bucket_ids": payload["activated_bucket_ids"],
+            "selected_bucket_ids": payload["admitted_bucket_ids"],
+            "structural_injected_bucket_ids": [],
+            "existing_injected_bucket_ids": [],
+            "reason": (
+                "structural_candidate_selected"
+                if payload["admitted_bucket_ids"]
+                else ("no_admitted_structural_candidate" if paths else "no_structural_match")
+            ),
+        }
+        return payload
+
+    @staticmethod
+    def _finalize_structural_activation_debug(
+        query_planner_debug: dict[str, Any] | None,
+        injected_bucket_ids: list[str],
+    ) -> dict[str, Any]:
+        planner = query_planner_debug if isinstance(query_planner_debug, dict) else {}
+        raw_trace = planner.get("structural_activation_debug")
+        trace = deepcopy(raw_trace) if isinstance(raw_trace, dict) else {}
+        if not trace:
+            return {}
+        selected_ids = {
+            str(bucket_id or "")
+            for bucket_id in trace.get("admitted_bucket_ids", []) or []
+            if str(bucket_id or "")
+        }
+        injected_ids = [
+            str(bucket_id or "")
+            for bucket_id in injected_bucket_ids or []
+            if str(bucket_id or "")
+        ]
+        structural_injected = [bucket_id for bucket_id in injected_ids if bucket_id in selected_ids]
+        existing_injected = [bucket_id for bucket_id in injected_ids if bucket_id not in selected_ids]
+        paths = trace.get("paths") if isinstance(trace.get("paths"), list) else []
+        if structural_injected:
+            reason = "injected"
+        elif not paths:
+            reason = "no_structural_match"
+        elif not selected_ids:
+            reason = "no_admitted_structural_candidate"
+        else:
+            reason = "structural_candidate_not_injected"
+        trace["final"] = {
+            "structural_candidate_bucket_ids": list(trace.get("activated_bucket_ids") or []),
+            "selected_bucket_ids": list(trace.get("admitted_bucket_ids") or []),
+            "structural_injected_bucket_ids": structural_injected,
+            "existing_injected_bucket_ids": existing_injected,
+            "reason": reason,
+        }
+        return trace
+
+    def _memory_edge_activation_debug(
+        self,
+        query: str,
+        recalled_moments: list[dict],
+        diffused_rows: list[dict[str, Any]],
+        *,
+        context_mode: str = "",
+    ) -> dict[str, Any]:
+        payload = {
+            "enabled": True,
+            "status": "pending",
+            "reason": "",
+            "seed_bucket_ids": [],
+            "seeds": [],
+            "edge_candidates": [],
+            "paths": [],
+            "injected_path_count": 0,
+        }
+        if self.retrieval_mode != "graph":
+            payload.update(enabled=False, status="skipped", reason="retrieval_mode_bucket")
+            return payload
+        if self.related_memory_budget <= 0:
+            payload.update(enabled=False, status="disabled", reason="related_memory_budget_zero")
+            return payload
+        if not self.diffusion_options.enabled or self.diffusion_options.top_k <= 0:
+            payload.update(enabled=False, status="disabled", reason="diffusion_disabled")
+            return payload
+
+        query_plan = self._recall_query_plan(query, context_mode=context_mode)
+        seed_moments = [
+            moment
+            for moment in recalled_moments or []
+            if isinstance(moment, dict) and not self._is_source_record_capsule_only_moment(moment)
+        ]
+        if self._diffusion_requires_reliable_direct_seed(query_plan):
+            seed_moments = [
+                moment
+                for moment in seed_moments
+                if self._moment_has_reliable_diffusion_seed_signal(query, moment)
+            ]
+        seed_bucket_ids = list(
+            dict.fromkeys(
+                str(moment.get("bucket_id") or "")
+                for moment in seed_moments
+                if str(moment.get("bucket_id") or "")
+            )
+        )
+        payload["seed_bucket_ids"] = seed_bucket_ids
+        payload["seeds"] = [
+            {
+                "bucket_id": str(moment.get("bucket_id") or ""),
+                "bucket_name": self._moment_bucket_title(moment),
+                "moment_id": str(moment.get("moment_id") or ""),
+                "evidence_labels": self._debug_str_list(moment.get("evidence_labels")),
+                "hard_evidence_labels": self._debug_str_list(moment.get("hard_evidence_labels")),
+            }
+            for moment in seed_moments
+            if str(moment.get("bucket_id") or "")
+        ]
+        if not seed_bucket_ids:
+            payload.update(status="no_seed", reason="no_reliable_direct_seed")
+            return payload
+
+        try:
+            edges = self.memory_edge_store.related_edges(
+                seed_bucket_ids,
+                min_confidence=self.edge_min_confidence,
+                limit_per_source=20,
+            )
+        except Exception as exc:
+            logger.warning("Gateway memory edge shadow lookup failed: %s", exc)
+            payload.update(status="error", reason="memory_edge_lookup_failed")
+            return payload
+        payload["edge_candidates"] = [
+            {
+                "source_bucket_id": str(edge.get("source") or ""),
+                "target_bucket_id": str(edge.get("target") or ""),
+                "relation_type": str(edge.get("relation_type") or "relates_to"),
+                "confidence": self._safe_float(edge.get("confidence"), 0.0),
+                "direction": str(edge.get("direction") or "outgoing"),
+                "reason": str(edge.get("reason") or ""),
+                "status": str(edge.get("status") or "active"),
+                "seen_count": int(edge.get("seen_count") or 0),
+                "last_seen": str(edge.get("last_seen") or ""),
+            }
+            for edge in edges[:30]
+        ]
+
+        paths: list[dict[str, Any]] = []
+        for row in diffused_rows or []:
+            if not isinstance(row, dict) or str(row.get("source") or "") != "graph":
+                continue
+            path = row.get("path") if isinstance(row.get("path"), dict) else {}
+            trace = row.get("diffusion_trace") if isinstance(row.get("diffusion_trace"), dict) else {}
+            if not path.get("steps") or not trace:
+                continue
+            paths.append(
+                {
+                    "seed": dict(trace.get("seed") or {}),
+                    "target": dict(trace.get("target") or {}),
+                    "path_trace": str(trace.get("path_trace") or path.get("trace") or ""),
+                    "steps": [dict(step) for step in (path.get("steps") or []) if isinstance(step, dict)],
+                    "confidence": self._safe_float(trace.get("confidence"), 0.0),
+                    "activation": self._safe_float(trace.get("activation"), 0.0),
+                    "gate": dict(trace.get("gate") or {}),
+                    "final": dict(trace.get("final") or {}),
+                }
+            )
+            if len(paths) >= 20:
+                break
+        payload["paths"] = paths
+        payload["injected_path_count"] = sum(
+            1 for path in paths if bool((path.get("final") or {}).get("injected"))
+        )
+        if paths:
+            payload.update(status="expanded", reason="diffusion_paths_built")
+        elif payload["edge_candidates"]:
+            payload.update(status="no_path", reason="edge_did_not_produce_diffusion_path")
+        else:
+            payload.update(status="no_edge", reason="no_active_edge_for_seed")
+        return payload
+
+    def _moment_chunk_shadow_debug(
+        self,
+        bucket_map: dict[str, dict],
+        bucket_ids: list[str],
+    ) -> dict[str, Any]:
+        candidate_ids = list(
+            dict.fromkeys(
+                str(bucket_id or "")
+                for bucket_id in bucket_ids or []
+                if str(bucket_id or "") and str(bucket_id or "") in bucket_map
+            )
+        )[:12]
+        previews: list[dict[str, Any]] = []
+        errors: list[dict[str, str]] = []
+        for bucket_id in candidate_ids:
+            bucket = bucket_map[bucket_id]
+            try:
+                preview = preview_bucket_moment_chunks(
+                    bucket,
+                    target_chars=MOMENT_CHUNK_SHADOW_TARGET_CHARS,
+                    max_chars=MOMENT_CHUNK_SHADOW_MAX_CHARS,
+                    min_tail_chars=MOMENT_CHUNK_SHADOW_MIN_TAIL_CHARS,
+                )
+            except Exception as exc:
+                logger.warning("Gateway moment chunk shadow preview failed for %s: %s", bucket_id, exc)
+                errors.append({"bucket_id": bucket_id, "reason": type(exc).__name__})
+                continue
+            metadata = bucket.get("metadata") if isinstance(bucket.get("metadata"), dict) else {}
+            previews.append(
+                {
+                    "bucket_id": bucket_id,
+                    "bucket_name": str(metadata.get("name") or bucket_id),
+                    **preview,
+                }
+            )
+        changed_ids = [
+            str(preview.get("bucket_id") or "")
+            for preview in previews
+            if preview.get("changed") and preview.get("bucket_id")
+        ]
+        return {
+            "enabled": True,
+            "mode": "shadow",
+            "strategy": "line_aware_v1",
+            "affects_recall": False,
+            "status": "previewed" if previews else ("error" if errors else "no_candidates"),
+            "target_chars": MOMENT_CHUNK_SHADOW_TARGET_CHARS,
+            "max_chars": MOMENT_CHUNK_SHADOW_MAX_CHARS,
+            "min_tail_chars": MOMENT_CHUNK_SHADOW_MIN_TAIL_CHARS,
+            "candidate_bucket_ids": candidate_ids,
+            "changed_bucket_ids": changed_ids,
+            "buckets": previews,
+            "errors": errors,
         }
 
     @staticmethod
@@ -13573,6 +13956,11 @@ class GatewayService:
                     "word_map_neighbor_terms": list(
                         word_map_item_debug.get("neighbor_terms") or []
                     ),
+                    "word_map_activation_terms": [
+                        dict(row)
+                        for row in (word_map_item_debug.get("terms") or [])
+                        if isinstance(row, dict)
+                    ],
                     "low_frequency_match": low_frequency_match,
                     "low_frequency_direct_match": low_frequency_direct_match,
                     "low_frequency_terms": low_frequency_terms,
@@ -13724,6 +14112,7 @@ class GatewayService:
             timing_debug=timing_debug,
             timing_prefix="direct",
         )
+        structural_activation_items = list(active_pool) + list(suppressed_candidates)
         self._add_timing_ms(timing_debug, "direct.candidate_items_total", stage_started_at)
         stage_started_at = time.perf_counter()
         self._merge_word_map_hint_debug(planner_debug, active_pool + suppressed_candidates)
@@ -13768,6 +14157,8 @@ class GatewayService:
                 )
                 relation_axis_items.extend(admitted)
                 suppressed_candidates.extend(suppressed)
+                structural_activation_items.extend(admitted)
+                structural_activation_items.extend(suppressed)
                 stage_started_at = time.perf_counter()
                 self._merge_word_map_hint_debug(planner_debug, admitted + suppressed)
                 self._merge_exact_anchor_debug(planner_debug, admitted + suppressed)
@@ -13843,6 +14234,8 @@ class GatewayService:
                         )
                         supplemental_items.extend(admitted)
                         suppressed_candidates.extend(suppressed)
+                        structural_activation_items.extend(admitted)
+                        structural_activation_items.extend(suppressed)
                         stage_started_at = time.perf_counter()
                         self._merge_word_map_hint_debug(planner_debug, admitted + suppressed)
                         self._merge_exact_anchor_debug(planner_debug, admitted + suppressed)
@@ -13893,6 +14286,11 @@ class GatewayService:
             for item in selected_items
             if (item.get("bucket") or {}).get("id")
         ]
+        planner_debug["structural_activation_debug"] = self._structural_activation_shadow_debug(
+            query,
+            structural_activation_items,
+            planner_debug["final_bucket_ids"],
+        )
         selected_buckets = [
             self._bucket_with_recall_signal(item)
             for item in selected_items
@@ -16500,6 +16898,21 @@ class GatewayService:
             )
             for moment in (suppressed_moments or [])[:20]
         ]
+        moment_chunk_shadow_bucket_ids = list(
+            dict.fromkeys(
+                recalled_bucket_ids
+                + [
+                    str(row.get("bucket_id") or "")
+                    for row in suppressed_bucket_debug_rows
+                    if row.get("bucket_id")
+                ]
+                + diffused_candidate_bucket_ids
+            )
+        )
+        moment_chunk_shadow_debug = self._moment_chunk_shadow_debug(
+            bucket_map,
+            moment_chunk_shadow_bucket_ids,
+        )
         recall_why_summary = self._build_recall_why_summary(
             injected_bucket_ids=injected_bucket_ids,
             direct_rows=recalled_moment_debug_rows,
@@ -16510,6 +16923,18 @@ class GatewayService:
             date_recall_bucket_ids=date_recall_bucket_ids,
             targeted_bucket_ids=targeted_bucket_ids,
             dream_source_bucket_ids=dream_source_bucket_ids,
+        )
+        structural_activation_debug = self._finalize_structural_activation_debug(
+            query_planner_debug,
+            injected_bucket_ids,
+        )
+        if not structural_activation_debug:
+            structural_activation_debug = self._structural_activation_debug_base(query)
+        structural_activation_debug["memory_edges"] = self._memory_edge_activation_debug(
+            query,
+            recalled_moments,
+            diffused_debug_rows,
+            context_mode=context_mode,
         )
         return {
             "model": model,
@@ -16532,6 +16957,8 @@ class GatewayService:
             "active_reminders_injected": bool(str(active_reminders or "").strip()),
             "active_reminder_ids": active_reminder_ids,
             "query_planner_debug": query_planner_debug or self._query_planner_debug_base(query),
+            "structural_activation_debug": structural_activation_debug,
+            "moment_chunk_shadow_debug": moment_chunk_shadow_debug,
             "memory_sentinel_debug": memory_sentinel_debug or self._memory_sentinel_debug_base(query),
             "domain_sentinel_debug": domain_sentinel_debug or self._domain_sentinel_rule_plan(query),
             "memory_detail_recall_debug": self._memory_detail_recall_debug_base(injected_bucket_ids),

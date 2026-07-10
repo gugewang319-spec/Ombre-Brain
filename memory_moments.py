@@ -87,6 +87,19 @@ DEFAULT_ANNOTATION_OPTIONS = {
     "max_evidence_chars": 120,
 }
 DEFAULT_CONTENT_START_LINE = 1
+SHADOW_CHUNKABLE_CONTENT_SECTIONS = frozenset(
+    {
+        "body",
+        "moment",
+        "fact",
+        "original",
+        "context",
+        "evidence_context",
+        "reflection",
+        "feeling",
+    }
+)
+SENTENCE_END_RE = re.compile(r"[\u3002\uff01\uff1f\uff1b!?;]+|[.]+(?=\s|$)")
 
 
 class MemoryMomentStore:
@@ -594,6 +607,80 @@ def parse_bucket_moments(
     return moments
 
 
+def preview_bucket_moment_chunks(
+    bucket: dict,
+    target_chars: int = 320,
+    max_chars: int = 520,
+    min_tail_chars: int = 100,
+) -> dict:
+    """Preview line-aware content chunks without changing indexed moments."""
+    target_chars = int(target_chars)
+    max_chars = int(max_chars)
+    min_tail_chars = int(min_tail_chars)
+    if target_chars <= 0 or max_chars <= 0:
+        raise ValueError("target_chars and max_chars must be positive")
+    if target_chars > max_chars:
+        raise ValueError("target_chars must not exceed max_chars")
+    if min_tail_chars < 0 or min_tail_chars > max_chars:
+        raise ValueError("min_tail_chars must be between 0 and max_chars")
+
+    current = parse_bucket_moments(bucket)
+    content_text_start_lines = _content_moment_text_start_lines(bucket)
+    current_debug = [_current_moment_preview(moment) for moment in current]
+    shadow: list[dict] = []
+
+    for moment in current:
+        text = str(moment.get("text") or "")
+        should_split = (
+            moment.get("source") == "content"
+            and moment.get("section") in SHADOW_CHUNKABLE_CONTENT_SECTIONS
+            and len(text) > max_chars
+        )
+        chunks = (
+            _split_shadow_moment_text(text, target_chars, max_chars, min_tail_chars)
+            if should_split
+            else [{"text": text, "start_line": 1, "end_line": max(1, text.count("\n") + 1)}]
+        )
+        parent_ref = _moment_source_ref(moment)
+        text_start_line = content_text_start_lines.get(str(moment.get("source_id") or ""))
+        for chunk_index, chunk in enumerate(chunks):
+            source_ref = parent_ref
+            if should_split:
+                source_ref = _shadow_chunk_source_ref(parent_ref, text_start_line, chunk)
+            chunk_text = str(chunk["text"])
+            shadow.append(
+                {
+                    "parent_moment_id": str(moment.get("moment_id") or ""),
+                    "section": str(moment.get("section") or ""),
+                    "chunk_index": chunk_index,
+                    "chars": len(chunk_text),
+                    "text_preview": _clip_text(chunk_text, 180),
+                    "source_ref": source_ref,
+                    "source": str(moment.get("source") or ""),
+                    "source_id": str(moment.get("source_id") or ""),
+                    "parent_ordinal": int(moment.get("ordinal") or 0),
+                    "split": should_split,
+                }
+            )
+
+    current_content_count = sum(1 for moment in current if moment.get("source") == "content")
+    shadow_content_count = sum(1 for moment in shadow if moment.get("source") == "content")
+    return {
+        "mode": "shadow_preview",
+        "strategy": "line_then_sentence_with_short_tail_merge",
+        "thresholds": {
+            "target_chars": target_chars,
+            "max_chars": max_chars,
+            "min_tail_chars": min_tail_chars,
+        },
+        "current_content_moment_count": current_content_count,
+        "shadow_content_moment_count": shadow_content_count,
+        "changed": shadow_content_count != current_content_count,
+        "current_moments": current_debug,
+        "shadow_moments": shadow,
+    }
+
+
 def build_moment_edges(moments: list[dict]) -> list[dict]:
     ordered = sorted(
         [moment for moment in moments if moment.get("moment_id")],
@@ -735,10 +822,16 @@ def _block_from_split_state(current: dict, fallback_end_line: int) -> dict:
     text = "\n".join(raw_lines).strip()
     start_line = _safe_int(current.get("start_line"), 1)
     end_line = max(start_line, int(fallback_end_line))
+    text_start_line = start_line
     if heading:
-        for index, line in enumerate(raw_lines, start=start_line + 1):
-            if str(line).strip():
-                end_line = index
+        nonblank = [
+            index
+            for index, line in enumerate(raw_lines, start=start_line + 1)
+            if str(line).strip()
+        ]
+        if nonblank:
+            text_start_line = nonblank[0]
+            end_line = nonblank[-1]
     else:
         nonblank = [
             index
@@ -747,6 +840,7 @@ def _block_from_split_state(current: dict, fallback_end_line: int) -> dict:
         ]
         if nonblank:
             start_line = nonblank[0]
+            text_start_line = start_line
             end_line = nonblank[-1]
     return {
         "heading": heading,
@@ -754,7 +848,162 @@ def _block_from_split_state(current: dict, fallback_end_line: int) -> dict:
         "text": text,
         "start_line": start_line,
         "end_line": end_line,
+        "text_start_line": text_start_line,
     }
+
+
+def _current_moment_preview(moment: dict) -> dict:
+    text = str(moment.get("text") or "")
+    return {
+        "moment_id": str(moment.get("moment_id") or ""),
+        "section": str(moment.get("section") or ""),
+        "ordinal": int(moment.get("ordinal") or 0),
+        "source": str(moment.get("source") or ""),
+        "source_id": str(moment.get("source_id") or ""),
+        "chars": len(text),
+        "text_preview": _clip_text(text, 180),
+        "source_ref": _moment_source_ref(moment),
+    }
+
+
+def _moment_source_ref(moment: dict) -> dict | None:
+    metadata = moment.get("metadata") if isinstance(moment.get("metadata"), dict) else {}
+    source_ref = metadata.get("source_ref")
+    return dict(source_ref) if isinstance(source_ref, dict) else None
+
+
+def _content_moment_text_start_lines(bucket: dict) -> dict[str, int]:
+    source_base = _source_ref_base(bucket)
+    if not source_base:
+        return {}
+
+    content = str(bucket.get("content") or "")
+    blocks = _split_markdown_blocks(content)
+    offset = int(source_base["content_start_line"]) - 1
+    if not any(_canonical_section(block["heading"]) for block in blocks if block["heading"]):
+        lines = content.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        first_nonblank = next(
+            (line_no for line_no, line in enumerate(lines, start=1) if str(line).strip()),
+            1,
+        )
+        return {"body": offset + first_nonblank}
+
+    starts: dict[str, int] = {}
+    for block_index, block in enumerate(blocks):
+        heading = block["heading"]
+        text = str(block["text"] or "").strip()
+        canonical_section = _canonical_section(heading) if heading else "body"
+        section = canonical_section or "body"
+        if not canonical_section and heading:
+            text = f"{block['heading_line']}\n{text}".strip()
+        if not text:
+            continue
+        relative_line = (
+            _safe_int(block.get("text_start_line"), _safe_int(block.get("start_line"), 1))
+            if canonical_section
+            else _safe_int(block.get("start_line"), 1)
+        )
+        starts[f"{section}-{block_index}"] = offset + relative_line
+    return starts
+
+
+def _split_shadow_moment_text(
+    text: str,
+    target_chars: int,
+    max_chars: int,
+    min_tail_chars: int,
+) -> list[dict]:
+    units = _shadow_text_units(text, max_chars)
+    if not units:
+        return [{"text": text, "start_line": 1, "end_line": 1}]
+
+    packed: list[list[dict]] = []
+    current: list[dict] = []
+    for unit in units:
+        candidate = [*current, unit]
+        if current and (
+            len(_render_shadow_units(current)) >= target_chars
+            or len(_render_shadow_units(candidate)) > max_chars
+        ):
+            packed.append(current)
+            current = [unit]
+        else:
+            current = candidate
+    if current:
+        packed.append(current)
+
+    if len(packed) > 1 and len(_render_shadow_units(packed[-1])) < min_tail_chars:
+        merged = [*packed[-2], *packed[-1]]
+        if len(_render_shadow_units(merged)) <= max_chars:
+            packed[-2:] = [merged]
+
+    return [
+        {
+            "text": _render_shadow_units(chunk_units),
+            "start_line": int(chunk_units[0]["line"]),
+            "end_line": int(chunk_units[-1]["line"]),
+        }
+        for chunk_units in packed
+    ]
+
+
+def _shadow_text_units(text: str, max_chars: int) -> list[dict]:
+    lines = str(text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    units: list[dict] = []
+    previous_line = 0
+    for line_no, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        fragments = _sentence_fragments(line) if len(line) > max_chars else [line]
+        for fragment_index, fragment in enumerate(fragments):
+            if not fragment:
+                continue
+            pieces = [fragment[index : index + max_chars] for index in range(0, len(fragment), max_chars)]
+            for piece_index, piece in enumerate(pieces):
+                separator = ""
+                if fragment_index == 0 and piece_index == 0 and previous_line:
+                    separator = "\n" * max(1, line_no - previous_line)
+                units.append({"text": piece, "separator": separator, "line": line_no})
+        previous_line = line_no
+    return units
+
+
+def _sentence_fragments(line: str) -> list[str]:
+    fragments = []
+    start = 0
+    for match in SENTENCE_END_RE.finditer(line):
+        end = match.end()
+        if end > start:
+            fragments.append(line[start:end])
+        start = end
+    if start < len(line):
+        fragments.append(line[start:])
+    return fragments or [line]
+
+
+def _render_shadow_units(units: list[dict]) -> str:
+    if not units:
+        return ""
+    parts = [str(units[0]["text"])]
+    for unit in units[1:]:
+        parts.append(str(unit.get("separator") or ""))
+        parts.append(str(unit["text"]))
+    return "".join(parts).strip()
+
+
+def _shadow_chunk_source_ref(
+    parent_ref: dict | None,
+    text_start_line: int | None,
+    chunk: dict,
+) -> dict | None:
+    if not parent_ref:
+        return None
+    source_ref = dict(parent_ref)
+    if text_start_line is None:
+        return source_ref
+    source_ref["start_line"] = text_start_line + int(chunk["start_line"]) - 1
+    source_ref["end_line"] = text_start_line + int(chunk["end_line"]) - 1
+    return source_ref
 
 
 def _make_edge(
