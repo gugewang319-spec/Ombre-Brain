@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 from openai import AsyncOpenAI
 
 from identity import identity_names, render_identity_template
+from self_anchor import is_self_anchor_bucket
 from utils import bucket_text_for_embedding, strip_wikilinks
 
 logger = logging.getLogger("ombre_brain.portrait")
@@ -96,6 +97,8 @@ PORTRAIT_PROMPT_TEMPLATE = """你是一个证据化记忆状态整理器，正�
 - rewrite_mid_term 只能综合 staging_pool 里的观察，或本次明确 move_to_staging 的观察；当天新材料先进入 staging，再作为 mid-term 证据。
 - rewrite_stable 必须有 previous_portrait 或 staging/mid-term 证据支撑。
 - memory_materials 含路径、tags、created 日期、关键 moment/reflection 片段，以及 source_excerpt 原文短摘；优先读证据原味。
+- memory_materials 中的 allowed_scopes 是硬边界，evidence_scope_limits 也是历史证据的硬边界；有值时，该材料不能用于列表之外的 scope。relationship_weather / daily_impression 只能进入 relationship，自我锚点只能进入 persona。
+- evergreen=true 的材料是常驻长期证据，不代表今天发生了什么；不要据此生成 daily_summary 或 add_recent_activity。
 - 每条 add/rewrite/candidate 都必须带 evidence；没有证据就放 skip。
 
 输出前逐条自检：
@@ -104,6 +107,33 @@ PORTRAIT_PROMPT_TEMPLATE = """你是一个证据化记忆状态整理器，正�
 - text 是否平实准确，避免“总是、一定、极度、深刻、高度敏感、仪式、象征”等证据不足的夸张词。
 - user、relationship、persona 是否放在正确 scope；recent doing 是否留在 add_recent_activity。
 - 多条相似材料是否已经压成一句核心概括。
+- 输出 JSON 对象，不要 markdown，不要解释。"""
+
+
+STABLE_MAINTENANCE_PROMPT_TEMPLATE = """你是 {ai_name} 与 {user_display_name} 的长期画像维护器。
+这一步只维护 stable portrait，不处理 daily summary、recent、staging 或 mid-term。
+
+你会收到 previous_portrait、daily_patch 和 memory_materials。必须对 user、persona、relationship 三个 scope 分别作出一次明确决定，并输出纯 JSON：
+{{
+  "stable_maintenance": {{
+    "user": {{"action": "rewrite|unchanged", "text": "", "evidence": [], "confidence": 0.82}},
+    "persona": {{"action": "rewrite|unchanged", "text": "", "evidence": [], "confidence": 0.82}},
+    "relationship": {{"action": "rewrite|unchanged", "text": "", "evidence": [], "confidence": 0.82}}
+  }}
+}}
+
+规则：
+- 三个 scope 都必须返回，不能省略。stable_locked=true 时必须 unchanged。
+- 输入里的 required_rewrite_scopes 非空时，那些 scope 已有足够证据但 stable 仍空，必须 rewrite。
+- rewrite 的 text 是该 scope 完整、可直接替换的 stable 段落，最多160字；不是增量，不是事件列表，不是把 mid-term 原句复制过去。
+- previous stable 已准确且没有实质变化时 unchanged；action=unchanged 时 text 和 evidence 留空。
+- previous stable 为空时，只要 previous mid-term/staging 或本次 daily_patch 已有跨日、重复或明确长期证据，就必须 rewrite，不能因为其他 scope 更醒目而跳过。
+- user 回答“{user_display_name}长期稳定的偏好、边界、工作方式和关心点是什么”。
+- persona 回答“{ai_name}怎样理解自己、稳定选择怎样回应、保留哪些自我边界”。自我锚点可以作为 persona 的长期证据；affection/playful 等事件标签本身不足以证明稳定自我。
+- relationship 回答“这段关系长期怎样被理解、恢复和维护”。
+- memory_materials.allowed_scopes 与 evidence_scope_limits 是硬边界；材料不得用于列表外的 scope。relationship_weather / daily_impression 只能支持 relationship，自我锚点只能支持 persona。
+- rewrite 必须带真实 evidence，只能引用输入中已有的 bucket_id / session_id；无证据不得编造。
+- 文字中不要出现 bucket_id、日期、路径、证据编号，不做心理诊断，不用文学化夸张词。
 - 输出 JSON 对象，不要 markdown，不要解释。"""
 
 
@@ -224,7 +254,21 @@ class DailyPortraitMaintainer:
             state,
             initial=initial,
         )
-        if not materials["buckets"] and not materials["persona_events"] and not force:
+        persona_stable_empty = not str(
+            ((state.get("portrait", {}) or {}).get("persona", {}) or {}).get("stable") or ""
+        ).strip()
+        has_persona_seed = any(
+            isinstance(row, dict)
+            and bool(row.get("evergreen"))
+            and set(row.get("allowed_scopes", []) or []) == {"persona"}
+            for row in materials.get("buckets", []) or []
+        )
+        if (
+            not materials.get("daily_bucket_count")
+            and not materials["persona_events"]
+            and not (persona_stable_empty and has_persona_seed)
+            and not force
+        ):
             return {
                 "status": "empty",
                 "date": date_key,
@@ -240,6 +284,15 @@ class DailyPortraitMaintainer:
             normalized_patch["daily_summary"] = ""
             self._demote_initial_old_recent(normalized_patch, materials)
         self._seed_missing_mid_terms(normalized_patch, state)
+        stable_rewrites, stable_rejected = await self._maintain_stables(
+            date_key,
+            state,
+            materials,
+            normalized_patch,
+        )
+        if stable_rewrites is not None:
+            normalized_patch["rewrite_stable"] = stable_rewrites
+        rejected.extend(stable_rejected)
         handoff_summaries = self._build_handoff_recent_summaries(
             materials,
             normalized_patch,
@@ -727,10 +780,25 @@ class DailyPortraitMaintainer:
         )
         limit = self.first_run_material_limit if initial else self.material_limit
         bucket_rows = [self._bucket_payload(bucket) for bucket in buckets[:limit]]
+        material_ids = {str(row.get("bucket_id") or "") for row in bucket_rows}
+        for bucket in self._self_anchor_material_buckets(all_buckets):
+            bucket_id = str(bucket.get("id") or "")
+            if bucket_id and bucket_id not in material_ids:
+                bucket_rows.append(self._bucket_payload(bucket))
+                material_ids.add(bucket_id)
+        evidence_scope_limits = {
+            str(bucket.get("id") or ""): allowed
+            for bucket in all_buckets
+            if isinstance(bucket, dict)
+            for allowed in [self._material_allowed_scopes(bucket)]
+            if str(bucket.get("id") or "") and allowed
+        }
         return {
             "date": now_local.date().isoformat(),
             "initial": initial,
             "buckets": bucket_rows,
+            "daily_bucket_count": min(len(buckets), limit),
+            "evidence_scope_limits": evidence_scope_limits,
             "persona_events": self._persona_event_materials(persona_engine, start, end, initial=initial),
             "previous_portrait": self._portrait_snapshot(state),
         }
@@ -743,6 +811,232 @@ class DailyPortraitMaintainer:
                 logger.warning("Portrait LLM patch failed, using fallback: %s", exc)
         return self._fallback_patch(materials, initial=initial)
 
+    async def _maintain_stables(
+        self,
+        date_key: str,
+        state: dict,
+        materials: dict,
+        patch: dict,
+    ) -> tuple[list[dict] | None, list[dict]]:
+        if not self.client:
+            return None, []
+        try:
+            raw = await self._api_stable_maintenance(date_key, materials, patch)
+        except Exception as exc:
+            logger.warning("Portrait stable maintenance failed, keeping primary patch: %s", exc)
+            return None, []
+        items, rejected, decided_scopes = self._normalize_stable_maintenance(
+            raw,
+            state,
+            materials,
+            patch,
+        )
+        missing_scopes = [scope for scope in PORTRAIT_SCOPES if scope not in decided_scopes]
+        if missing_scopes:
+            try:
+                retry_raw = await self._api_stable_maintenance(
+                    date_key,
+                    materials,
+                    patch,
+                    required_rewrite_scopes=missing_scopes,
+                )
+                retry_items, retry_rejected, retry_decided = self._normalize_stable_maintenance(
+                    retry_raw,
+                    state,
+                    materials,
+                    patch,
+                )
+                retry_missing = [scope for scope in PORTRAIT_SCOPES if scope not in retry_decided]
+                if not retry_missing:
+                    return retry_items, retry_rejected
+                missing_scopes = retry_missing
+                rejected = retry_rejected
+            except Exception as exc:
+                logger.warning("Portrait stable maintenance retry failed: %s", exc)
+            logger.warning(
+                "Portrait stable maintenance incomplete, keeping primary patch | missing=%s",
+                ",".join(missing_scopes),
+            )
+            rejected.append(
+                {
+                    "key": "stable_maintenance",
+                    "reason": "missing_scope_decisions",
+                    "item": ",".join(missing_scopes),
+                }
+            )
+            return None, rejected
+        return items, rejected
+
+    async def _api_stable_maintenance(
+        self,
+        date_key: str,
+        materials: dict,
+        patch: dict,
+        required_rewrite_scopes: list[str] | None = None,
+    ) -> dict:
+        payload = {
+            "date": date_key,
+            "required_rewrite_scopes": required_rewrite_scopes or [],
+            "previous_portrait": materials.get("previous_portrait", {}),
+            "daily_patch": {
+                key: patch.get(key, [])
+                for key in ("add_recent", "move_to_staging", "rewrite_mid_term")
+            },
+            "memory_materials": {
+                "buckets": materials.get("buckets", []),
+                "persona_events": materials.get("persona_events", []),
+                "evidence_scope_limits": materials.get("evidence_scope_limits", {}),
+            },
+        }
+        max_tokens = min(max(self.max_tokens, 1800), 4000)
+        response = await self._create_stable_completion(payload, max_tokens=max_tokens)
+        choice = response.choices[0] if response.choices else None
+        raw = choice.message.content if choice and choice.message else "{}"
+        return self._parse_json_object(raw or "{}")
+
+    async def _create_stable_completion(self, payload: dict, *, max_tokens: int):
+        messages = [
+            {"role": "system", "content": self._stable_prompt()},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        ]
+        options = self._completion_options(
+            max_tokens=max_tokens,
+            temperature=self.temperature,
+            json_response=self.json_response_format,
+        )
+        try:
+            return await self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                **options,
+            )
+        except Exception as exc:
+            if not options.pop("response_format", None):
+                raise
+            logger.warning("Portrait stable JSON response_format failed, retrying without it: %s", exc)
+            return await self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                **options,
+            )
+
+    def _normalize_stable_maintenance(
+        self,
+        payload: dict,
+        state: dict,
+        materials: dict,
+        daily_patch: dict | None = None,
+    ) -> tuple[list[dict], list[dict], set[str]]:
+        root = payload.get("stable_maintenance", {}) if isinstance(payload, dict) else {}
+        root = root if isinstance(root, dict) else {}
+        current_bucket_ids = {
+            str(item.get("bucket_id") or "")
+            for item in materials.get("buckets", [])
+            if str(item.get("bucket_id") or "")
+        }
+        current_session_ids = {
+            str(item.get("session_id") or "")
+            for item in materials.get("persona_events", [])
+            if str(item.get("session_id") or "")
+        }
+        portrait_bucket_ids, portrait_session_ids = self._portrait_evidence_sets(
+            materials.get("previous_portrait", {})
+        )
+        known_bucket_ids = current_bucket_ids | portrait_bucket_ids
+        known_session_ids = current_session_ids | portrait_session_ids
+        scope_limits = self._material_scope_limits(materials)
+        portrait = state.get("portrait", {}) if isinstance(state.get("portrait"), dict) else {}
+        items = []
+        rejected = []
+        decided_scopes: set[str] = set()
+        for scope in PORTRAIT_SCOPES:
+            scope_state = portrait.get(scope, {}) if isinstance(portrait.get(scope), dict) else {}
+            row = root.get(scope)
+            if not isinstance(row, dict):
+                rejected.append({"key": "stable_maintenance", "reason": "missing_scope", "item": scope})
+                continue
+            action = str(row.get("action") or "").strip().lower()
+            if bool(scope_state.get("stable_locked")):
+                decided_scopes.add(scope)
+                continue
+            if action == "unchanged":
+                if self._scope_requires_stable_seed(
+                    scope,
+                    scope_state,
+                    materials,
+                    daily_patch or {},
+                ):
+                    rejected.append(
+                        {
+                            "key": "stable_maintenance",
+                            "reason": "empty_stable_requires_rewrite",
+                            "item": scope,
+                        }
+                    )
+                    continue
+                decided_scopes.add(scope)
+                continue
+            if action != "rewrite":
+                rejected.append(
+                    {"key": "stable_maintenance", "reason": "invalid_action", "item": scope}
+                )
+                continue
+            clean, reason = self._normalize_patch_item(
+                {**row, "scope": scope},
+                key="rewrite_stable",
+                evidence_bucket_ids=known_bucket_ids,
+                evidence_session_ids=known_session_ids,
+                evidence_scope_limits=scope_limits,
+            )
+            if not clean:
+                rejected.append(
+                    {
+                        "key": "stable_maintenance",
+                        "reason": reason,
+                        "item": scope,
+                    }
+                )
+                continue
+            items.append(clean)
+            decided_scopes.add(scope)
+        return items, rejected, decided_scopes
+
+    def _scope_requires_stable_seed(
+        self,
+        scope: str,
+        scope_state: dict,
+        materials: dict,
+        daily_patch: dict,
+    ) -> bool:
+        if bool(scope_state.get("stable_locked")):
+            return False
+        if str(scope_state.get("stable") or "").strip():
+            return False
+        if str(scope_state.get("mid_term") or "").strip():
+            return True
+        if any(
+            isinstance(row, dict) and row.get("evidence")
+            for row in scope_state.get("staging_pool", []) or []
+        ):
+            return True
+        for key in ("move_to_staging", "rewrite_mid_term"):
+            if any(
+                isinstance(row, dict)
+                and str(row.get("scope") or "") == scope
+                and row.get("evidence")
+                for row in daily_patch.get(key, []) or []
+            ):
+                return True
+        if scope == "persona":
+            return any(
+                isinstance(row, dict)
+                and bool(row.get("evergreen"))
+                and set(row.get("allowed_scopes", []) or []) == {"persona"}
+                and bool(row.get("bucket_id"))
+                for row in materials.get("buckets", []) or []
+            )
+        return False
+
     async def _api_patch(self, date_key: str, state: dict, materials: dict, *, initial: bool) -> dict:
         payload = {
             "date": date_key,
@@ -751,6 +1045,7 @@ class DailyPortraitMaintainer:
             "memory_materials": {
                 "buckets": materials.get("buckets", []),
                 "persona_events": materials.get("persona_events", []),
+                "evidence_scope_limits": materials.get("evidence_scope_limits", {}),
             },
         }
         token_attempts = [self.max_tokens]
@@ -841,7 +1136,11 @@ class DailyPortraitMaintainer:
                 move_to_staging.append(row)
             else:
                 add_recent.append(row)
-        daily_summary = "；".join(self._clip(item.get("name") or item.get("text"), 24) for item in materials.get("buckets", [])[:3] if item.get("name") or item.get("text"))
+        daily_summary = "；".join(
+            self._clip(item.get("name") or item.get("text"), 24)
+            for item in materials.get("buckets", [])[:3]
+            if not item.get("evergreen") and (item.get("name") or item.get("text"))
+        )
         return {
             "daily_summary": daily_summary,
             "add_recent": add_recent,
@@ -858,6 +1157,7 @@ class DailyPortraitMaintainer:
             patch = {}
         normalized = {key: [] for key in PATCH_KEYS}
         rejected = []
+        evidence_scope_limits = self._material_scope_limits(materials)
         current_bucket_ids = {
             str(item.get("bucket_id") or "")
             for item in materials.get("buckets", [])
@@ -890,6 +1190,7 @@ class DailyPortraitMaintainer:
                     key=key,
                     evidence_bucket_ids=known_bucket_ids,
                     evidence_session_ids=known_session_ids,
+                    evidence_scope_limits=evidence_scope_limits,
                 )
                 if clean:
                     normalized[key].append(clean)
@@ -920,6 +1221,7 @@ class DailyPortraitMaintainer:
                     key=key,
                     evidence_bucket_ids=bucket_ids,
                     evidence_session_ids=session_ids,
+                    evidence_scope_limits=evidence_scope_limits,
                     missing_reason=missing_reason,
                 )
                 if clean:
@@ -936,6 +1238,57 @@ class DailyPortraitMaintainer:
             normalized[key] = [by_scope[scope] for scope in PORTRAIT_SCOPES if scope in by_scope]
         return normalized, rejected
 
+    def _material_scope_limits(self, materials: dict) -> dict[tuple[str, str], set[str]]:
+        limits: dict[tuple[str, str], set[str]] = {}
+        configured_limits = materials.get("evidence_scope_limits", {})
+        if isinstance(configured_limits, dict):
+            for bucket_id, scopes in configured_limits.items():
+                allowed = {
+                    str(scope or "").strip()
+                    for scope in scopes or []
+                    if str(scope or "").strip() in PORTRAIT_SCOPES
+                }
+                if str(bucket_id or "").strip() and allowed:
+                    limits[("bucket", str(bucket_id).strip())] = allowed
+        for row in materials.get("buckets", []) or []:
+            if not isinstance(row, dict):
+                continue
+            bucket_id = str(row.get("bucket_id") or "").strip()
+            allowed = {
+                str(scope or "").strip()
+                for scope in row.get("allowed_scopes", []) or []
+                if str(scope or "").strip() in PORTRAIT_SCOPES
+            }
+            if bucket_id and allowed:
+                limits[("bucket", bucket_id)] = allowed
+        for row in materials.get("persona_events", []) or []:
+            if not isinstance(row, dict):
+                continue
+            session_id = str(row.get("session_id") or "").strip()
+            allowed = {
+                str(scope or "").strip()
+                for scope in row.get("allowed_scopes", []) or []
+                if str(scope or "").strip() in PORTRAIT_SCOPES
+            }
+            if session_id and allowed:
+                limits[("session", session_id)] = allowed
+        return limits
+
+    @staticmethod
+    def _evidence_allowed_for_scope(
+        evidence: dict,
+        scope: str,
+        limits: dict[tuple[str, str], set[str]],
+    ) -> bool:
+        scoped_limits = []
+        bucket_id = str(evidence.get("bucket_id") or "").strip()
+        session_id = str(evidence.get("session_id") or "").strip()
+        if bucket_id and ("bucket", bucket_id) in limits:
+            scoped_limits.append(limits[("bucket", bucket_id)])
+        if session_id and ("session", session_id) in limits:
+            scoped_limits.append(limits[("session", session_id)])
+        return all(scope in allowed for allowed in scoped_limits)
+
     def _normalize_patch_item(
         self,
         item: Any,
@@ -943,6 +1296,7 @@ class DailyPortraitMaintainer:
         key: str,
         evidence_bucket_ids: set[str],
         evidence_session_ids: set[str],
+        evidence_scope_limits: dict[tuple[str, str], set[str]] | None = None,
         missing_reason: str = "missing_valid_evidence",
     ) -> tuple[dict | None, str]:
         if not isinstance(item, dict):
@@ -976,6 +1330,14 @@ class DailyPortraitMaintainer:
             ]
             if not evidence:
                 return None, missing_reason
+            scoped_evidence = [
+                row
+                for row in evidence
+                if self._evidence_allowed_for_scope(row, scope, evidence_scope_limits or {})
+            ]
+            if not scoped_evidence:
+                return None, "scope_limited_evidence"
+            evidence = scoped_evidence
         if key == "profile_fact_candidate" and not any(row.get("bucket_id") for row in evidence):
             return None, "profile_fact_needs_bucket_evidence"
         clean = {
@@ -1976,6 +2338,8 @@ class DailyPortraitMaintainer:
             "source": str(meta.get("source") or ""),
             "anchor": bool(meta.get("anchor")),
             "profile_kind": str(meta.get("profile_kind") or ""),
+            "allowed_scopes": self._material_allowed_scopes(bucket),
+            "evergreen": self._is_self_anchor_material(bucket),
             "confidence": self._clamp(meta.get("confidence"), 0.55),
             "key_sections": key_sections,
             "text": self._clip(strip_wikilinks(text), 700),
@@ -2010,12 +2374,58 @@ class DailyPortraitMaintainer:
                     "assistant_excerpt": self._clip(event.get("assistant_excerpt") or "", 240),
                     "reply_guidance": self._clip(event.get("reply_guidance") or "", 160),
                     "relationship_event": bool(event.get("relationship_event")),
+                    "allowed_scopes": ["user", "persona", "relationship"],
                     "confidence": self._clamp(event.get("confidence"), 0.55),
                 }
             )
             if len(rows) >= self.persona_events_limit:
                 break
         return rows
+
+    def _configured_self_anchor_id(self) -> str:
+        cfg = self.config.get("self_anchor", {}) if isinstance(self.config.get("self_anchor"), dict) else {}
+        return str(cfg.get("entry_bucket_id") or "").strip()
+
+    def _is_self_anchor_material(self, bucket: dict) -> bool:
+        bucket_id = str(bucket.get("id") or "").strip() if isinstance(bucket, dict) else ""
+        configured_id = self._configured_self_anchor_id()
+        return bool((configured_id and bucket_id == configured_id) or is_self_anchor_bucket(bucket))
+
+    def _self_anchor_material_buckets(self, all_buckets: list[dict]) -> list[dict]:
+        configured_id = self._configured_self_anchor_id()
+        rows = []
+        for bucket in all_buckets:
+            if not isinstance(bucket, dict) or not self._is_self_anchor_material(bucket):
+                continue
+            meta = bucket.get("metadata", {}) if isinstance(bucket.get("metadata"), dict) else {}
+            if meta.get("active") is False or meta.get("deprecated") or meta.get("type") == "archived":
+                continue
+            rows.append(bucket)
+        rows.sort(
+            key=lambda bucket: (
+                str(bucket.get("id") or "") == configured_id,
+                int((bucket.get("metadata", {}) or {}).get("importance") or 0),
+                str(
+                    (bucket.get("metadata", {}) or {}).get("updated_at")
+                    or (bucket.get("metadata", {}) or {}).get("last_active")
+                    or (bucket.get("metadata", {}) or {}).get("created")
+                    or ""
+                ),
+            ),
+            reverse=True,
+        )
+        return rows[:1]
+
+    def _material_allowed_scopes(self, bucket: dict) -> list[str]:
+        if self._is_self_anchor_material(bucket):
+            return ["persona"]
+        meta = bucket.get("metadata", {}) if isinstance(bucket.get("metadata"), dict) else {}
+        tags = {str(tag or "").strip().lower() for tag in meta.get("tags", []) or []}
+        if tags & {"relationship_weather", "daily_impression", "weekly_impression"}:
+            return ["relationship"]
+        if "profile_fact" in tags or str(meta.get("profile_kind") or "").strip():
+            return ["user"]
+        return []
 
     def _is_material_bucket(self, bucket: dict) -> bool:
         if not isinstance(bucket, dict):
@@ -2240,6 +2650,9 @@ class DailyPortraitMaintainer:
 
     def _prompt(self) -> str:
         return render_identity_template(PORTRAIT_PROMPT_TEMPLATE, self.identity)
+
+    def _stable_prompt(self) -> str:
+        return render_identity_template(STABLE_MAINTENANCE_PROMPT_TEMPLATE, self.identity)
 
     def _completion_options(
         self,
