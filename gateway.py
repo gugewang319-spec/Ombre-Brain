@@ -7738,6 +7738,9 @@ class GatewayService:
             debug["skip_reason"] = "budget_disabled"
             return "", debug
 
+        if self._query_requests_bridge_just_now_context(query_text):
+            return self._build_bridge_just_now_raw_context(debug)
+
         profile_id = str(getattr(self.persona_engine, "profile_id", "") or "default")
         limit = max(self.just_now_context_max_turns * 4, self.just_now_context_max_turns)
         turns = self.state_store.list_recent_conversation_turns(
@@ -7770,6 +7773,70 @@ class GatewayService:
                 lines.append(f"{header} {self.identity['user_display_name']}: {self._clip_text(user_text, 180)}")
             if assistant_text:
                 lines.append(f"  {self.identity['ai_name']}: {self._clip_text(assistant_text, 180)}")
+
+        text = self._trim_text("\n".join(lines), self.just_now_context_budget)
+        if not text.strip():
+            debug["skip_reason"] = "empty_context"
+            return "", debug
+        debug["status"] = "injected"
+        debug["source"] = "conversation_turns"
+        return text, debug
+
+    def _build_bridge_just_now_raw_context(
+        self,
+        debug: dict[str, Any],
+    ) -> tuple[str, dict[str, Any]]:
+        end_at = datetime.now(timezone.utc) + timedelta(seconds=1)
+        start_at = end_at - timedelta(hours=self.just_now_context_hours)
+        limit = max(self.just_now_context_max_turns * 2, self.just_now_context_max_turns)
+        try:
+            events = self.raw_event_store.list_events_between(
+                start_at=start_at,
+                end_at=end_at,
+                limit=limit,
+                source="haven_bridge_codex",
+            )
+        except Exception as exc:
+            logger.warning("Gateway Bridge just-now raw lookup failed | error=%s", exc)
+            debug["skip_reason"] = "bridge_raw_lookup_failed"
+            debug["source"] = "raw_events:haven_bridge_codex"
+            return "", debug
+
+        selected = [
+            event
+            for event in events
+            if str(event.get("role") or "").strip().lower() in {"user", "assistant"}
+            and self._clean_conversation_turn_text(event.get("text", ""))
+        ][:limit]
+        debug["turn_count"] = len(selected)
+        debug["selected_turn_ids"] = [int(event.get("id") or 0) for event in selected]
+        debug["source"] = "raw_events:haven_bridge_codex"
+        if not selected:
+            debug["skip_reason"] = "no_recent_bridge_raw_events"
+            return "", debug
+
+        lines = [
+            "Recent Haven Bridge raw chat snippets for an explicit Codex/Bridge/room just-now reference. "
+            "These are original mirrored messages; do not substitute current API-session turns."
+        ]
+        for event in reversed(selected):
+            created = self._format_conversation_turn_time(event.get("created_at"))
+            session_label = self._clip_text(
+                str(event.get("session_id") or event.get("conversation_id") or ""),
+                18,
+            )
+            header_bits = [created] if created else []
+            if session_label:
+                header_bits.append(f"session:{session_label}")
+            header = f"- [{' '.join(header_bits)}]" if header_bits else "-"
+            role = str(event.get("role") or "").strip().lower()
+            speaker = (
+                self.identity["user_display_name"]
+                if role == "user"
+                else self.identity["ai_name"]
+            )
+            text = self._clean_conversation_turn_text(event.get("text", ""))
+            lines.append(f"{header} {speaker}: {self._clip_text(text, 180)}")
 
         text = self._trim_text("\n".join(lines), self.just_now_context_budget)
         if not text.strip():
@@ -8046,6 +8113,23 @@ class GatewayService:
         if "之前" in text and ("背景" in text or "相关" in text):
             return False
         return True
+
+    @classmethod
+    def _query_requests_bridge_just_now_context(cls, query: str) -> bool:
+        text = " ".join(str(query or "").lower().split())
+        if not cls._query_requests_just_now_context(text):
+            return False
+        bridge_markers = (
+            "codex",
+            "haven bridge",
+            "bridge",
+            "pwa",
+            "room",
+            "房间",
+            "网页版",
+            "网页端",
+        )
+        return any(marker in text for marker in bridge_markers)
 
     async def _build_relationship_weather_block(self, all_buckets: list[dict]) -> str:
         if self.relationship_weather_budget <= 0:
