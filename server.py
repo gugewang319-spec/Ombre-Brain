@@ -973,6 +973,12 @@ def _require_dashboard_auth(request):
     )
 
 
+def _require_raw_api_auth(request):
+    if _dashboard_authenticated(request) or _authorized_memory_write(request):
+        return None
+    return _require_dashboard_auth(request)
+
+
 def _dashboard_login_response():
     from starlette.responses import JSONResponse
     token = _create_dashboard_session()
@@ -10951,7 +10957,7 @@ def _raw_ingest_events_from_body(
 async def api_ingest_raw(request):
     """Ingest user/assistant raw dialogue events. Does not accept tools, system prompts, or memory injections."""
     from starlette.responses import JSONResponse
-    err = _require_dashboard_auth(request)
+    err = _require_raw_api_auth(request)
     if err:
         return err
     try:
@@ -10982,7 +10988,7 @@ async def api_ingest_raw(request):
 async def api_search_raw(request):
     """Search raw dialogue events as a fallback archive. Returns only stored user/assistant originals."""
     from starlette.responses import JSONResponse
-    err = _require_dashboard_auth(request)
+    err = _require_raw_api_auth(request)
     if err:
         return err
 
