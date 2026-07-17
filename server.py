@@ -2437,6 +2437,13 @@ def make_json_safe(obj):
     return obj
 
 
+def json_safe_datetime(value):
+    """Serialize date-like API fields while preserving empty values."""
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    return value
+
+
 def _bucket_light_payload(bucket: dict) -> dict:
     meta = bucket.get("metadata", {}) if isinstance(bucket, dict) else {}
     metadata_view = normalize_memory_metadata(bucket)
@@ -6858,8 +6865,8 @@ def _inspect_moment_payload(
         "layer_debug": moment_layer_debug(moment),
         "runtime_gate": moment_runtime_gate_debug(moment),
         "metadata": moment.get("metadata", {}),
-        "created_at": moment.get("created_at"),
-        "updated_at": moment.get("updated_at"),
+        "created_at": json_safe_datetime(moment.get("created_at")),
+        "updated_at": json_safe_datetime(moment.get("updated_at")),
     }
     if include_text:
         payload["text"] = text
