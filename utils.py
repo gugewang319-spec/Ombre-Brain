@@ -545,6 +545,18 @@ def load_config(config_path: str = None) -> dict:
 
     # --- Environment variable overrides (highest priority) ---
     # --- 环境变量覆盖敏感/运行时配置（优先级最高）---
+    identity_config = config.get("identity")
+    if not isinstance(identity_config, dict):
+        identity_config = {}
+        config["identity"] = identity_config
+    for env_name, config_key in (
+        ("OMBRE_AI_NAME", "ai_name"),
+        ("OMBRE_USER_NAME", "user_name"),
+        ("OMBRE_USER_DISPLAY_NAME", "user_display_name"),
+    ):
+        if env_name in os.environ:
+            identity_config[config_key] = os.environ[env_name]
+
     env_api_key = os.environ.get("OMBRE_API_KEY", "")
     if env_api_key:
         config.setdefault("dehydration", {})["api_key"] = env_api_key
