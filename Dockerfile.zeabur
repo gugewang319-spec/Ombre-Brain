@@ -1,0 +1,33 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends nginx gettext-base \
+    && rm -rf /var/lib/apt/lists/* \
+    && rm -f /etc/nginx/sites-enabled/default
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY *.py .
+COPY resources ./resources
+COPY scripts ./scripts
+COPY dashboard.html .
+COPY dashboard_assets ./dashboard_assets
+COPY config.example.yaml ./config.yaml
+COPY zeabur/start.sh /usr/local/bin/zeabur-start
+COPY zeabur/nginx.conf.template /etc/nginx/nginx.conf.template
+
+RUN chmod +x /usr/local/bin/zeabur-start scripts/*.sh \
+    && mkdir -p /data/buckets /data/state
+
+ENV OMBRE_TRANSPORT=streamable-http \
+    OMBRE_BUCKETS_DIR=/data/buckets \
+    OMBRE_STATE_DIR=/data/state
+
+VOLUME ["/data"]
+
+EXPOSE 8000 8010
+
+ENTRYPOINT ["/usr/local/bin/zeabur-start"]
