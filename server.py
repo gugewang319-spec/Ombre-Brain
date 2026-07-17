@@ -2428,22 +2428,26 @@ def _metadata_text(value) -> str:
 
 def make_json_safe(obj):
     """Convert nested API response values into JSONResponse-safe primitives."""
+    if isinstance(obj, str):
+        return "".join(
+            "\ufffd" if 0xD800 <= ord(char) <= 0xDFFF else char
+            for char in obj
+        )
     if isinstance(obj, (datetime, date)):
         return obj.isoformat()
     if isinstance(obj, Path):
-        return str(obj)
+        return make_json_safe(str(obj))
     if isinstance(obj, (bytes, bytearray)):
         try:
-            return bytes(obj).decode("utf-8")
+            return make_json_safe(bytes(obj).decode("utf-8"))
         except UnicodeDecodeError:
             return f"<bytes:{len(obj)}>"
     if isinstance(obj, dict):
         safe = {}
         for key, value in obj.items():
-            if isinstance(key, (str, int, float, bool)) or key is None:
-                safe_key = key
-            else:
-                safe_key = str(make_json_safe(key))
+            safe_key = make_json_safe(key)
+            if not isinstance(safe_key, (str, int, float, bool)) and safe_key is not None:
+                safe_key = make_json_safe(str(safe_key))
             safe[safe_key] = make_json_safe(value)
         return safe
     if isinstance(obj, (list, tuple, set)):
