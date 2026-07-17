@@ -326,6 +326,7 @@ DEFAULT_IMPORT_CHUNK_TOKENS = 3500
 _IMPORT_DUPLICATE_SIMILARITY = 88.0
 _IMPORT_DEFAULT_MERGE_THRESHOLD = 90.0
 _IMPORT_DEFAULT_MERGE_CONTENT_SIMILARITY = 99.0
+_OPERIT_TAGGING_INPUT_CHARS = 2000
 
 
 def _normalize_import_text(text: str) -> str:
@@ -606,7 +607,17 @@ class ImportState:
             "memories_failed": 0,
             "embeddings_created": 0,
             "embeddings_failed": 0,
+            "embeddings_total": 0,
+            "embeddings_processed": 0,
             "import_format": "",
+            "operit_phase": "",
+            "operit_tagging_enabled": False,
+            "tagging_total": 0,
+            "tagging_processed": 0,
+            "tagging_succeeded": 0,
+            "tagging_failed": 0,
+            "tagging_pending": 0,
+            "tagging_concurrency": 0,
             "errors": [],
             "status": "idle",  # idle | running | paused | completed | error
             "started_at": "",
@@ -624,7 +635,17 @@ class ImportState:
                 self.data.setdefault("memories_failed", 0)
                 self.data.setdefault("embeddings_created", 0)
                 self.data.setdefault("embeddings_failed", 0)
+                self.data.setdefault("embeddings_total", 0)
+                self.data.setdefault("embeddings_processed", 0)
                 self.data.setdefault("import_format", "")
+                self.data.setdefault("operit_phase", "")
+                self.data.setdefault("operit_tagging_enabled", False)
+                self.data.setdefault("tagging_total", 0)
+                self.data.setdefault("tagging_processed", 0)
+                self.data.setdefault("tagging_succeeded", 0)
+                self.data.setdefault("tagging_failed", 0)
+                self.data.setdefault("tagging_pending", 0)
+                self.data.setdefault("tagging_concurrency", 0)
                 return True
             except (json.JSONDecodeError, OSError):
                 return False
@@ -654,7 +675,17 @@ class ImportState:
             "memories_failed": 0,
             "embeddings_created": 0,
             "embeddings_failed": 0,
+            "embeddings_total": 0,
+            "embeddings_processed": 0,
             "import_format": "",
+            "operit_phase": "",
+            "operit_tagging_enabled": False,
+            "tagging_total": 0,
+            "tagging_processed": 0,
+            "tagging_succeeded": 0,
+            "tagging_failed": 0,
+            "tagging_pending": 0,
+            "tagging_concurrency": 0,
             "errors": [],
             "status": "running",
             "started_at": now_iso(),
@@ -663,7 +694,11 @@ class ImportState:
 
     @property
     def can_resume(self) -> bool:
-        return self.data["status"] in ("paused", "running") and self.data["processed"] < self.data["total_chunks"]
+        if self.data["status"] not in ("paused", "running"):
+            return False
+        if self.data.get("import_format") == "operit":
+            return self.data.get("operit_phase") != "completed"
+        return self.data["processed"] < self.data["total_chunks"]
 
     def to_dict(self) -> dict:
         return dict(self.data)
@@ -777,11 +812,31 @@ class ImportEngine:
             import_cfg.get("merge_block_disjoint_dates"),
             True,
         )
+        self.operit_tagging_enabled = _bool_value(import_cfg.get("operit_tagging_enabled"), True)
+        self.operit_tagging_concurrency = _int_between(
+            import_cfg.get("operit_tagging_concurrency"),
+            2,
+            1,
+            8,
+        )
+        self.operit_tagging_max_attempts = _int_between(
+            import_cfg.get("operit_tagging_max_attempts"),
+            3,
+            1,
+            6,
+        )
+        self.operit_tagging_retry_base_seconds = _float_between(
+            import_cfg.get("operit_tagging_retry_base_seconds"),
+            1.0,
+            0.0,
+            30.0,
+        )
         self.state = ImportState(config.get("state_dir") or config["buckets_dir"])
         self._paused = False
         self._running = False
         self._chunks: list[dict] = []
         self._seen_import_hashes: set[str] = set()
+        self._state_lock: asyncio.Lock | None = None
 
     @property
     def is_running(self) -> bool:
@@ -801,6 +856,8 @@ class ImportEngine:
         filename: str = "",
         preserve_raw: bool = False,
         resume: bool = False,
+        import_mode: str = "auto",
+        operit_tagging: bool | None = None,
     ) -> dict:
         """
         Start or resume an import.
@@ -812,16 +869,24 @@ class ImportEngine:
         self._running = True
         self._paused = False
         self._seen_import_hashes = set()
+        self._state_lock = asyncio.Lock()
 
         try:
             source_hash = hashlib.sha256(raw_content.encode()).hexdigest()[:16]
-            operit_backup = parse_operit_memory_backup(raw_content)
+            normalized_mode = str(import_mode or "auto").strip().lower()
+            if normalized_mode not in {"auto", "operit", "conversation"}:
+                raise ValueError(f"Unsupported import mode: {import_mode}")
+            operit_backup = parse_operit_memory_backup(raw_content) if normalized_mode != "conversation" else None
+            if normalized_mode == "operit" and operit_backup is None:
+                raise ValueError("The selected file is not a valid Operit memory backup")
             if operit_backup is not None:
+                tagging_enabled = self.operit_tagging_enabled if operit_tagging is None else bool(operit_tagging)
                 return await self._start_operit_import(
                     operit_backup,
                     filename=filename,
                     source_hash=source_hash,
                     resume=resume,
+                    tagging_enabled=tagging_enabled,
                 )
 
             # Check for resume
@@ -876,8 +941,9 @@ class ImportEngine:
         filename: str,
         source_hash: str,
         resume: bool,
+        tagging_enabled: bool,
     ) -> dict:
-        """Import one untouched Ombre bucket per Operit memory entry."""
+        """Import all raw Operit entries before running optional model tagging."""
         entries = list(backup.get("memories") or [])
         if resume and self.state.load() and self.state.can_resume:
             if (
@@ -885,22 +951,31 @@ class ImportEngine:
                 and self.state.data.get("import_format") == "operit"
             ):
                 self.state.data["status"] = "running"
+                self.state.data["operit_tagging_enabled"] = bool(tagging_enabled)
+                self.state.data["tagging_concurrency"] = self.operit_tagging_concurrency if tagging_enabled else 0
                 self.state.save()
                 return await self._process_operit_entries(
                     entries,
                     filename=filename,
                     source_hash=source_hash,
                     export_date=backup.get("export_date"),
+                    tagging_enabled=tagging_enabled,
                 )
 
         self.state.reset(filename, source_hash, len(entries))
         self.state.data["import_format"] = "operit"
+        self.state.data["operit_phase"] = "raw"
+        self.state.data["operit_tagging_enabled"] = bool(tagging_enabled)
+        self.state.data["tagging_total"] = len(entries) if tagging_enabled else 0
+        self.state.data["tagging_pending"] = len(entries) if tagging_enabled else 0
+        self.state.data["tagging_concurrency"] = self.operit_tagging_concurrency if tagging_enabled else 0
         self.state.save()
         return await self._process_operit_entries(
             entries,
             filename=filename,
             source_hash=source_hash,
             export_date=backup.get("export_date"),
+            tagging_enabled=tagging_enabled,
         )
 
     async def _process_operit_entries(
@@ -910,7 +985,11 @@ class ImportEngine:
         filename: str,
         source_hash: str,
         export_date,
+        tagging_enabled: bool,
     ) -> dict:
+        self.state.data["operit_phase"] = "raw"
+        self.state.data["status"] = "running"
+        self.state.save()
         start_idx = int(self.state.data.get("processed") or 0)
         for index in range(start_idx, len(entries)):
             if self._paused:
@@ -927,6 +1006,7 @@ class ImportEngine:
                     filename=filename,
                     source_hash=source_hash,
                     export_date=export_date,
+                    tagging_enabled=tagging_enabled,
                 )
                 if status == "created":
                     self.state.data["memories_created"] += 1
@@ -949,6 +1029,12 @@ class ImportEngine:
             self.state.data["processed"] = index + 1
             self.state.save()
 
+        if not await self._process_operit_embeddings(entries):
+            return self.state.to_dict()
+        if tagging_enabled:
+            return await self._process_operit_tagging(entries)
+
+        self.state.data["operit_phase"] = "completed"
         self.state.data["status"] = "completed"
         self.state.save()
         self._running = False
@@ -962,6 +1048,7 @@ class ImportEngine:
         filename: str,
         source_hash: str,
         export_date,
+        tagging_enabled: bool,
     ) -> str:
         if not isinstance(entry, dict):
             raise ValueError("entry must be an object")
@@ -978,7 +1065,6 @@ class ImportEngine:
                 raise ValueError(f"bucket id collision: {bucket_id}")
             if str(existing.get("content") or "") != content:
                 raise ValueError(f"Operit UUID already exists with different content: {operit_uuid}")
-            await self._ensure_operit_embedding(bucket_id, content, entry.get("title"))
             return "duplicate"
 
         title = str(entry.get("title") or "").strip()
@@ -1008,6 +1094,8 @@ class ImportEngine:
             "operit_updated_at_ms": entry.get("updatedAt"),
             "operit_export_date_ms": export_date,
             "operit_entry_index": entry_index,
+            "operit_tagging_status": "pending" if tagging_enabled else "skipped",
+            "operit_tagging_attempts": 0,
         }
         extra_metadata = {key: value for key, value in extra_metadata.items() if value not in (None, "")}
 
@@ -1025,8 +1113,199 @@ class ImportEngine:
             updated_at=updated,
             extra_metadata=extra_metadata,
         )
-        await self._ensure_operit_embedding(bucket_id, content, title)
         return "created"
+
+    async def _process_operit_embeddings(self, entries: list[dict]) -> bool:
+        """Fill embeddings only after every valid raw entry is already on disk."""
+        targets = []
+        seen_bucket_ids = set()
+        for index, entry in enumerate(entries, start=1):
+            if not isinstance(entry, dict):
+                continue
+            bucket_id = self._operit_bucket_id(entry, index)
+            if bucket_id in seen_bucket_ids:
+                continue
+            seen_bucket_ids.add(bucket_id)
+            bucket = await self.bucket_mgr.get(bucket_id)
+            if bucket:
+                targets.append(bucket)
+
+        self.state.data["operit_phase"] = "embedding"
+        self.state.data["embeddings_total"] = len(targets)
+        self.state.data["embeddings_processed"] = 0
+        self.state.save()
+        for bucket in targets:
+            if self._paused:
+                self.state.data["status"] = "paused"
+                self.state.save()
+                self._running = False
+                return False
+            meta = bucket.get("metadata", {}) if isinstance(bucket.get("metadata"), dict) else {}
+            await self._ensure_operit_embedding(
+                bucket["id"],
+                str(bucket.get("content") or ""),
+                meta.get("name"),
+            )
+            self.state.data["embeddings_processed"] += 1
+            self.state.save()
+        return True
+
+    async def _process_operit_tagging(self, entries: list[dict]) -> dict:
+        """Tag each imported raw entry with bounded model concurrency."""
+        completed = []
+        candidates = []
+        seen_bucket_ids = set()
+        for index, entry in enumerate(entries, start=1):
+            if not isinstance(entry, dict):
+                continue
+            bucket_id = self._operit_bucket_id(entry, index)
+            if bucket_id in seen_bucket_ids:
+                continue
+            seen_bucket_ids.add(bucket_id)
+            bucket = await self.bucket_mgr.get(bucket_id)
+            if not bucket:
+                continue
+            meta = bucket.get("metadata", {}) if isinstance(bucket.get("metadata"), dict) else {}
+            if meta.get("operit_tagging_status") == "done":
+                completed.append(bucket)
+            else:
+                candidates.append(bucket)
+
+        self.state.data["operit_phase"] = "tagging"
+        self.state.data["tagging_total"] = len(completed) + len(candidates)
+        self.state.data["tagging_processed"] = len(completed)
+        self.state.data["tagging_succeeded"] = len(completed)
+        self.state.data["tagging_failed"] = 0
+        self.state.data["tagging_pending"] = len(candidates)
+        self.state.data["tagging_concurrency"] = self.operit_tagging_concurrency
+        self.state.save()
+
+        semaphore = asyncio.Semaphore(self.operit_tagging_concurrency)
+
+        async def _worker(bucket: dict) -> str:
+            async with semaphore:
+                if self._paused:
+                    return "pending"
+                try:
+                    return await self._tag_operit_bucket(bucket)
+                except Exception as exc:
+                    await self._record_operit_tagging_result(
+                        success=False,
+                        error=f"Unexpected Operit tagging failure for {bucket.get('id', '?')}: {str(exc)[:200]}",
+                    )
+                    return "failed"
+
+        if candidates:
+            await asyncio.gather(*(_worker(bucket) for bucket in candidates))
+
+        if self._paused:
+            self.state.data["status"] = "paused"
+            self.state.save()
+            self._running = False
+            return self.state.to_dict()
+
+        self.state.data["operit_phase"] = "completed"
+        self.state.data["status"] = "completed"
+        self.state.save()
+        self._running = False
+        return self.state.to_dict()
+
+    async def _tag_operit_bucket(self, bucket: dict) -> str:
+        bucket_id = str(bucket.get("id") or "")
+        content = str(bucket.get("content") or "")
+        meta = bucket.get("metadata", {}) if isinstance(bucket.get("metadata"), dict) else {}
+        previous_attempts = int(meta.get("operit_tagging_attempts") or 0)
+        last_error = ""
+
+        for attempt in range(1, self.operit_tagging_max_attempts + 1):
+            if self._paused:
+                return "pending"
+            async with self._state_lock:
+                self.state.data["api_calls"] += 1
+                self.state.save()
+            try:
+                analysis = await self.dehydrator.analyze(self._operit_tagging_input(content))
+                generated_tags = list(analysis.get("tags") or [])
+                if analysis.get("memory_classification_source") == "default" and not generated_tags:
+                    raise RuntimeError("model returned only default tagging metadata")
+
+                domains = _clean_import_list(
+                    analysis.get("domain"),
+                    max_items=2,
+                    max_chars=16,
+                    default=list(meta.get("domain") or ["Operit"]),
+                )
+                tags = _dedupe_list(list(meta.get("tags") or []) + generated_tags)
+                update_ok = await self.bucket_mgr.update(
+                    bucket_id,
+                    tags=tags,
+                    domain=domains,
+                    valence=analysis.get("valence", meta.get("valence", 0.5)),
+                    arousal=analysis.get("arousal", meta.get("arousal", 0.3)),
+                    last_active=meta.get("last_active"),
+                    updated_at=meta.get("updated_at"),
+                    extra_metadata={
+                        "operit_tagging_status": "done",
+                        "operit_tagging_attempts": previous_attempts + attempt,
+                        "operit_tagged_at": now_iso(),
+                        "operit_tagging_error": "",
+                        "operit_tagging_model": str(getattr(self.dehydrator, "model", "") or ""),
+                        "memory_subject": analysis.get("memory_subject"),
+                        "memory_layer": analysis.get("memory_layer"),
+                        "memory_classification_source": analysis.get("memory_classification_source"),
+                    },
+                )
+                if not update_ok:
+                    raise RuntimeError("bucket metadata update failed")
+                await self._record_operit_tagging_result(success=True)
+                return "done"
+            except Exception as exc:
+                last_error = str(exc)[:200]
+                if attempt < self.operit_tagging_max_attempts:
+                    delay = self.operit_tagging_retry_base_seconds * (2 ** (attempt - 1))
+                    if delay > 0:
+                        await asyncio.sleep(delay)
+
+        await self.bucket_mgr.update(
+            bucket_id,
+            last_active=meta.get("last_active"),
+            updated_at=meta.get("updated_at"),
+            extra_metadata={
+                "operit_tagging_status": "failed",
+                "operit_tagging_attempts": previous_attempts + self.operit_tagging_max_attempts,
+                "operit_tagging_error": last_error,
+                "operit_tagging_model": str(getattr(self.dehydrator, "model", "") or ""),
+            },
+        )
+        await self._record_operit_tagging_result(
+            success=False,
+            error=f"Operit tagging failed for {bucket_id}: {last_error}",
+        )
+        return "failed"
+
+    async def _record_operit_tagging_result(self, *, success: bool, error: str = "") -> None:
+        async with self._state_lock:
+            self.state.data["tagging_processed"] += 1
+            self.state.data["tagging_pending"] = max(0, self.state.data["tagging_pending"] - 1)
+            if success:
+                self.state.data["tagging_succeeded"] += 1
+            else:
+                self.state.data["tagging_failed"] += 1
+                if error and error not in self.state.data["errors"] and len(self.state.data["errors"]) < 100:
+                    self.state.data["errors"].append(error)
+            self.state.save()
+
+    @staticmethod
+    def _operit_tagging_input(content: str, max_chars: int = _OPERIT_TAGGING_INPUT_CHARS) -> str:
+        """Keep both ends of a long raw entry inside the analyzer's input budget."""
+        text = str(content or "")
+        if max_chars <= 0 or len(text) <= max_chars:
+            return text
+        marker = "\n\n[中间内容省略，仅用于打标]\n\n"
+        remaining = max(2, max_chars - len(marker))
+        head_chars = remaining // 2
+        tail_chars = remaining - head_chars
+        return text[:head_chars] + marker + text[-tail_chars:]
 
     async def _ensure_operit_embedding(self, bucket_id: str, content: str, title) -> bool:
         if not self.embedding_engine:
