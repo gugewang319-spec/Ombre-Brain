@@ -53,7 +53,7 @@ import secrets
 import time
 from base64 import b64decode
 from dataclasses import replace
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlencode, urlparse
 from zoneinfo import ZoneInfo
 import httpx
@@ -2422,6 +2422,19 @@ def _metadata_text(value) -> str:
     if isinstance(value, datetime):
         return value.isoformat()
     return str(value)
+
+
+def make_json_safe(obj):
+    """Convert API response values that JSONResponse cannot serialize."""
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    if isinstance(obj, dict):
+        return {key: make_json_safe(value) for key, value in obj.items()}
+    if isinstance(obj, list):
+        return [make_json_safe(value) for value in obj]
+    if isinstance(obj, tuple):
+        return [make_json_safe(value) for value in obj]
+    return obj
 
 
 def _bucket_light_payload(bucket: dict) -> dict:
@@ -9632,7 +9645,7 @@ async def api_buckets(request):
                 "content_preview": strip_wikilinks(b.get("content", ""))[:200],
             })
         result.sort(key=_bucket_dashboard_sort_key, reverse=True)
-        return JSONResponse(result)
+        return JSONResponse(make_json_safe(result))
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
