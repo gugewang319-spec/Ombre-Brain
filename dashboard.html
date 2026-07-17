@@ -3847,16 +3847,22 @@ let todoItems = [];
 let editingTodoId = '';
 
 function authUrl(path) {
-  return path.startsWith('http') ? path : BASE + path;
+  // Dashboard authentication must always use the public origin that served this page.
+  // This keeps the session cookie on the same origin as /dashboard and /api/*.
+  return new URL(String(path || ''), window.location.origin).toString();
 }
 
 async function authFetch(url, options) {
-  const response = await fetch(url, options);
+  const response = await fetch(url, Object.assign({ credentials: 'include' }, options || {}));
   if (response.status === 401) {
     showAuthOverlay(false);
     return null;
   }
   return response;
+}
+
+function dashboardBuckets() {
+  return Array.isArray(allBuckets) ? allBuckets : [];
 }
 
 function showAuthError(message) {
@@ -3892,7 +3898,8 @@ function clearAuthSensitiveFields(password) {
 
 async function checkAuth() {
   try {
-    const response = await fetch(authUrl('/auth/status'));
+    const response = await authFetch(authUrl('/auth/status'));
+    if (!response) return false;
     const data = await response.json();
     if (data.identity) {
       if (data.identity.user_name) dashboardCommentAuthor = data.identity.user_name;
@@ -3916,15 +3923,19 @@ async function doSetup() {
   const p2 = document.getElementById('auth-setup-pwd2').value;
   if (p1.length < 6) return showAuthError('密码至少6位');
   if (p1 !== p2) return showAuthError('两次密码不一致');
-  const response = await fetch(authUrl('/auth/setup'), {
+  const response = await authFetch(authUrl('/auth/setup'), {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({password: p1}),
   });
+  if (!response) return;
   if (response.ok) {
-    document.getElementById('auth-overlay').style.display = 'none';
     clearAuthSensitiveFields(p1);
-    loadBuckets();
+    if (!await checkAuth()) {
+      showAuthError('密码已设置，但浏览器未保存登录会话。请检查 Cookie 设置后重试。');
+      return;
+    }
+    await loadBuckets();
     return;
   }
   const data = await response.json().catch(() => ({}));
@@ -3933,23 +3944,30 @@ async function doSetup() {
 
 async function doLogin() {
   const password = document.getElementById('auth-login-pwd').value;
-  const response = await fetch(authUrl('/auth/login'), {
+  const response = await authFetch(authUrl('/auth/login'), {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({password}),
   });
+  if (!response) {
+    showAuthError('密码错误');
+    return;
+  }
   if (response.ok) {
-    document.getElementById('auth-overlay').style.display = 'none';
     clearAuthSensitiveFields(password);
     setTimeout(function() { clearAuthSensitiveFields(password); }, 80);
-    loadBuckets();
+    if (!await checkAuth()) {
+      showAuthError('登录成功，但浏览器未保存登录会话。请检查 Cookie 设置后重试。');
+      return;
+    }
+    await loadBuckets();
     return;
   }
   showAuthError('密码错误');
 }
 
 async function doLogout() {
-  await fetch(authUrl('/auth/logout'), { method: 'POST' });
+  await authFetch(authUrl('/auth/logout'), { method: 'POST' });
   showAuthOverlay(false);
 }
 
@@ -3999,7 +4017,7 @@ document.getElementById('search-input').addEventListener('input', (e) => {
   const q = e.target.value.trim();
   searchTimer = setTimeout(() => {
     if (q) searchBuckets(q);
-    else renderBuckets(filterBuckets(allBuckets));
+    else renderBuckets(filterBuckets(dashboardBuckets()));
   }, 300);
 });
 
@@ -4007,18 +4025,22 @@ async function loadBuckets(options) {
   options = options || {};
   try {
     if (!domainOptions.length) await loadDomainTaxonomy();
-    const res = await authFetch(BASE + '/api/buckets');
+    const res = await authFetch(authUrl('/api/buckets'));
     if (!res) return;
-    allBuckets = await res.json();
+    const data = await res.json();
+    if (!Array.isArray(data)) {
+      throw new Error((data && data.error) || '桶列表返回格式错误');
+    }
+    allBuckets = data;
     updateStats();
     loadDarkroomDoor();
     buildFilters();
     selectedBucketIds.forEach(function(id) {
-      if (!allBuckets.some(function(bucket) { return String(bucket.id || '') === id; })) {
+      if (!dashboardBuckets().some(function(bucket) { return String(bucket.id || '') === id; })) {
         selectedBucketIds.delete(id);
       }
     });
-    renderBuckets(filterBuckets(allBuckets));
+    renderBuckets(filterBuckets(dashboardBuckets()));
     if (getActiveTab() === 'reflection') renderReflectionReview();
     if (getActiveTab() === 'chat-memory' && window.loadDailyChatMemoryPending) loadDailyChatMemoryPending();
     if (getActiveTab() === 'todos') loadTodos();
@@ -4507,7 +4529,7 @@ function isSurfaceableBucket(bucket) {
 }
 
 function getDailyImpressions() {
-  return allBuckets.filter(function(b) {
+  return dashboardBuckets().filter(function(b) {
     return isDailyImpressionBucket(b);
   }).map(function(b) {
     return Object.assign({}, b, { reflection_date: getBucketDate(b) });
@@ -4520,7 +4542,7 @@ function getDailyImpressions() {
 
 function getReflectionEventsByDate() {
   var byDate = {};
-  allBuckets.filter(isReflectionEventBucket).forEach(function(bucket) {
+  dashboardBuckets().filter(isReflectionEventBucket).forEach(function(bucket) {
     var date = getBucketEventDate(bucket);
     if (!byDate[date]) byDate[date] = [];
     byDate[date].push(bucket);
@@ -4644,7 +4666,7 @@ function reflectionSourceChips(detail, reflectionDate) {
   sourceIds.forEach(function(id) {
     var textId = String(id || '');
     if (!textId) return;
-    var source = allBuckets.find(function(bucket) { return String(bucket.id) === textId; });
+    var source = dashboardBuckets().find(function(bucket) { return String(bucket.id) === textId; });
     if (source && !isReflectionSourceBucket(source, reflectionDate)) return;
     var label = source ? (source.name || source.id) : textId;
     filteredSources.push({ id: textId, label: label });
@@ -6000,13 +6022,14 @@ function renderWordMapBoundary(privateTerms, identity) {
 }
 
 function updateStats() {
-  const total = allBuckets.length;
-  const pinned = allBuckets.filter(b => b.pinned).length;
-  const anchors = allBuckets.filter(b => b.anchor).length;
-  const feels = allBuckets.filter(b => b.type === 'feel').length;
-  const resolved = allBuckets.filter(b => b.resolved).length;
-  const digested = allBuckets.filter(b => b.digested).length;
-  const archived = allBuckets.filter(b => b.type === 'archived').length;
+  const buckets = dashboardBuckets();
+  const total = buckets.length;
+  const pinned = buckets.filter(b => b.pinned).length;
+  const anchors = buckets.filter(b => b.anchor).length;
+  const feels = buckets.filter(b => b.type === 'feel').length;
+  const resolved = buckets.filter(b => b.resolved).length;
+  const digested = buckets.filter(b => b.digested).length;
+  const archived = buckets.filter(b => b.type === 'archived').length;
   document.getElementById('stats').textContent =
     total + ' 桶 · ' + pinned + ' 钉选 · ' + anchors + ' anchor · ' + feels + ' feel · ' + resolved + ' 已沉底 · ' + digested + ' 已消化 · ' + archived + ' 归档';
 }
@@ -6049,11 +6072,12 @@ function buildFilters() {
     filters.querySelectorAll('.filter-btn').forEach(function(b) { b.classList.remove('active'); });
     btn.classList.add('active');
     currentFilter = btn.dataset.filter;
-    renderBuckets(filterBuckets(allBuckets));
+    renderBuckets(filterBuckets(dashboardBuckets()));
   };
 }
 
 function filterBuckets(buckets) {
+  buckets = Array.isArray(buckets) ? buckets : [];
   if (currentFilter === 'all') return buckets;
   if (currentFilter === 'pinned') return buckets.filter(function(b) { return b.pinned; });
   if (currentFilter === 'anchor') return buckets.filter(function(b) { return b.anchor; });
@@ -6106,7 +6130,7 @@ function bucketWeightScore(bucket) {
 }
 
 function sortBucketsForDisplay(buckets) {
-  var sorted = (buckets || []).slice();
+  var sorted = Array.isArray(buckets) ? buckets.slice() : [];
   sorted.sort(function(a, b) {
     var left = bucketSortMode === 'weight' ? bucketWeightScore(a) : bucketCreatedTime(a);
     var right = bucketSortMode === 'weight' ? bucketWeightScore(b) : bucketCreatedTime(b);
@@ -6149,7 +6173,7 @@ function bucketBulkReasonText(reason) {
 
 function bucketById(id) {
   id = String(id || '');
-  return allBuckets.find(function(bucket) { return String(bucket.id || '') === id; });
+  return dashboardBuckets().find(function(bucket) { return String(bucket.id || '') === id; });
 }
 
 function setBucketBulkMessage(message, tone) {
@@ -6192,7 +6216,7 @@ function toggleBucketBulkMode() {
     selectedBucketIds.clear();
     setBucketBulkMessage('');
   }
-  renderBuckets(renderedBuckets.length ? renderedBuckets : filterBuckets(allBuckets));
+  renderBuckets(renderedBuckets.length ? renderedBuckets : filterBuckets(dashboardBuckets()));
 }
 
 function toggleBucketSelection(id) {
@@ -8783,9 +8807,13 @@ async function saveConfig(persist, persistEnv) {
   }
 }
 
-checkAuth().then(function(ok) {
-  if (ok) loadBuckets();
-});
+async function initializeDashboard() {
+  if (await checkAuth()) {
+    await loadBuckets();
+  }
+}
+
+void initializeDashboard();
 
 // --- Import functions ---
 const uploadZone = document.getElementById('import-upload-zone');
