@@ -48,12 +48,14 @@ import asyncio
 import hashlib
 import hmac
 import json as _json_lib
+import math
 import re
 import secrets
 import time
 from base64 import b64decode
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlparse
 from zoneinfo import ZoneInfo
 import httpx
@@ -2425,16 +2427,32 @@ def _metadata_text(value) -> str:
 
 
 def make_json_safe(obj):
-    """Convert API response values that JSONResponse cannot serialize."""
+    """Convert nested API response values into JSONResponse-safe primitives."""
     if isinstance(obj, (datetime, date)):
         return obj.isoformat()
+    if isinstance(obj, Path):
+        return str(obj)
+    if isinstance(obj, (bytes, bytearray)):
+        try:
+            return bytes(obj).decode("utf-8")
+        except UnicodeDecodeError:
+            return f"<bytes:{len(obj)}>"
     if isinstance(obj, dict):
-        return {key: make_json_safe(value) for key, value in obj.items()}
-    if isinstance(obj, list):
+        safe = {}
+        for key, value in obj.items():
+            if isinstance(key, (str, int, float, bool)) or key is None:
+                safe_key = key
+            else:
+                safe_key = str(make_json_safe(key))
+            safe[safe_key] = make_json_safe(value)
+        return safe
+    if isinstance(obj, (list, tuple, set)):
         return [make_json_safe(value) for value in obj]
-    if isinstance(obj, tuple):
-        return [make_json_safe(value) for value in obj]
-    return obj
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if obj is None or isinstance(obj, (str, int, bool)):
+        return obj
+    return f"<unsupported:{type(obj).__name__}>"
 
 
 def json_safe_datetime(value):
@@ -10736,11 +10754,22 @@ async def api_moments(request):
 
     bucket_id = str(request.query_params.get("bucket_id", "") or "").strip()
     limit = _int_between(request.query_params.get("limit"), 20, 1, 200)
-    payload = await inspect_moments(bucket_id=bucket_id, limit=limit)
-    if payload.get("status") == "error":
-        status_code = 404 if payload.get("error") == "not_found" else 400
-        return JSONResponse(payload, status_code=status_code)
-    return JSONResponse(payload)
+    try:
+        payload = make_json_safe(await inspect_moments(bucket_id=bucket_id, limit=limit))
+        if payload.get("status") == "error":
+            status_code = 404 if payload.get("error") == "not_found" else 400
+            return JSONResponse(payload, status_code=status_code)
+        return JSONResponse(payload)
+    except Exception:
+        logger.exception("Moments inspection failed for bucket_id=%s", bucket_id)
+        return JSONResponse(
+            {
+                "status": "error",
+                "error": "moments_inspection_failed",
+                "detail": "Moment inspection failed; check server logs for details.",
+            },
+            status_code=500,
+        )
 
 
 @mcp.custom_route("/api/todos", methods=["GET"])

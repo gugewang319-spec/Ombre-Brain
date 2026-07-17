@@ -6524,7 +6524,19 @@ async function loadBucketMoments(bucketId) {
   try {
     var res = await authFetch(BASE + '/api/moments?bucket_id=' + encodeURIComponent(bucketId) + '&limit=40');
     if (!res) return;
-    var data = await res.json();
+    if (!res.ok) {
+      throw new Error(await momentResponseError(res));
+    }
+    var raw = await res.text();
+    var data;
+    try {
+      data = JSON.parse(raw);
+    } catch (e) {
+      throw new Error('Moments 服务返回了非 JSON 响应');
+    }
+    if (!data || typeof data !== 'object') {
+      throw new Error('Moments 服务返回格式错误');
+    }
     if (!block || block.getAttribute('data-bucket-id') !== bucketId) return;
     block.innerHTML = renderBucketMoments(data);
   } catch (e) {
@@ -8810,6 +8822,17 @@ async function saveConfig(persist, persistEnv) {
 async function initializeDashboard() {
   if (await checkAuth()) {
     await loadBuckets();
+  }
+}
+
+async function momentResponseError(response) {
+  var raw = await response.text().catch(function() { return ''; });
+  if (!raw) return 'Moments 服务请求失败 (HTTP ' + response.status + ')';
+  try {
+    var data = JSON.parse(raw);
+    return data.detail || data.error || ('Moments 服务请求失败 (HTTP ' + response.status + ')');
+  } catch (e) {
+    return 'Moments 服务请求失败 (HTTP ' + response.status + ')';
   }
 }
 
