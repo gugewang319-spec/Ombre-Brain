@@ -5,6 +5,8 @@ import json
 from datetime import date, datetime
 from pathlib import Path
 
+from utils import make_json_safe
+
 
 SERVER_PATH = Path(__file__).with_name("server.py")
 
@@ -28,10 +30,7 @@ def _server_function(name, *, remove_imports=False):
 
 
 def _make_json_safe():
-    namespace = {"date": date, "datetime": datetime, "Path": Path, "math": __import__("math")}
-    helper = _server_function("make_json_safe")
-    exec(compile(ast.Module(body=[helper], type_ignores=[]), str(SERVER_PATH), "exec"), namespace)
-    return namespace["make_json_safe"]
+    return make_json_safe
 
 
 def test_make_json_safe_handles_nested_moments_payload_values():

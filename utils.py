@@ -14,12 +14,55 @@ import re
 import uuid
 import yaml
 import logging
+import math
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
+
+from starlette.responses import JSONResponse as StarletteJSONResponse
 
 
 LOCAL_TZ = ZoneInfo("Asia/Shanghai")
+
+
+def make_json_safe(value):
+    """Convert nested response data into UTF-8-safe JSON primitives."""
+    if isinstance(value, str):
+        return "".join(
+            "\ufffd" if 0xD800 <= ord(char) <= 0xDFFF else char
+            for char in value
+        )
+    if isinstance(value, (datetime, date)):
+        return make_json_safe(value.isoformat())
+    if isinstance(value, Path):
+        return make_json_safe(str(value))
+    if isinstance(value, (bytes, bytearray)):
+        try:
+            return make_json_safe(bytes(value).decode("utf-8"))
+        except UnicodeDecodeError:
+            return f"<bytes:{len(value)}>"
+    if isinstance(value, dict):
+        safe = {}
+        for key, item in value.items():
+            safe_key = make_json_safe(key)
+            if not isinstance(safe_key, (str, int, float, bool)) and safe_key is not None:
+                safe_key = make_json_safe(str(safe_key))
+            safe[safe_key] = make_json_safe(item)
+        return safe
+    if isinstance(value, (list, tuple, set)):
+        return [make_json_safe(item) for item in value]
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if value is None or isinstance(value, (int, bool)):
+        return value
+    return f"<unsupported:{type(value).__name__}>"
+
+
+class JsonSafeJSONResponse(StarletteJSONResponse):
+    """JSONResponse that sanitizes nested values before UTF-8 encoding."""
+
+    def render(self, content) -> bytes:
+        return super().render(make_json_safe(content))
 
 
 def _date_hint(year: int, month: int, day: int, label: str, tz=LOCAL_TZ) -> dict[str, str] | None:

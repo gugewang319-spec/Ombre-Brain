@@ -48,14 +48,12 @@ import asyncio
 import hashlib
 import hmac
 import json as _json_lib
-import math
 import re
 import secrets
 import time
 from base64 import b64decode
 from dataclasses import replace
-from datetime import date, datetime, timedelta, timezone
-from pathlib import Path
+from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlencode, urlparse
 from zoneinfo import ZoneInfo
 import httpx
@@ -133,12 +131,14 @@ from scripts.migrate_affect_anchor_sections import plan_bucket_migration
 from source_refs import source_ref_window
 from word_map import WordMapStore, reflection_identity_terms
 from utils import (
+    JsonSafeJSONResponse as JSONResponse,
     bucket_content_for_recall,
     bucket_text_for_embedding,
     count_tokens_approx,
     LOCAL_TZ,
     local_date_key,
     load_config,
+    make_json_safe,
     now_iso,
     parse_human_date_reference,
     setup_logging,
@@ -729,7 +729,6 @@ async def _oauth_form(request) -> dict[str, str]:
 
 
 def _oauth_error(message: str, status_code: int = 400):
-    from starlette.responses import JSONResponse
     return JSONResponse({"error": message}, status_code=status_code)
 
 
@@ -771,7 +770,6 @@ class OmbreChatGptOAuthMiddleware:
             await self.app(scope, receive, send)
             return
 
-        from starlette.responses import JSONResponse
         response = JSONResponse(
             {"error": "invalid_token"},
             status_code=401,
@@ -895,7 +893,6 @@ async def chatgpt_oauth_token(request):
     else:
         return _oauth_error("unsupported_grant_type")
 
-    from starlette.responses import JSONResponse
     return JSONResponse(_oauth_success_payload())
 
 
@@ -916,7 +913,6 @@ def _oauth_server_metadata(request) -> dict:
 @mcp.custom_route("/mcp/.well-known/oauth-authorization-server", methods=["GET"])
 @mcp.custom_route("/mcp/.well-known/openid-configuration", methods=["GET"])
 async def chatgpt_oauth_metadata(request):
-    from starlette.responses import JSONResponse
 
     if not OMBRE_CHATGPT_OAUTH.enabled:
         return _oauth_error("oauth_not_configured", 404)
@@ -926,7 +922,6 @@ async def chatgpt_oauth_metadata(request):
 @mcp.custom_route("/.well-known/oauth-protected-resource", methods=["GET"])
 @mcp.custom_route("/mcp/.well-known/oauth-protected-resource", methods=["GET"])
 async def chatgpt_oauth_resource_metadata(request):
-    from starlette.responses import JSONResponse
 
     if not OMBRE_CHATGPT_OAUTH.enabled:
         return _oauth_error("oauth_not_configured", 404)
@@ -966,7 +961,6 @@ def _dashboard_authenticated(request) -> bool:
 
 
 def _require_dashboard_auth(request):
-    from starlette.responses import JSONResponse
     if _dashboard_authenticated(request):
         return None
     return JSONResponse(
@@ -982,7 +976,6 @@ def _require_raw_api_auth(request):
 
 
 def _dashboard_login_response():
-    from starlette.responses import JSONResponse
     token = _create_dashboard_session()
     response = JSONResponse({"ok": True})
     response.set_cookie(
@@ -2426,46 +2419,6 @@ def _metadata_text(value) -> str:
     return str(value)
 
 
-def make_json_safe(obj):
-    """Convert nested API response values into JSONResponse-safe primitives."""
-    if isinstance(obj, str):
-        return "".join(
-            "\ufffd" if 0xD800 <= ord(char) <= 0xDFFF else char
-            for char in obj
-        )
-    if isinstance(obj, (datetime, date)):
-        return obj.isoformat()
-    if isinstance(obj, Path):
-        return make_json_safe(str(obj))
-    if isinstance(obj, (bytes, bytearray)):
-        try:
-            return make_json_safe(bytes(obj).decode("utf-8"))
-        except UnicodeDecodeError:
-            return f"<bytes:{len(obj)}>"
-    if isinstance(obj, dict):
-        safe = {}
-        for key, value in obj.items():
-            safe_key = make_json_safe(key)
-            if not isinstance(safe_key, (str, int, float, bool)) and safe_key is not None:
-                safe_key = make_json_safe(str(safe_key))
-            safe[safe_key] = make_json_safe(value)
-        return safe
-    if isinstance(obj, (list, tuple, set)):
-        return [make_json_safe(value) for value in obj]
-    if isinstance(obj, float):
-        return obj if math.isfinite(obj) else None
-    if obj is None or isinstance(obj, (str, int, bool)):
-        return obj
-    return f"<unsupported:{type(obj).__name__}>"
-
-
-def json_safe_datetime(value):
-    """Serialize date-like API fields while preserving empty values."""
-    if isinstance(value, (datetime, date)):
-        return value.isoformat()
-    return value
-
-
 def _bucket_light_payload(bucket: dict) -> dict:
     meta = bucket.get("metadata", {}) if isinstance(bucket, dict) else {}
     metadata_view = normalize_memory_metadata(bucket)
@@ -3156,7 +3109,6 @@ async def root_redirect(request):
 
 @mcp.custom_route("/auth/status", methods=["GET"])
 async def auth_status(request):
-    from starlette.responses import JSONResponse
     return JSONResponse(
         {
             "authenticated": _dashboard_authenticated(request),
@@ -3171,7 +3123,6 @@ async def auth_status(request):
 
 @mcp.custom_route("/auth/setup", methods=["POST"])
 async def auth_setup(request):
-    from starlette.responses import JSONResponse
     if not _dashboard_setup_needed():
         return JSONResponse({"error": "already configured"}, status_code=400)
     try:
@@ -3187,7 +3138,6 @@ async def auth_setup(request):
 
 @mcp.custom_route("/auth/login", methods=["POST"])
 async def auth_login(request):
-    from starlette.responses import JSONResponse
     try:
         body = await request.json()
     except Exception:
@@ -3200,7 +3150,6 @@ async def auth_login(request):
 
 @mcp.custom_route("/auth/logout", methods=["POST"])
 async def auth_logout(request):
-    from starlette.responses import JSONResponse
     token = request.cookies.get("ombre_session")
     if token:
         _dashboard_sessions.pop(token, None)
@@ -3211,7 +3160,6 @@ async def auth_logout(request):
 
 @mcp.custom_route("/health", methods=["GET"])
 async def health_check(request):
-    from starlette.responses import JSONResponse
     try:
         stats = await bucket_mgr.get_stats()
         return JSONResponse({
@@ -6887,8 +6835,8 @@ def _inspect_moment_payload(
         "layer_debug": moment_layer_debug(moment),
         "runtime_gate": moment_runtime_gate_debug(moment),
         "metadata": moment.get("metadata", {}),
-        "created_at": json_safe_datetime(moment.get("created_at")),
-        "updated_at": json_safe_datetime(moment.get("updated_at")),
+        "created_at": make_json_safe(moment.get("created_at")),
+        "updated_at": make_json_safe(moment.get("updated_at")),
     }
     if include_text:
         payload["text"] = text
@@ -8174,7 +8122,6 @@ async def delete_bucket_comment(bucket_id: str, comment_id: str) -> dict:
 @mcp.custom_route("/api/bucket/{bucket_id}/comments", methods=["POST"])
 async def api_bucket_comment(request):
     """Add a dashboard-authenticated user comment to a bucket."""
-    from starlette.responses import JSONResponse
 
     err = _require_dashboard_auth(request)
     if err:
@@ -8228,7 +8175,6 @@ async def api_bucket_comment(request):
 @mcp.custom_route("/api/bucket/{bucket_id}/comments/{comment_id}", methods=["DELETE"])
 async def api_bucket_comment_delete(request):
     """Delete a dashboard-authenticated user comment from a bucket."""
-    from starlette.responses import JSONResponse
 
     err = _require_dashboard_auth(request)
     if err:
@@ -9499,7 +9445,6 @@ async def portrait_state() -> dict:
 @mcp.custom_route("/api/memories", methods=["POST"])
 async def api_create_memory(request):
     """Create or update one memory bucket from a trusted C-side client."""
-    from starlette.responses import JSONResponse
 
     if not _memory_write_token():
         return JSONResponse({"error": "memory write token is not configured"}, status_code=503)
@@ -9629,7 +9574,6 @@ async def api_create_memory(request):
 @mcp.custom_route("/api/buckets", methods=["GET"])
 async def api_buckets(request):
     """List all buckets with metadata (no content for efficiency)."""
-    from starlette.responses import JSONResponse
     err = _require_dashboard_auth(request)
     if err:
         return err
@@ -9682,7 +9626,6 @@ async def api_buckets(request):
 @mcp.custom_route("/api/buckets/light", methods=["GET"])
 async def api_buckets_light(request):
     """List lightweight bucket metadata without content previews."""
-    from starlette.responses import JSONResponse
     err = _require_dashboard_auth(request)
     if err:
         return err
@@ -9708,7 +9651,6 @@ async def api_buckets_light(request):
 @mcp.custom_route("/api/domain-taxonomy", methods=["GET"])
 async def api_domain_taxonomy(request):
     """Return canonical domain keys and display labels for dashboard controls."""
-    from starlette.responses import JSONResponse
     err = _require_dashboard_auth(request)
     if err:
         return err
@@ -9718,7 +9660,6 @@ async def api_domain_taxonomy(request):
 @mcp.custom_route("/api/portrait-state", methods=["GET"])
 async def api_portrait_state(request):
     """Read maintained portrait state for dashboard inspection."""
-    from starlette.responses import JSONResponse
     err = _require_dashboard_auth(request)
     if err:
         return err
@@ -9731,7 +9672,6 @@ async def api_portrait_state(request):
 @mcp.custom_route("/api/portrait-maintain", methods=["POST"])
 async def api_portrait_maintain(request):
     """Run portrait maintainer manually from dashboard."""
-    from starlette.responses import JSONResponse
     err = _require_dashboard_auth(request)
     if err:
         return err
@@ -9767,7 +9707,6 @@ async def api_portrait_maintain(request):
 @mcp.custom_route("/api/portrait-state/items", methods=["DELETE"])
 async def api_portrait_state_item_delete(request):
     """Delete one portrait state row or clear one maintained portrait paragraph."""
-    from starlette.responses import JSONResponse
     err = _require_dashboard_auth(request)
     if err:
         return err
@@ -9805,7 +9744,6 @@ async def api_portrait_state_item_delete(request):
 @mcp.custom_route("/api/portrait-state/items", methods=["POST"])
 async def api_portrait_state_item_add(request):
     """Add one manual Current Focus item."""
-    from starlette.responses import JSONResponse
 
     err = _require_dashboard_auth(request)
     if err:
@@ -9828,7 +9766,6 @@ async def api_portrait_state_item_add(request):
 @mcp.custom_route("/api/portrait-state/items", methods=["PUT"])
 async def api_portrait_state_item_edit(request):
     """Edit one Current Focus or portrait generation-evidence row."""
-    from starlette.responses import JSONResponse
 
     err = _require_dashboard_auth(request)
     if err:
@@ -9856,7 +9793,6 @@ async def api_portrait_state_item_edit(request):
 
 
 def _portrait_mutation_response(result: dict):
-    from starlette.responses import JSONResponse
 
     status = str(result.get("status") or "")
     if status in {"updated", "unchanged"}:
@@ -9881,7 +9817,6 @@ def _portrait_expected_revision(body: dict) -> int | None:
 @mcp.custom_route("/api/portrait-state/stable", methods=["PUT"])
 async def api_portrait_stable_edit(request):
     """Manually replace one stable portrait paragraph with optimistic locking."""
-    from starlette.responses import JSONResponse
 
     err = _require_dashboard_auth(request)
     if err:
@@ -9908,7 +9843,6 @@ async def api_portrait_stable_edit(request):
 @mcp.custom_route("/api/portrait-state/stable/lock", methods=["POST"])
 async def api_portrait_stable_lock(request):
     """Lock or unlock one stable portrait paragraph."""
-    from starlette.responses import JSONResponse
 
     err = _require_dashboard_auth(request)
     if err:
@@ -9933,7 +9867,6 @@ async def api_portrait_stable_lock(request):
 @mcp.custom_route("/api/portrait-state/stable/rollback", methods=["POST"])
 async def api_portrait_stable_rollback(request):
     """Restore one stable portrait history revision without discarding newer history."""
-    from starlette.responses import JSONResponse
 
     err = _require_dashboard_auth(request)
     if err:
@@ -9965,7 +9898,6 @@ async def api_portrait_stable_rollback(request):
 @mcp.custom_route("/api/portrait-state/reset", methods=["POST"])
 async def api_portrait_state_reset(request):
     """Reset maintained portrait state so the next manual generation is an initial run."""
-    from starlette.responses import JSONResponse
     err = _require_dashboard_auth(request)
     if err:
         return err
@@ -9987,7 +9919,6 @@ async def api_portrait_state_reset(request):
 @mcp.custom_route("/api/profile-facts", methods=["GET"])
 async def api_profile_facts(request):
     """List evidence-bound profile facts for dashboard review."""
-    from starlette.responses import JSONResponse
     err = _require_dashboard_auth(request)
     if err:
         return err
@@ -10013,7 +9944,6 @@ async def api_profile_facts(request):
 @mcp.custom_route("/api/profile-facts/{bucket_id}", methods=["PATCH"])
 async def api_profile_fact_update(request):
     """Confirm, edit, or deprecate a profile fact bucket."""
-    from starlette.responses import JSONResponse
     err = _require_dashboard_auth(request)
     if err:
         return err
@@ -10108,7 +10038,6 @@ async def api_profile_fact_update(request):
 @mcp.custom_route("/api/profile-facts/{bucket_id}", methods=["DELETE"])
 async def api_profile_fact_delete(request):
     """Hard-delete one profile fact bucket and clean its indexes."""
-    from starlette.responses import JSONResponse
     err = _require_dashboard_auth(request)
     if err:
         return err
@@ -10145,7 +10074,6 @@ async def api_profile_fact_delete(request):
 @mcp.custom_route("/api/profile-fact-proposals", methods=["POST"])
 async def api_profile_fact_proposals(request):
     """Generate evidence-bound profile fact proposals from one bucket."""
-    from starlette.responses import JSONResponse
     err = _require_dashboard_auth(request)
     if err:
         return err
@@ -10208,7 +10136,6 @@ async def api_profile_fact_proposals(request):
 @mcp.custom_route("/api/profile-fact-proposals/confirm", methods=["POST"])
 async def api_profile_fact_proposal_confirm(request):
     """Confirm one proposal by writing through the existing profile_fact path."""
-    from starlette.responses import JSONResponse
     err = _require_dashboard_auth(request)
     if err:
         return err
@@ -10267,7 +10194,6 @@ async def api_profile_fact_proposal_confirm(request):
 @mcp.custom_route("/api/anchor-proposals", methods=["POST"])
 async def api_anchor_proposals(request):
     """Generate one manual-confirm anchor proposal for an existing bucket."""
-    from starlette.responses import JSONResponse
     err = _require_dashboard_auth(request)
     if err:
         return err
@@ -10335,7 +10261,6 @@ async def api_anchor_proposals(request):
 @mcp.custom_route("/api/anchor-proposals/confirm", methods=["POST"])
 async def api_anchor_proposal_confirm(request):
     """Confirm one anchor proposal by applying the existing trace(anchor=1) path."""
-    from starlette.responses import JSONResponse
     err = _require_dashboard_auth(request)
     if err:
         return err
@@ -10386,7 +10311,6 @@ async def api_anchor_proposal_confirm(request):
 @mcp.custom_route("/api/word-map", methods=["GET"])
 async def api_word_map(request):
     """Return generic Word Map Lite diagnostics for dashboard review."""
-    from starlette.responses import JSONResponse
     err = _require_dashboard_auth(request)
     if err:
         return err
@@ -10402,7 +10326,6 @@ async def api_word_map(request):
 @mcp.custom_route("/api/word-map/rebuild", methods=["POST"])
 async def api_word_map_rebuild(request):
     """Rebuild the generic Word Map Lite index from current buckets."""
-    from starlette.responses import JSONResponse
     err = _require_dashboard_auth(request)
     if err:
         return err
@@ -10434,7 +10357,6 @@ async def api_word_map_rebuild(request):
 @mcp.custom_route("/api/word-map/cards", methods=["GET"])
 async def api_word_map_cards(request):
     """Return bucket evidence rows for one Word Map term."""
-    from starlette.responses import JSONResponse
     err = _require_dashboard_auth(request)
     if err:
         return err
@@ -10455,7 +10377,6 @@ async def api_word_map_cards(request):
 @mcp.custom_route("/api/identity-semantics", methods=["GET"])
 async def api_identity_semantics(request):
     """Return private identity alias diagnostics for dashboard review."""
-    from starlette.responses import JSONResponse
     err = _require_dashboard_auth(request)
     if err:
         return err
@@ -10470,7 +10391,6 @@ async def api_identity_semantics(request):
 @mcp.custom_route("/api/identity-semantics/rebuild", methods=["POST"])
 async def api_identity_semantics_rebuild(request):
     """Rebuild private identity alias evidence from current buckets."""
-    from starlette.responses import JSONResponse
     err = _require_dashboard_auth(request)
     if err:
         return err
@@ -10503,7 +10423,6 @@ async def api_identity_semantics_rebuild(request):
 @mcp.custom_route("/api/buckets/delete", methods=["POST"])
 async def api_buckets_delete(request):
     """Bulk-delete dashboard buckets and clean their indexes."""
-    from starlette.responses import JSONResponse
     err = _require_dashboard_auth(request)
     if err:
         return err
@@ -10594,7 +10513,6 @@ def _merge_metadata_list(current, *, add: list[str] | None = None, remove: list[
 @mcp.custom_route("/api/buckets/bulk-update", methods=["POST"])
 async def api_buckets_bulk_update(request):
     """Bulk-edit dashboard bucket metadata and archive state."""
-    from starlette.responses import JSONResponse
     err = _require_dashboard_auth(request)
     if err:
         return err
@@ -10737,7 +10655,6 @@ async def api_buckets_bulk_update(request):
 @mcp.custom_route("/api/bucket/{bucket_id}", methods=["GET"])
 async def api_bucket_detail(request):
     """Get full bucket content by ID."""
-    from starlette.responses import JSONResponse
     err = _require_dashboard_auth(request)
     if err:
         return err
@@ -10751,7 +10668,6 @@ async def api_bucket_detail(request):
 @mcp.custom_route("/api/moments", methods=["GET"])
 async def api_moments(request):
     """Return dashboard diagnostics for indexed memory moments."""
-    from starlette.responses import JSONResponse
     err = _require_dashboard_auth(request)
     if err:
         return err
@@ -10779,7 +10695,6 @@ async def api_moments(request):
 @mcp.custom_route("/api/todos", methods=["GET"])
 async def api_todos(request):
     """Deprecated: derived followup/todo items are disabled."""
-    from starlette.responses import JSONResponse
     err = _require_dashboard_auth(request)
     if err:
         return err
@@ -10796,7 +10711,6 @@ async def api_todos(request):
 @mcp.custom_route("/api/todos/{todo_id}", methods=["PATCH"])
 async def api_todo_update(request):
     """Deprecated: derived followup/todo items are disabled."""
-    from starlette.responses import JSONResponse
     err = _require_dashboard_auth(request)
     if err:
         return err
@@ -10809,7 +10723,6 @@ async def api_todo_update(request):
 @mcp.custom_route("/api/todos/{todo_id}/writeback", methods=["POST"])
 async def api_todo_writeback(request):
     """Deprecated: todo writeback is disabled."""
-    from starlette.responses import JSONResponse
     err = _require_dashboard_auth(request)
     if err:
         return err
@@ -10822,7 +10735,6 @@ async def api_todo_writeback(request):
 @mcp.custom_route("/api/reminders", methods=["GET"])
 async def api_reminders(request):
     """List standalone care memos."""
-    from starlette.responses import JSONResponse
     err = _require_dashboard_auth(request)
     if err:
         return err
@@ -10840,7 +10752,6 @@ async def api_reminders(request):
 @mcp.custom_route("/api/reminders", methods=["POST"])
 async def api_reminder_create(request):
     """Create a standalone care memo without touching memory buckets."""
-    from starlette.responses import JSONResponse
     err = _require_dashboard_auth(request)
     if err:
         return err
@@ -10878,7 +10789,6 @@ async def api_reminder_create(request):
 @mcp.custom_route("/api/reminders/{reminder_id}", methods=["PATCH"])
 async def api_reminder_update(request):
     """Update one standalone reminder. Snooze keeps it active and moves next_due_at."""
-    from starlette.responses import JSONResponse
     err = _require_dashboard_auth(request)
     if err:
         return err
@@ -10944,7 +10854,6 @@ async def api_reminder_update(request):
 @mcp.custom_route("/api/bucket/{bucket_id}", methods=["PATCH"])
 async def api_bucket_update(request):
     """Update dashboard-editable bucket body fields."""
-    from starlette.responses import JSONResponse
 
     err = _require_dashboard_auth(request)
     if err:
@@ -11016,7 +10925,6 @@ async def api_bucket_update(request):
 @mcp.custom_route("/api/darkroom/status", methods=["GET"])
 async def api_darkroom_status(request):
     """Return public darkroom door status. Never returns private notes."""
-    from starlette.responses import JSONResponse
     err = _require_dashboard_auth(request)
     if err:
         return err
@@ -11026,7 +10934,6 @@ async def api_darkroom_status(request):
 @mcp.custom_route("/api/search", methods=["GET"])
 async def api_search(request):
     """Search buckets by query."""
-    from starlette.responses import JSONResponse
     err = _require_dashboard_auth(request)
     if err:
         return err
@@ -11094,7 +11001,6 @@ def _raw_ingest_events_from_body(
 @mcp.custom_route("/api/ingest-raw", methods=["POST"])
 async def api_ingest_raw(request):
     """Ingest user/assistant raw dialogue events. Does not accept tools, system prompts, or memory injections."""
-    from starlette.responses import JSONResponse
     err = _require_raw_api_auth(request)
     if err:
         return err
@@ -11125,7 +11031,6 @@ async def api_ingest_raw(request):
 @mcp.custom_route("/api/search-raw", methods=["GET", "POST"])
 async def api_search_raw(request):
     """Search raw dialogue events as a fallback archive. Returns only stored user/assistant originals."""
-    from starlette.responses import JSONResponse
     err = _require_raw_api_auth(request)
     if err:
         return err
@@ -11163,7 +11068,6 @@ async def api_search_raw(request):
 @mcp.custom_route("/api/network", methods=["GET"])
 async def api_network(request):
     """Get embedding similarity network for visualization."""
-    from starlette.responses import JSONResponse
     err = _require_dashboard_auth(request)
     if err:
         return err
@@ -11230,7 +11134,6 @@ async def api_network(request):
 @mcp.custom_route("/api/edges", methods=["GET"])
 async def api_edges(request):
     """List explicit memory edges."""
-    from starlette.responses import JSONResponse
     err = _require_dashboard_auth(request)
     if err:
         return err
@@ -11240,7 +11143,6 @@ async def api_edges(request):
 @mcp.custom_route("/api/breath-debug", methods=["GET"])
 async def api_breath_debug(request):
     """Debug endpoint: simulate breath scoring and return per-bucket breakdown."""
-    from starlette.responses import JSONResponse
     err = _require_dashboard_auth(request)
     if err:
         return err
@@ -11381,7 +11283,6 @@ async def api_breath_debug(request):
 @mcp.custom_route("/api/diffusion-debug", methods=["GET"])
 async def api_diffusion_debug(request):
     """Debug endpoint: inspect bucket-level diffusion paths for a query."""
-    from starlette.responses import JSONResponse
     err = _require_dashboard_auth(request)
     if err:
         return err
@@ -11409,7 +11310,6 @@ async def api_diffusion_debug(request):
 @mcp.custom_route("/api/recall-debug", methods=["GET"])
 async def api_recall_debug(request):
     """Debug endpoint: inspect query-to-moment recall candidates."""
-    from starlette.responses import JSONResponse
     err = _require_dashboard_auth(request)
     if err:
         return err
@@ -11436,7 +11336,6 @@ async def api_recall_debug(request):
 @mcp.custom_route("/api/gateway-injections", methods=["GET"])
 async def api_gateway_injections(request):
     """Dashboard-authenticated proxy for recent Gateway injection debug records."""
-    from starlette.responses import JSONResponse
     err = _require_dashboard_auth(request)
     if err:
         return err
@@ -11460,7 +11359,6 @@ async def api_gateway_injections(request):
 @mcp.custom_route("/api/reflection/run", methods=["POST"])
 async def api_reflection_run(request):
     """Run daily reflection from dashboard or trusted local callers; weekly obeys reflection.weekly_enabled."""
-    from starlette.responses import JSONResponse
     err = _require_dashboard_auth(request)
     if err:
         return err
@@ -11488,7 +11386,6 @@ async def api_reflection_run(request):
 @mcp.custom_route("/api/daily-chat-memory/run", methods=["POST"])
 async def api_daily_chat_memory_run(request):
     """Run daily Gateway chat memory extraction; review mode writes pending candidates only."""
-    from starlette.responses import JSONResponse
     err = _require_dashboard_auth(request)
     if err:
         return err
@@ -11587,7 +11484,6 @@ async def _daily_impression_material_for_date(date_key: str, bucket_mgr_arg=None
 @mcp.custom_route("/api/daily-activity-summary/run", methods=["POST"])
 async def api_daily_activity_summary_run(request):
     """Summarize what happened that day into portrait recent_timeline."""
-    from starlette.responses import JSONResponse
     err = _require_dashboard_auth(request)
     if err:
         return err
@@ -11617,7 +11513,6 @@ async def api_daily_activity_summary_run(request):
 @mcp.custom_route("/api/daily-chat-memory/pending", methods=["GET"])
 async def api_daily_chat_memory_pending(request):
     """List pending daily chat memory candidates."""
-    from starlette.responses import JSONResponse
     err = _require_dashboard_auth(request)
     if err:
         return err
@@ -11632,7 +11527,6 @@ async def api_daily_chat_memory_pending(request):
 @mcp.custom_route("/api/daily-chat-memory/confirm", methods=["POST"])
 async def api_daily_chat_memory_confirm(request):
     """Confirm or reject pending daily chat memory candidates."""
-    from starlette.responses import JSONResponse
     err = _require_dashboard_auth(request)
     if err:
         return err
@@ -11687,7 +11581,6 @@ async def dashboard_assets(request):
 @mcp.custom_route("/api/persona", methods=["GET"])
 async def api_persona_get(request):
     """Return Persona State Engine data for the local dashboard."""
-    from starlette.responses import JSONResponse
     err = _require_dashboard_auth(request)
     if err:
         return err
@@ -11717,7 +11610,6 @@ async def api_persona_get(request):
 @mcp.custom_route("/api/dreams", methods=["GET"])
 async def api_dreams(request):
     """Return dream dashboard metadata only. Dream bodies are never exposed here."""
-    from starlette.responses import JSONResponse
     err = _require_dashboard_auth(request)
     if err:
         return err
@@ -11734,7 +11626,6 @@ async def api_dreams(request):
 @mcp.custom_route("/api/dreams/{dream_id}", methods=["GET"])
 async def api_dream_detail(request):
     """Return one retained dream body for an authenticated dashboard reader."""
-    from starlette.responses import JSONResponse
     err = _require_dashboard_auth(request)
     if err:
         return err
@@ -11747,7 +11638,6 @@ async def api_dream_detail(request):
 @mcp.custom_route("/api/config", methods=["GET"])
 async def api_config_get(request):
     """Get current runtime config (safe fields only, API key masked)."""
-    from starlette.responses import JSONResponse
     err = _require_dashboard_auth(request)
     if err:
         return err
@@ -12065,7 +11955,6 @@ async def api_config_get(request):
 @mcp.custom_route("/api/config", methods=["POST"])
 async def api_config_update(request):
     """Hot-update runtime config. Optionally persist to config.yaml."""
-    from starlette.responses import JSONResponse
     import yaml
     global dream_engine, persona_engine, portrait_engine, reflection_engine, reranker_engine
     err = _require_dashboard_auth(request)
@@ -13178,7 +13067,6 @@ async def api_config_update(request):
 @mcp.custom_route("/api/status", methods=["GET"])
 async def api_status(request):
     """Return dashboard-visible system status."""
-    from starlette.responses import JSONResponse
     err = _require_dashboard_auth(request)
     if err:
         return err
@@ -13212,7 +13100,6 @@ async def api_status(request):
 @mcp.custom_route("/api/import/upload", methods=["POST"])
 async def api_import_upload(request):
     """Upload a conversation file and start import."""
-    from starlette.responses import JSONResponse
     err = _require_dashboard_auth(request)
     if err:
         return err
@@ -13283,7 +13170,6 @@ async def api_import_upload(request):
 @mcp.custom_route("/api/import/status", methods=["GET"])
 async def api_import_status(request):
     """Get current import progress."""
-    from starlette.responses import JSONResponse
     err = _require_dashboard_auth(request)
     if err:
         return err
@@ -13293,7 +13179,6 @@ async def api_import_status(request):
 @mcp.custom_route("/api/import/pause", methods=["POST"])
 async def api_import_pause(request):
     """Pause the running import."""
-    from starlette.responses import JSONResponse
     err = _require_dashboard_auth(request)
     if err:
         return err
@@ -13306,7 +13191,6 @@ async def api_import_pause(request):
 @mcp.custom_route("/api/import/patterns", methods=["GET"])
 async def api_import_patterns(request):
     """Detect high-frequency patterns after import."""
-    from starlette.responses import JSONResponse
     err = _require_dashboard_auth(request)
     if err:
         return err
@@ -13320,7 +13204,6 @@ async def api_import_patterns(request):
 @mcp.custom_route("/api/import/results", methods=["GET"])
 async def api_import_results(request):
     """List recently imported/created buckets for review."""
-    from starlette.responses import JSONResponse
     err = _require_dashboard_auth(request)
     if err:
         return err
@@ -13349,7 +13232,6 @@ async def api_import_results(request):
 @mcp.custom_route("/api/import/review", methods=["POST"])
 async def api_import_review(request):
     """Apply review decisions: mark buckets as important/noise/pinned."""
-    from starlette.responses import JSONResponse
     err = _require_dashboard_auth(request)
     if err:
         return err

@@ -19,7 +19,7 @@ import uvicorn
 from starlette.applications import Starlette
 from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response, StreamingResponse
+from starlette.responses import Response, StreamingResponse
 from starlette.routing import Route
 
 from bucket_manager import BucketManager
@@ -103,6 +103,7 @@ from reranker_engine import RerankerEngine
 from self_anchor import is_self_anchor_bucket, is_self_anchor_metadata
 from source_refs import source_ref_window
 from utils import (
+    JsonSafeJSONResponse as JSONResponse,
     count_tokens_approx,
     bucket_content_for_recall,
     bucket_text_for_embedding,
