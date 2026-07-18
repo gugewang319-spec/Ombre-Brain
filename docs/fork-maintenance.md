@@ -1,17 +1,38 @@
 # Fork 长期维护基线
 
-本文记录 Ombre-Brain 生产 fork 相对官方仓库的长期维护差异。同步 upstream 时，应以本文列出的能力边界和回归测试为准，而不是机械保留某段历史代码。
+本文记录 Ombre-Brain 生产 fork 相对官方仓库的长期维护差异。同步 upstream 时，应以本文列出的能力边界、生产契约和回归测试为准，而不是机械保留某段历史代码。
 
-## 基线
+## 当前基线
 
 - 生产仓库：`gugewang319-spec/Ombre-Brain`
-- 生产分支：`zeabur`
-- 当前生产 SHA：`a7a8df642c752529de5ce64dca0faf9884a17b36`
+- 生产部署分支：`zeabur`
+- `origin/zeabur`：`83a85b8ba798fd36c63f13f1ad49e8076e811c2b`
 - 官方远端：`Yinglianchun/Ombre-Brain`
-- upstream 基线：`bbd6500de639f64fef6d63b705d2509d937b0a16`
-- 当前生产与 upstream 的 merge-base：`bbd6500de639f64fef6d63b705d2509d937b0a16`
+- `upstream/main`：`bbd6500de639f64fef6d63b705d2509d937b0a16`
+- merge-base：`bbd6500de639f64fef6d63b705d2509d937b0a16`
+- `origin/zeabur` 相对 `upstream/main`：ahead 16、behind 0
+- 当前净差异文件：30
+- 运行时代码及配置净差异：约 `+508/-250`
+- 当前 fork 健康等级：**B（健康，但核心补丁分散度偏高）**
 
-更新本文基线时，必须同时更新生产 SHA、upstream SHA、提交清单和净差异文件清单。
+更新本基线时，必须同时更新生产 SHA、upstream SHA、merge-base、ahead/behind、独有提交清单和净差异文件清单。
+
+## 健康度判断
+
+当前 `upstream/main` 是 `origin/zeabur` 的祖先，fork 没有落后于 upstream。16 个 ahead 提交是 Git 拓扑数量，不代表存在 16 套互不相关的长期补丁：其中一个是 upstream 同步 merge 节点，多个早期局部序列化修复已经被后续统一安全层吸收。
+
+当前实际需要维护的能力约 7–8 类：
+
+1. Zeabur 单容器部署与 `/data` 持久化。
+2. Dashboard 同源鉴权、Cookie 和 API 容错。
+3. 身份配置环境变量覆盖。
+4. API JSON/Unicode 安全响应。
+5. LLM、Embedding、Rerank 出站 payload Unicode sanitizer。
+6. DeepSeek V4 后台结构化任务兼容。
+7. Bucket 历史时间字段的数据兼容与稳定排序。
+8. 对应的回归测试和 fork/upstream 维护流程。
+
+补丁数量尚未失控，主要风险来自实现分散在 `gateway.py`、`server.py`、`dashboard.html`、`reflection_engine.py` 等 upstream 活跃核心文件中。
 
 ## 当前生产依赖
 
@@ -20,138 +41,207 @@
 - `OMBRE_CONFIG_PATH=/data/state/config.yaml`
 - Zeabur 自动部署分支为 `zeabur`
 - `/data` 是持久化 Volume，至少承载 buckets 和 state
-- Brain、Gateway 与 Nginx 由 Zeabur 单容器入口共同运行
+- Brain、Gateway 与 Nginx 在 Zeabur 单容器入口中共同运行
+- Brain 使用 8000，Gateway 使用 8010，Nginx 监听 Zeabur 提供的 `PORT`
+- `/v1/` 转发到 Gateway，Dashboard、Auth 和 `/api/` 转发到 Brain
 - DeepSeek V4 后台结构化任务兼容
-- API 响应与模型出站 payload 的 Unicode sanitizer
+- API 响应和模型出站 payload 的 Unicode sanitizer
 
-不得在普通 upstream 同步中静默改变这些约定。任何调整都必须单独审查、测试并准备回滚方案。
-
-## 维护原则
-
-> 保留能力和测试，不执着保留具体实现。
-
-如果 upstream 提供语义等价、测试充分且更通用的实现，应优先回归官方实现，并保留或调整本 fork 的回归测试。不要为了保留历史 diff 而并行维护重复逻辑。
+普通 upstream 同步不得静默改变这些约定。任何调整都必须单独审查、测试并准备回滚方案。
 
 ## Fork 独有提交
 
-当前 `upstream/main..zeabur` 包含 11 个提交：
+当前 `upstream/main..origin/zeabur` 包含 16 个提交：
 
-| 提交 | 目的 | 长期维护判断 |
-| --- | --- | --- |
-| `5b60759c231618a542682747d18bda862061b4ef` | 增加 Zeabur 单容器部署，组合 Brain、Gateway 与 Nginx | 生产部署能力，长期保留 |
-| `04939a26b17d78a7201c91b9e80aefa3581e9c80` | 修复反代环境 Dashboard Cookie、鉴权和 bucket 加载 | 在 Zeabur 同源反代仍需要时保留 |
-| `2baf0d908cd6830098104528bc054d4b1370e793` | 修复 bucket API datetime 序列化 | 已由后续统一 JSON safe 能力吸收 |
-| `74eea3e33a5b8286487989f42f328da84a8b0d20` | 修复 moments datetime 序列化 | 已由后续统一 JSON safe 能力吸收 |
-| `bf8b79dafd88e7056c8960b9dbd546c28516d2fa` | 增强 moments API 序列化、错误响应和 Dashboard 报错 | 官方提供等价 API 契约前保留 |
-| `1751432583af31323210081e71821b5ed444d209` | 修复 moments API 非法 Unicode surrogate | 已由后续统一 sanitizer 吸收 |
-| `2ebe85bd820afd9333828fc688b0c9a5a366bb90` | 增加身份环境变量覆盖 | 生产配置能力，按运行依赖保留 |
-| `1acff8f5c20bbad374f6aac35821b7f07d29eaa9` | 增加全局 Unicode/类型安全 JSONResponse | 官方提供等价全局响应层前保留 |
-| `4d58c6c5960d1df7d2b185f486b13a0d6ce3a6b9` | 合并 upstream 至 `bbd6500` | 同步节点，不是独立产品能力 |
-| `e0520fce8c66ee14c748b7f475c1837bee15c6d2` | 修复 DeepSeek V4 Persona 和脱水结构化任务 | 当前模型组合必须保留 |
-| `a7a8df642c752529de5ce64dca0faf9884a17b36` | 统一模型、Embedding、Rerank 出站 payload Unicode sanitize | 官方提供统一安全出站层前保留 |
-
-早期的 bucket、moment 局部序列化提交虽然仍存在于历史中，但当前维护对象是后续形成的统一 JSON safe 和 Unicode sanitizer 能力。不应在同步时重新引入多套局部 helper。
-
-## 差异文件维护分类
-
-风险级别：
-
-- **高**：upstream 修改后必须逐块人工合并，禁止整文件选择一方。
-- **中**：改动范围较小，但相关功能被重构时可能产生语义冲突。
-- **低**：通常是新增部署文件或回归测试，文本冲突概率较低。
-
-| 文件 | 修改原因 | 分类 | 冲突风险 |
+| 提交 | 目的 | 分类 | 长期维护判断 |
 | --- | --- | --- | --- |
-| `Dockerfile.zeabur` | 构建 Python、Nginx、应用文件和持久化目录，提供单容器入口 | 部署适配 | 低文本风险；高运行风险 |
-| `zeabur/nginx.conf.template` | 将 `/v1/` 转发给 Gateway，将 Dashboard、Auth 和 API 保持在 Brain 同源 | 部署适配 | 低文本风险；高运行风险 |
-| `zeabur/start.sh` | 启动并监管 Brain、Gateway、Nginx，传播退出信号 | 部署适配 | 低文本风险；高运行风险 |
-| `config.example.yaml` | 记录 DeepSeek V4 auto thinking 语义和 Persona 800 token 默认值 | 配置/功能 | 高 |
-| `dashboard.html` | 同源鉴权、Cookie、bucket 容错、moments 错误显示、Persona thinking 配置 | 部署适配/功能增强 | 高 |
-| `scripts/one_click.sh` | 新安装配置使用 Persona `max_tokens=800` | 安装适配 | 高 |
-| `server.py` | 安全 JSONResponse、bucket/moment 序列化、Persona thinking 持久化和热更新、模型 payload sanitize | 核心功能/稳健性 | 高 |
-| `utils.py` | 身份环境变量、统一 JSON safe、Unicode sanitizer、模型 wrapper 和 Persona 默认值 | 核心基础设施 | 高 |
-| `gateway.py` | 安全 API 响应、普通聊天出站 sanitize、内部模型任务 wrapper、Persona thinking 热更新 | 核心功能 | 高 |
-| `persona_engine.py` | V4 thinking、JSON mode、800 tokens、finish_reason 分类和 Unicode-safe 调用 | 功能增强 | 高 |
-| `dehydrator.py` | V4 后台任务关闭 thinking、严格 JSON 任务 response_format 和 Unicode-safe 调用 | 功能增强 | 高 |
-| `dream_engine.py` | Dream JSON 和完整 ChatCompletion payload sanitize | 稳健性 | 中 |
-| `embedding_engine.py` | Embedding 输入统一 sanitize | 稳健性 | 中 |
-| `import_memory.py` | 导入提取任务的模型 payload sanitize | 稳健性 | 中 |
-| `portrait_engine.py` | Portrait JSON payload 和重试请求 sanitize | 稳健性 | 中 |
-| `reflection_engine.py` | 反思、日记、每日摘要等模型 payload sanitize | 稳健性 | 中 |
-| `reranker_engine.py` | HTTP rerank JSON payload sanitize | 稳健性 | 中 |
-| `reclassify_api.py` | 重分类模型请求使用统一安全 wrapper | 稳健性 | 中 |
-| `scripts/compare_dynamic_alpha_rrf.py` | 离线 Embedding 请求 sanitize | 工具稳健性 | 低 |
-| `scripts/local_memory_worker.py` | urllib JSON 请求在编码前 sanitize | 工具稳健性 | 低 |
-| `test_deepseek_v4_structured_tasks.py` | 覆盖 Persona/脱水 V4 参数、配置保存和错误分类 | 回归测试 | 低 |
-| `test_global_unicode_json_response.py` | 覆盖全局 API Unicode 安全响应 | 回归测试 | 低 |
-| `test_identity_environment_overrides.py` | 覆盖身份环境变量优先级 | 回归测试 | 低 |
-| `test_llm_unicode_sanitize.py` | 覆盖模型 payload、Path、dict key、Portrait 和幂等性 | 回归测试 | 低 |
-| `test_moments_api_serialization.py` | 覆盖 moments/bucket datetime、Path、surrogate 和错误响应 | 回归测试 | 低 |
+| `5b60759c231618a542682747d18bda862061b4ef` | 增加 Zeabur 单容器部署，组合 Brain、Gateway 与 Nginx | 部署差异 | 当前生产长期保留 |
+| `04939a26b17d78a7201c91b9e80aefa3581e9c80` | 修复同源反代环境中的 Dashboard 鉴权、Cookie 和 bucket 加载 | 部署差异、bug fix | Zeabur 架构仍使用同源反代时保留 |
+| `2baf0d908cd6830098104528bc054d4b1370e793` | 修复 bucket API datetime 序列化 | bug fix、数据兼容 | 已由后续统一 JSON safe 能力吸收 |
+| `74eea3e33a5b8286487989f42f328da84a8b0d20` | 修复 moments datetime 序列化 | bug fix、数据兼容 | 已由后续统一 JSON safe 能力吸收 |
+| `bf8b79dafd88e7056c8960b9dbd546c28516d2fa` | 增强 moments API 序列化、错误响应和 Dashboard 报错 | bug fix、数据兼容 | upstream 提供等价 API 契约前保留 |
+| `1751432583af31323210081e71821b5ed444d209` | 修复 moments API 非法 Unicode surrogate | bug fix、数据兼容 | 已由后续统一 sanitizer 吸收 |
+| `2ebe85bd820afd9333828fc688b0c9a5a366bb90` | 增加身份环境变量覆盖 | 部署差异、配置能力 | 生产仍依赖环境覆盖时保留 |
+| `1acff8f5c20bbad374f6aac35821b7f07d29eaa9` | 增加全局 Unicode/类型安全 JSONResponse | bug fix、数据兼容 | upstream 提供等价全局响应层前保留 |
+| `4d58c6c5960d1df7d2b185f486b13a0d6ce3a6b9` | 合并 upstream 至 `bbd6500` | upstream 同步 | 同步节点，不是独立产品补丁 |
+| `e0520fce8c66ee14c748b7f475c1837bee15c6d2` | 修复 DeepSeek V4 Persona 和脱水结构化任务 | 模型适配 | 当前模型组合必须保留；未来移入 Provider capability 层 |
+| `a7a8df642c752529de5ce64dca0faf9884a17b36` | 统一模型、Embedding、Rerank 出站 payload Unicode sanitize | bug fix、数据兼容 | upstream 提供统一安全出站层前保留 |
+| `e52310d6712d035e2361f6c81f28aa2932bbeff4` | 增加 fork 维护基线和 upstream 同步 SOP | 维护文档 | 长期保留并随生产更新 |
+| `193b84c37655e5e09035cc8c87de48a9b73a03fb` | 修复 Reflection backfill 的 bucket 时间混合类型排序 | bug fix、数据兼容 | 保留能力；未来采用公共时间归一化层 |
+| `90e3c12ae092410d167c2459acbd3b1318572670` | 修复 Import results 的 created 时间混合类型排序 | bug fix、数据兼容 | 保留能力；未来采用公共时间归一化层 |
+| `03e4b1460257d1bc94ee7071aee45d35d522c0f2` | 增加 Reflection DeepSeek V4 结构化 JSON 任务兼容 | 模型适配 | 保留能力；未来移入 Provider capability 层 |
+| `83a85b8ba798fd36c63f13f1ad49e8076e811c2b` | 恢复 dedicated daily 非 DeepSeek 模型的 thinking 控制并保持参数互斥 | bug fix、模型适配 | 保留能力；未来移入 Provider capability 层 |
 
-## 高风险文件
+早期 bucket、moment datetime 和 surrogate 提交虽然仍存在于生产历史中，但当前维护对象是后续形成的统一 JSON safe 和 Unicode sanitizer 能力。不得为了整理提交数量而 rebase 或重写生产历史。
 
-### `server.py`
+## 当前净差异文件
 
-该文件同时承载大量官方 API 路由、Dashboard 配置持久化和本 fork 的统一 JSONResponse。同步时重点检查：
+当前共有 30 个净差异文件。
 
-- `OMBRE_CONFIG_PATH` 是否仍被尊重，不能退回固定写入容器内 `/app/config.yaml`
-- 未知配置字段是否在持久化时得到保留
-- Persona `thinking_mode` 是否能加载、保存、热更新并立即生效
-- bucket、moments 和其他 API 是否仍使用全局安全响应层
-- 所有内部模型任务是否经过统一出站 sanitizer
+### 运行时代码与配置：17 个
+
+- `config.example.yaml`
+- `dashboard.html`
+- `dehydrator.py`
+- `dream_engine.py`
+- `embedding_engine.py`
+- `gateway.py`
+- `import_memory.py`
+- `persona_engine.py`
+- `portrait_engine.py`
+- `reclassify_api.py`
+- `reflection_engine.py`
+- `reranker_engine.py`
+- `scripts/compare_dynamic_alpha_rrf.py`
+- `scripts/local_memory_worker.py`
+- `scripts/one_click.sh`
+- `server.py`
+- `utils.py`
+
+这些文件合计净差异约为 `+508/-250`。
+
+### Zeabur 部署文件：3 个
+
+- `Dockerfile.zeabur`
+- `zeabur/nginx.conf.template`
+- `zeabur/start.sh`
+
+### Fork 回归测试：8 个
+
+- `test_deepseek_v4_structured_tasks.py`
+- `test_global_unicode_json_response.py`
+- `test_identity_environment_overrides.py`
+- `test_import_results_time_sort.py`
+- `test_llm_unicode_sanitize.py`
+- `test_moments_api_serialization.py`
+- `test_reflection_backfill_time_sort.py`
+- `test_reflection_structured_tasks.py`
+
+### 维护文档：2 个
+
+- `docs/fork-maintenance.md`
+- `docs/upstream-sync-sop.md`
+
+## 最近新增的数据兼容能力
+
+### Reflection bucket 时间排序
+
+Reflection memory enrichment backfill 会读取 bucket YAML frontmatter 的 `metadata.updated_at` 或 `metadata.created`。历史数据可能被 YAML 解析为 `datetime`，也可能仍是 ISO 8601 字符串。
+
+排序前必须统一归一化为可比较的 `datetime`：
+
+- 支持 `datetime`
+- 支持 ISO 8601 字符串
+- 支持带时区字符串
+- 空值和非法值使用稳定最小值并排在最后
+- 不得用 `str(value)` 代替时间解析
+- 不修改或重写现有 bucket 数据
+
+### Import results created 时间排序
+
+`/api/import/results` 对 bucket `metadata.created` 排序时遵循相同兼容规则。该修复只改变展示排序边界，不改变 import 写入流程、bucket schema 或生产数据。
+
+## DeepSeek V4 后台结构化任务契约
+
+以下规则只适用于明确要求结构化 JSON 的后台任务，不得影响普通聊天调用链。
+
+### Persona
+
+- 请求包含 `response_format={"type":"json_object"}`
+- `deepseek-v4-*` 未显式配置 `thinking_mode` 时，默认发送 `thinking.type=disabled`
+- 显式 `thinking_mode` 优先于自动默认
+- 默认 `max_tokens=800`，显式配置仍优先
+- 空 content、`finish_reason=length`、非法 JSON 和 API 异常分别记录
+
+### Dehydration
+
+- DeepSeek V4 后台任务未显式配置时默认 `thinking.type=disabled`
+- 只有现有协议要求严格 JSON 的任务才加入 `response_format=json_object`
+- 普通文本脱水、merge 和 moment 不得被强制 JSON mode
+
+### Reflection
+
+所有明确执行严格 JSON 解析的 Reflection 请求必须包含：
+
+```json
+{"response_format":{"type":"json_object"}}
+```
+
+DeepSeek V4 参数规则：
+
+- 显式 `reflection.thinking_mode` 优先
+- 未显式配置时默认 `thinking.type=disabled`
+- 非 DeepSeek 模型不得收到 DeepSeek `thinking` 参数
+
+Dedicated daily client 的互斥规则：
+
+- 实际模型为 `deepseek-v4-*`：只发送 `thinking`，不得发送 `enable_thinking`
+- 实际模型不是 DeepSeek V4 且使用 dedicated daily client：发送 `enable_thinking=False`，不得发送 `thinking`
+- 其他非 DeepSeek、非 dedicated daily client：两者都不自动发送
+- 任何请求不得同时包含 `thinking` 和 `enable_thinking`
+
+## 主要高风险文件
 
 ### `gateway.py`
 
-这是普通聊天、召回、Provider 转发和 Persona 更新的共同主路径。同步时重点检查：
+该文件承载普通聊天、Provider 转发、Recall、Persona 热更新和安全出站边界。同步时必须确认：
 
-- 普通聊天不得被强制加入结构化任务专用的 `response_format` 或 `thinking=disabled`
-- OpenAI 与 Anthropic 的流式/非流式请求仍经过 Unicode sanitize
-- 新增的内部 LLM、Embedding 或 Rerank 调用不得绕过统一出站层
-- Persona 配置热更新仍包含 `thinking_mode`
+- 普通聊天不得被后台结构化任务的 `response_format=json_object` 污染
+- 普通聊天不得被自动加入 `thinking=disabled`
+- OpenAI 和 Anthropic 的流式、非流式 payload 继续经过 Unicode sanitize
+- Persona 热更新继续传递 `thinking_mode`
 
-### `utils.py`
+upstream 对该文件修改频繁，属于最高冲突风险。
 
-该文件同时承载配置加载、环境变量覆盖、响应序列化和模型请求 wrapper。同步时重点检查：
+### `server.py`
 
-- `make_json_safe` 和 `sanitize_unicode` 不应出现重复或语义分叉
-- sanitizer 保持幂等，正常 Unicode 和 JSON 原生结构不变
-- 非法 surrogate 使用 replacement，不使用 `ignore`
-- 环境变量覆盖优先级不被 upstream 配置重构破坏
+该文件承载大量 API 路由、Dashboard 配置持久化、全局安全 JSONResponse、后台 scheduler 和本 fork 的时间兼容边界。同步时必须确认：
+
+- `OMBRE_CONFIG_PATH` 继续指向外部持久配置，不得退回固定写入 `/app/config.yaml`
+- 未知配置字段在持久化时得到保留
+- Persona 和 Reflection 的 `thinking_mode` 可加载、保存、热更新并立即生效
+- Bucket、Moments 和其他 API 继续使用统一安全响应层
+- Reflection backfill 与 Import results 的时间排序保持混合类型安全
+
+upstream 对该文件修改频繁，禁止整文件选择 ours 或 theirs。
 
 ### `dashboard.html`
 
 这是大型单文件界面，文本冲突和隐性运行回归风险都高。同步后必须实际验证：
 
 - Dashboard、Auth 和 API 使用同一 public origin
-- Cookie 能随请求发送
-- bucket API 非数组或错误响应不会导致整页崩溃
-- moments 错误信息可见
-- Persona thinking 的加载、留空/自动、保存链路完整
+- Cookie 随请求发送
+- bucket/moments 错误响应不会导致整页崩溃
+- Persona 和 Reflection thinking 配置能够加载、留空、保存
 
-### `persona_engine.py`
+### `reflection_engine.py`
 
-必须保留：
+该文件同时承载 Reflection、每日聊天记忆、活动摘要、日记候选和 dedicated daily client。同步时必须确认：
 
-- 显式 `thinking_mode` 优先
-- `deepseek-v4-*` 未显式配置时后台任务默认 `disabled`
-- `response_format={"type":"json_object"}`
-- 默认 `max_tokens=800`，显式配置优先
-- 空 content、`finish_reason=length`、非法 JSON、API 异常分别记录
-- 完整 payload 在模型 SDK 序列化前经过 sanitize
+- 严格 JSON 任务继续使用 JSON mode
+- DeepSeek V4 自动默认和显式配置优先级不变
+- `thinking` 与 `enable_thinking` 始终互斥
+- 普通文本任务没有被错误强制 JSON
+- Bucket 时间排序保持 `datetime`/字符串兼容
+- 错误日志不泄露完整对话、memory 或 API Key
 
-### `dehydrator.py`
+### `config.example.yaml`
 
-必须保留：
+upstream 经常修改该文件。同步时必须逐字段合并，确认：
 
-- DeepSeek V4 后台任务默认 `thinking=disabled`
-- 显式 `thinking_mode` 优先
-- 只有严格 JSON 任务设置 `response_format=json_object`
-- 普通文本脱水、merge 和 moment 不被强制 JSON
-- 所有模型调用经过统一出站 sanitizer
+- Persona 默认 `max_tokens=800`
+- Persona、Dehydration、Reflection 的 `thinking_mode` 语义一致
+- 留空表示 auto，而不是无条件走 Provider 默认
+- 新旧持久配置都能加载，未知字段不会丢失
 
-### `config.example.yaml` 与 `scripts/one_click.sh`
+## 次级高风险文件
 
-这两个文件和 `utils.py` 的内置默认值必须保持一致。重点核对 Persona `max_tokens`、`thinking_mode` 的 auto 语义，以及新安装配置是否符合生产预期。
+- `utils.py`：统一 sanitizer、JSONResponse、模型 wrapper、配置加载和环境覆盖
+- `persona_engine.py`：Persona JSON mode、thinking、token 上限和错误分类
+- `dehydrator.py`：严格 JSON 与普通文本任务边界
+- `scripts/one_click.sh`：新安装默认配置必须与 `utils.py`、`config.example.yaml` 一致
+
+这些文件文本冲突概率可能低于主要高风险文件，但存在较高语义回归风险。
 
 ## Zeabur 部署文件的运行高风险
 
@@ -161,50 +251,71 @@
 - `zeabur/nginx.conf.template`
 - `zeabur/start.sh`
 
-同步或改动后必须确认：
+同步或修改后必须确认：
 
 - `/data` 仍为持久化路径
-- `OMBRE_CONFIG_PATH=/data/state/config.yaml` 的外部配置仍生效
-- Brain 使用 8000，Gateway 使用 8010，Nginx 使用 Zeabur 提供的 `PORT`
-- `/v1/` 仅转发到 Gateway，Dashboard、Auth、`/api/` 转发到 Brain
-- `Set-Cookie` 和请求 Cookie 不被反代破坏
-- 任一子进程退出时容器能正确退出，TERM 能传递给所有子进程
-- Docker 构建仍包含应用所需的 Python、资源、脚本和 Dashboard 文件
+- `OMBRE_CONFIG_PATH=/data/state/config.yaml` 仍生效
+- Brain、Gateway 和 Nginx 端口与路由不变
+- `/v1/` 仅转发到 Gateway
+- Dashboard、Auth、`/api/` 转发到 Brain
+- Cookie 和 `Set-Cookie` 不被代理破坏
+- 任一子进程退出时容器能正确退出，TERM 能传播给所有子进程
+- Docker 构建继续包含全部 Python、资源、脚本和 Dashboard 文件
 
 ## 必须长期保留的能力
 
 在 upstream 未提供经过验证的等价实现前，必须保留：
 
 1. Zeabur 单容器部署与 `/data` 持久化契约。
-2. `OMBRE_CONFIG_PATH=/data/state/config.yaml` 的配置持久化路径。
-3. Dashboard 在同源反代环境中的鉴权和 Cookie 行为。
-4. DeepSeek V4 后台结构化任务兼容：
-   - Persona JSON mode
-   - Persona 默认 800 tokens
-   - DeepSeek V4 auto thinking disabled
-   - 严格 JSON 脱水任务的 response format
-   - 可诊断的 Persona 失败分类
-5. API 响应的全局 JSON/Unicode 安全层。
-6. ChatCompletion、Embedding、Rerank 和原始 HTTP 模型 payload 的统一 Unicode sanitizer。
-7. 身份环境变量覆盖，如果生产环境仍依赖它。
-8. 上述能力对应的回归测试。
+2. `OMBRE_CONFIG_PATH=/data/state/config.yaml`。
+3. Dashboard 同源鉴权和 Cookie 行为。
+4. DeepSeek V4 Persona、Dehydration、Reflection 后台结构化任务兼容。
+5. Dedicated daily 非 DeepSeek 模型的 `enable_thinking=False` 行为及参数互斥。
+6. API 响应的全局 JSON/Unicode 安全层。
+7. ChatCompletion、Embedding、Rerank 和原始 HTTP 模型 payload 的统一 sanitizer。
+8. Bucket 历史时间字段的混合类型排序兼容。
+9. 身份环境变量覆盖，如果生产环境仍依赖它。
+10. 上述能力对应的回归测试。
 
-## 可被官方等价实现替代的部分
+## 可由 upstream 等价实现替代的部分
 
-未来可在验证等价性后回归官方实现：
+未来可在验证等价性后采用官方实现：
 
-- bucket 和 moments 的局部 datetime/surrogate 补丁，可由官方全局 JSON encoder 替代。
-- Dashboard 的同源鉴权、bucket 数组保护和 moments 错误显示，可由官方等价 UI/API 契约替代。
-- DeepSeek 模型名判断，可由官方 Provider capability 或模型能力层替代。
-- 各引擎中的逐调用 wrapper，可由官方统一 client transport/middleware sanitizer 替代。
-- 身份环境变量覆盖，可由官方明确支持的配置覆盖系统替代。
-- 安装脚本中的 Persona 默认值差异，可在官方默认值和语义一致后消失。
+- Bucket、Moments 和 Import API 的局部 datetime/surrogate 补丁
+- 官方统一 JSON encoder 或安全响应层
+- 官方统一模型 transport/middleware sanitizer
+- DeepSeek 模型名判断和 Provider 私有 thinking 参数分支
+- 官方公开、稳定的时间归一化函数
+- Dashboard 同源鉴权、错误显示和结构化任务配置 UI
+- 身份环境变量覆盖体系
 
 替代前必须满足：
 
-1. 官方实现覆盖相同输入边界和错误场景。
-2. 本 fork 的相关回归测试继续通过，或已按官方接口等价调整。
-3. Zeabur 的持久化、配置和代理行为未改变。
-4. 普通聊天调用链没有受到后台结构化任务参数影响。
+1. upstream 实现覆盖相同输入边界和错误场景。
+2. fork 回归测试继续通过，或已按官方接口等价调整。
+3. Zeabur 持久化、配置和代理行为没有改变。
+4. 普通聊天没有受到后台结构化参数影响。
 
-完整同步流程见 `docs/upstream-sync-sop.md`。
+## 已记录技术债
+
+以下是后续可逐步处理的结构性技术债，本基线不授权立即重构：
+
+1. 提取 Provider / thinking / JSON task policy 独立模块，统一模型能力识别、JSON mode 和互斥参数。
+2. 提取公共时间归一化模块，避免跨模块调用私有 parser 和重复日期 helper。
+3. 提取模型安全出站 transport，统一 ChatCompletion、Embedding、Rerank 和原始 HTTP JSON 边界。
+4. 逐步拆分 Dashboard 配置加载、验证、保存和 UI 绑定逻辑，降低大型单文件冲突面。
+
+当前不要为了减少 diff 立即进行大规模重构。先保持生产稳定，先建立或保留能力级回归测试，再以独立分支、小提交逐步抽取。
+
+## Upstream 同步原则
+
+- 下次 upstream 更新必须按 `docs/upstream-sync-sop.md` 操作。
+- 只在独立 `sync/upstream-main-<sha>` 分支合并 upstream。
+- 高风险文件禁止整文件选择 ours 或 theirs，必须逐块审查。
+- 禁止 rebase 或改写生产 `zeabur` 历史。
+- 官方出现等价实现时，优先采用官方实现并保留回归测试。
+- 保留能力和测试，不执着保留当前具体实现。
+- 不要在 upstream 同步中顺手进行大规模本地重构。
+- 完成全量 pytest、py_compile、Shell 语法检查和 `git diff --check` 后，才可进入生产合入审查。
+
+完整同步和部署验证流程见 `docs/upstream-sync-sop.md`。
