@@ -37,11 +37,12 @@ def _response(content="{}", finish_reason="stop", *, choices=True):
     return SimpleNamespace(choices=response_choices)
 
 
-def _options(engine, model=None):
+def _options(engine, model=None, *, use_daily_client=False):
     return engine._completion_options(
         model=model or engine.model,
         max_tokens=700,
         temperature=0.1,
+        use_daily_client=use_daily_client,
     )
 
 
@@ -63,10 +64,63 @@ def test_non_deepseek_model_does_not_receive_thinking_parameter(tmp_path):
     assert "extra_body" not in _options(engine)
 
 
-def test_reflection_structured_request_uses_json_response_format(tmp_path):
-    engine = _engine(tmp_path)
+def test_dedicated_qwen_uses_only_enable_thinking_false(tmp_path):
+    engine = _engine(tmp_path, model="Qwen/Qwen3.5-4B")
+    extra_body = _options(engine, use_daily_client=True)["extra_body"]
 
-    assert _options(engine)["response_format"] == {"type": "json_object"}
+    assert extra_body == {"enable_thinking": False}
+    assert "thinking" not in extra_body
+
+
+def test_dedicated_deepseek_v4_uses_only_disabled_thinking(tmp_path):
+    engine = _engine(tmp_path)
+    extra_body = _options(engine, use_daily_client=True)["extra_body"]
+
+    assert extra_body == {"thinking": {"type": "disabled"}}
+    assert "enable_thinking" not in extra_body
+
+
+def test_dedicated_deepseek_v4_explicit_enabled_uses_only_thinking(tmp_path):
+    engine = _engine(tmp_path, thinking_mode="enabled")
+    extra_body = _options(engine, use_daily_client=True)["extra_body"]
+
+    assert extra_body == {"thinking": {"type": "enabled"}}
+    assert "enable_thinking" not in extra_body
+
+
+@pytest.mark.parametrize(
+    "task",
+    [
+        "memory_enrichment",
+        "reflection_daily",
+        "daily_chat_memory_summary",
+        "daily_activity_summary",
+        "daily_chat_memory_candidates",
+        "diary_memory_candidate",
+    ],
+)
+def test_all_reflection_json_requests_use_json_response_format(monkeypatch, tmp_path, task):
+    engine = _engine(tmp_path)
+    calls = []
+
+    async def capture_completion(_client, **payload):
+        calls.append(payload)
+        return _response()
+
+    monkeypatch.setattr(reflection_module, "create_chat_completion", capture_completion)
+    asyncio.run(
+        engine._create_structured_completion(
+            object(),
+            task=task,
+            model=engine.model,
+            messages=[{"role": "user", "content": "test"}],
+            max_tokens=700,
+            temperature=0.1,
+            use_daily_client=task.startswith("daily_"),
+        )
+    )
+
+    assert calls[0]["response_format"] == {"type": "json_object"}
 
 
 def test_reflection_empty_content_is_distinguished(tmp_path, caplog):

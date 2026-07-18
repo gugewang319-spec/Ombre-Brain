@@ -1679,7 +1679,7 @@ class ReflectionEngine:
     ) -> list[dict]:
         if not self.daily_chat_memory_summary_enabled:
             return []
-        client, model, _use_daily_client = self._daily_chat_memory_model_client(candidate=False)
+        client, model, use_daily_client = self._daily_chat_memory_model_client(candidate=False)
         if not client:
             return []
         windows = self._daily_chat_memory_windows(turns)
@@ -1716,6 +1716,7 @@ class ReflectionEngine:
                     ],
                     max_tokens=self.daily_chat_memory_summary_max_tokens,
                     temperature=self.temperature,
+                    use_daily_client=use_daily_client,
                 )
                 parsed = self._parse_structured_completion(response, task="daily_chat_memory_summary")
             except Exception as exc:
@@ -2144,6 +2145,7 @@ class ReflectionEngine:
                 ],
                 max_tokens=self.daily_activity_summary_max_tokens,
                 temperature=self.temperature,
+                use_daily_client=use_daily_client,
             )
             parsed = self._parse_structured_completion(response, task="daily_activity_summary")
         except Exception as exc:
@@ -2592,7 +2594,7 @@ class ReflectionEngine:
         window_summaries: list[dict] | None = None,
         max_candidates: int | None = None,
     ) -> list[dict]:
-        client, model, _use_daily_client = self._daily_chat_memory_model_client(candidate=True)
+        client, model, use_daily_client = self._daily_chat_memory_model_client(candidate=True)
         if client:
             summaries = window_summaries or []
             payload = {
@@ -2621,6 +2623,7 @@ class ReflectionEngine:
                     ],
                     max_tokens=self.daily_chat_memory_candidate_max_tokens,
                     temperature=self.temperature,
+                    use_daily_client=use_daily_client,
                 )
                 parsed = self._parse_structured_completion(response, task="daily_chat_memory_candidates")
                 candidates = parsed.get("candidates") if isinstance(parsed, dict) else []
@@ -4383,6 +4386,7 @@ class ReflectionEngine:
         model: str,
         max_tokens: int,
         temperature: float,
+        use_daily_client: bool = False,
     ) -> dict[str, Any]:
         options: dict[str, Any] = {
             "max_tokens": max_tokens,
@@ -4392,6 +4396,8 @@ class ReflectionEngine:
         mode = self._effective_thinking_mode(model)
         if mode:
             options["extra_body"] = {"thinking": {"type": mode}}
+        elif use_daily_client:
+            options["extra_body"] = {"enable_thinking": False}
         return options
 
     def _effective_thinking_mode(self, model: str) -> str:
@@ -4410,6 +4416,7 @@ class ReflectionEngine:
         messages: list[dict[str, str]],
         max_tokens: int,
         temperature: float,
+        use_daily_client: bool,
     ) -> Any:
         return await self._create_structured_completion(
             client,
@@ -4418,6 +4425,7 @@ class ReflectionEngine:
             messages=messages,
             max_tokens=max_tokens,
             temperature=temperature,
+            use_daily_client=use_daily_client,
         )
 
     async def _create_structured_completion(
@@ -4429,6 +4437,7 @@ class ReflectionEngine:
         messages: list[dict[str, str]],
         max_tokens: int,
         temperature: float,
+        use_daily_client: bool = False,
     ) -> Any:
         try:
             return await create_chat_completion(
@@ -4439,6 +4448,7 @@ class ReflectionEngine:
                     model=model,
                     max_tokens=max_tokens,
                     temperature=temperature,
+                    use_daily_client=use_daily_client,
                 ),
             )
         except Exception as exc:
