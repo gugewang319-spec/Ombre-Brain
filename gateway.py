@@ -3651,6 +3651,148 @@ class GatewayService:
             return last_response
         return self._upstream_request_error_response(upstream, model, last_error)
 
+    @staticmethod
+    def _sse_stream_message_count(payload: dict) -> int:
+        messages = payload.get("messages")
+        return len(messages) if isinstance(messages, list) else 0
+
+    @staticmethod
+    def _sse_stream_elapsed_ms(started_at: float) -> int:
+        return max(0, int((time.perf_counter() - started_at) * 1000))
+
+    @staticmethod
+    def _sse_stream_exception_repr(exc: BaseException) -> str:
+        detail = repr(exc)
+        detail = re.sub(
+            r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+",
+            r"\1<redacted>",
+            detail,
+        )
+        return re.sub(
+            r"(?i)((?:api[_-]?key|token|authorization)\s*[:=]\s*)"
+            r"(?:'[^']*'|\"[^\"]*\"|[^\s,;)\]]+)",
+            r"\1<redacted>",
+            detail,
+        )
+
+    def _log_sse_stream_started(
+        self,
+        *,
+        stream_id: str,
+        session_id: str,
+        model: str,
+        upstream_status: int,
+        message_count: int,
+        started_at: float,
+    ) -> None:
+        logger.info(
+            "Gateway SSE stream started | stream_id=%s session=%s model=%s "
+            "upstream_status=%s message_count=%s elapsed_ms=%s",
+            stream_id,
+            session_id,
+            model,
+            upstream_status,
+            message_count,
+            self._sse_stream_elapsed_ms(started_at),
+        )
+
+    def _log_sse_stream_completed(
+        self,
+        *,
+        stream_id: str,
+        session_id: str,
+        model: str,
+        chunk_count: int,
+        total_bytes: int,
+        started_at: float,
+        seen_done: bool,
+        finalize_attempted: bool,
+        finalize_completed: bool,
+    ) -> None:
+        logger.info(
+            "Gateway SSE stream completed | stream_id=%s session=%s model=%s "
+            "chunk_count=%s total_bytes=%s total_elapsed_ms=%s seen_done=%s "
+            "finalize_attempted=%s finalize_completed=%s",
+            stream_id,
+            session_id,
+            model,
+            chunk_count,
+            total_bytes,
+            self._sse_stream_elapsed_ms(started_at),
+            seen_done,
+            finalize_attempted,
+            finalize_completed,
+        )
+
+    def _log_sse_stream_exception(
+        self,
+        *,
+        stream_id: str,
+        session_id: str,
+        model: str,
+        stage: str,
+        exc: BaseException,
+        chunk_count: int,
+        total_bytes: int,
+        started_at: float,
+    ) -> None:
+        safe_exception_repr = self._sse_stream_exception_repr(exc)
+        safe_exception = RuntimeError(
+            f"redacted {type(exc).__name__}: {safe_exception_repr}"
+        )
+        logger.error(
+            "Gateway SSE stream failed | stream_id=%s session=%s model=%s stage=%s "
+            "exception_type=%s exception_repr=%s chunk_count=%s total_bytes=%s elapsed_ms=%s",
+            stream_id,
+            session_id,
+            model,
+            stage,
+            type(exc).__name__,
+            safe_exception_repr,
+            chunk_count,
+            total_bytes,
+            self._sse_stream_elapsed_ms(started_at),
+            exc_info=(type(safe_exception), safe_exception, exc.__traceback__),
+        )
+
+    async def _close_sse_upstream_response(
+        self,
+        upstream_response: httpx.Response,
+        *,
+        stream_id: str,
+        session_id: str,
+        model: str,
+        chunk_count: int,
+        total_bytes: int,
+        started_at: float,
+    ) -> None:
+        try:
+            await upstream_response.aclose()
+        except asyncio.CancelledError as exc:
+            self._log_sse_stream_exception(
+                stream_id=stream_id,
+                session_id=session_id,
+                model=model,
+                stage="downstream_cancelled",
+                exc=exc,
+                chunk_count=chunk_count,
+                total_bytes=total_bytes,
+                started_at=started_at,
+            )
+            raise
+        except Exception as exc:
+            self._log_sse_stream_exception(
+                stream_id=stream_id,
+                session_id=session_id,
+                model=model,
+                stage="upstream_close",
+                exc=exc,
+                chunk_count=chunk_count,
+                total_bytes=total_bytes,
+                started_at=started_at,
+            )
+            raise
+
     async def _stream_upstream(
         self,
         payload: dict,
@@ -3672,6 +3814,7 @@ class GatewayService:
                 client=client,
                 injection_debug=injection_debug,
             )
+        stream_id = secrets.token_hex(4)
         stream_started_at = time.perf_counter()
         upstream_open_started_at = time.perf_counter()
         upstream_response = await self._open_upstream_stream(route, payload)
@@ -3702,8 +3845,20 @@ class GatewayService:
                 media_type=content_type,
             )
 
+        self._log_sse_stream_started(
+            stream_id=stream_id,
+            session_id=session_id,
+            model=model,
+            upstream_status=upstream_response.status_code,
+            message_count=self._sse_stream_message_count(payload),
+            started_at=stream_started_at,
+        )
+
         async def stream_body():
             finalized = False
+            finalize_completed = False
+            stream_completed = False
+            stage = "upstream_read"
             stream_state = self._new_stream_capture_state()
             body_started_at = time.perf_counter()
             first_chunk_ms: int | None = None
@@ -3712,10 +3867,11 @@ class GatewayService:
             byte_count = 0
 
             async def finalize_once() -> None:
-                nonlocal finalized
+                nonlocal finalized, finalize_completed, stage
                 if finalized:
                     return
                 finalized = True
+                stage = "finalize"
                 await self._finalize_stream_turn(
                     session_id=session_id,
                     model=model,
@@ -3726,8 +3882,10 @@ class GatewayService:
                     client=client,
                     injection_debug=injection_debug,
                 )
+                finalize_completed = True
 
             try:
+                stage = "upstream_read"
                 async for chunk in upstream_response.aiter_bytes():
                     if chunk:
                         chunk_count += 1
@@ -3737,9 +3895,10 @@ class GatewayService:
                             first_chunk_ms = max(0, int((now - stream_started_at) * 1000))
                             header_to_first_chunk_ms = max(0, int((now - body_started_at) * 1000))
                             logger.info(
-                                "Gateway stream first chunk | session=%s route=%s upstream=%s "
+                                "Gateway stream first chunk | stream_id=%s session=%s route=%s upstream=%s "
                                 "model=%s upstream_model=%s status=%s header_ms=%s "
-                                "first_chunk_ms=%s header_to_first_chunk_ms=%s",
+                                "first_chunk_elapsed_ms=%s header_to_first_chunk_ms=%s chunk_bytes=%s",
+                                stream_id,
                                 session_id,
                                 "/v1/chat/completions",
                                 upstream.get("name"),
@@ -3749,18 +3908,48 @@ class GatewayService:
                                 upstream_headers_ms,
                                 first_chunk_ms,
                                 header_to_first_chunk_ms,
+                                len(chunk),
                             )
+                        stage = "capture"
                         self._consume_stream_capture_chunk(stream_state, chunk)
                         if stream_state.get("seen_done"):
                             await finalize_once()
+                        stage = "upstream_read"
                         yield chunk
+                stage = "capture"
                 self._consume_stream_capture_chunk(stream_state, b"", final=True)
                 await finalize_once()
+                stream_completed = True
+            except asyncio.CancelledError as exc:
+                self._log_sse_stream_exception(
+                    stream_id=stream_id,
+                    session_id=session_id,
+                    model=model,
+                    stage="downstream_cancelled",
+                    exc=exc,
+                    chunk_count=chunk_count,
+                    total_bytes=byte_count,
+                    started_at=stream_started_at,
+                )
+                raise
+            except Exception as exc:
+                self._log_sse_stream_exception(
+                    stream_id=stream_id,
+                    session_id=session_id,
+                    model=model,
+                    stage=stage,
+                    exc=exc,
+                    chunk_count=chunk_count,
+                    total_bytes=byte_count,
+                    started_at=stream_started_at,
+                )
+                raise
             finally:
                 logger.info(
-                    "Gateway stream timing | session=%s route=%s upstream=%s model=%s upstream_model=%s "
+                    "Gateway stream timing | stream_id=%s session=%s route=%s upstream=%s model=%s upstream_model=%s "
                     "status=%s header_ms=%s first_chunk_ms=%s header_to_first_chunk_ms=%s "
                     "body_ms=%s total_ms=%s chunks=%s bytes=%s finalized=%s seen_done=%s",
+                    stream_id,
                     session_id,
                     "/v1/chat/completions",
                     upstream.get("name"),
@@ -3777,7 +3966,27 @@ class GatewayService:
                     finalized,
                     bool(stream_state.get("seen_done")),
                 )
-                await upstream_response.aclose()
+                await self._close_sse_upstream_response(
+                    upstream_response,
+                    stream_id=stream_id,
+                    session_id=session_id,
+                    model=model,
+                    chunk_count=chunk_count,
+                    total_bytes=byte_count,
+                    started_at=stream_started_at,
+                )
+                if stream_completed:
+                    self._log_sse_stream_completed(
+                        stream_id=stream_id,
+                        session_id=session_id,
+                        model=model,
+                        chunk_count=chunk_count,
+                        total_bytes=byte_count,
+                        started_at=stream_started_at,
+                        seen_done=bool(stream_state.get("seen_done")),
+                        finalize_attempted=finalized,
+                        finalize_completed=finalize_completed,
+                    )
 
         return StreamingResponse(
             stream_body(),
@@ -6026,6 +6235,7 @@ class GatewayService:
                 injection_debug=injection_debug,
             )
 
+        stream_id = secrets.token_hex(4)
         stream_started_at = time.perf_counter()
         upstream_open_started_at = time.perf_counter()
         upstream_response = await self._open_upstream_stream(route, payload)
@@ -6057,8 +6267,20 @@ class GatewayService:
                 )
             )
 
+        self._log_sse_stream_started(
+            stream_id=stream_id,
+            session_id=session_id,
+            model=model,
+            upstream_status=upstream_response.status_code,
+            message_count=self._sse_stream_message_count(payload),
+            started_at=stream_started_at,
+        )
+
         async def stream_body():
             finalized = False
+            finalize_completed = False
+            stream_completed = False
+            stage = "transform"
             stream_state = self._new_stream_capture_state()
             body_started_at = time.perf_counter()
             first_chunk_ms: int | None = None
@@ -6089,10 +6311,11 @@ class GatewayService:
                 return chunks
 
             async def finalize_once() -> None:
-                nonlocal finalized
+                nonlocal finalized, finalize_completed, stage
                 if finalized:
                     return
                 finalized = True
+                stage = "finalize"
                 await self._finalize_stream_turn(
                     session_id=session_id,
                     model=model,
@@ -6103,8 +6326,10 @@ class GatewayService:
                     client=client,
                     injection_debug=injection_debug,
                 )
+                finalize_completed = True
 
             try:
+                stage = "transform"
                 yield self._anthropic_sse(
                     "message_start",
                     {
@@ -6122,6 +6347,7 @@ class GatewayService:
                     },
                 )
 
+                stage = "upstream_read"
                 async for chunk in upstream_response.aiter_bytes():
                     if not chunk:
                         continue
@@ -6132,9 +6358,10 @@ class GatewayService:
                         first_chunk_ms = max(0, int((now - stream_started_at) * 1000))
                         header_to_first_chunk_ms = max(0, int((now - body_started_at) * 1000))
                         logger.info(
-                            "Gateway stream first chunk | session=%s route=%s upstream=%s "
+                            "Gateway stream first chunk | stream_id=%s session=%s route=%s upstream=%s "
                             "model=%s upstream_model=%s status=%s header_ms=%s "
-                            "first_chunk_ms=%s header_to_first_chunk_ms=%s",
+                            "first_chunk_elapsed_ms=%s header_to_first_chunk_ms=%s chunk_bytes=%s",
+                            stream_id,
                             session_id,
                             "/v1/messages",
                             upstream.get("name"),
@@ -6144,10 +6371,13 @@ class GatewayService:
                             upstream_headers_ms,
                             first_chunk_ms,
                             header_to_first_chunk_ms,
+                            len(chunk),
                         )
+                    stage = "capture"
                     self._consume_stream_capture_chunk(stream_state, chunk)
                     if stream_state.get("seen_done"):
                         await finalize_once()
+                    stage = "transform"
                     for event in self._openai_sse_chunk_to_anthropic_events(chunk):
                         if event.get("_done"):
                             continue
@@ -6297,9 +6527,12 @@ class GatewayService:
                                         },
                                 },
                             )
+                    stage = "upstream_read"
 
+                stage = "capture"
                 self._consume_stream_capture_chunk(stream_state, b"", final=True)
                 await finalize_once()
+                stage = "transform"
                 for reasoning_chunk in close_reasoning_blocks():
                     yield reasoning_chunk
                 if text_block_index is not None:
@@ -6330,11 +6563,38 @@ class GatewayService:
                     "message_stop",
                     {"type": "message_stop"},
                 )
+                stream_completed = True
+            except asyncio.CancelledError as exc:
+                self._log_sse_stream_exception(
+                    stream_id=stream_id,
+                    session_id=session_id,
+                    model=model,
+                    stage="downstream_cancelled",
+                    exc=exc,
+                    chunk_count=chunk_count,
+                    total_bytes=byte_count,
+                    started_at=stream_started_at,
+                )
+                raise
+            except Exception as exc:
+                self._log_sse_stream_exception(
+                    stream_id=stream_id,
+                    session_id=session_id,
+                    model=model,
+                    stage=stage,
+                    exc=exc,
+                    chunk_count=chunk_count,
+                    total_bytes=byte_count,
+                    started_at=stream_started_at,
+                )
+                raise
             finally:
                 logger.info(
-                    "Gateway stream timing | session=%s route=%s upstream=%s model=%s upstream_model=%s "
+                    "Gateway stream timing | stream_id=%s session=%s route=%s upstream=%s "
+                    "model=%s upstream_model=%s "
                     "status=%s header_ms=%s first_chunk_ms=%s header_to_first_chunk_ms=%s "
                     "body_ms=%s total_ms=%s chunks=%s bytes=%s finalized=%s seen_done=%s",
+                    stream_id,
                     session_id,
                     "/v1/messages",
                     upstream.get("name"),
@@ -6351,7 +6611,27 @@ class GatewayService:
                     finalized,
                     bool(stream_state.get("seen_done")),
                 )
-                await upstream_response.aclose()
+                await self._close_sse_upstream_response(
+                    upstream_response=upstream_response,
+                    stream_id=stream_id,
+                    session_id=session_id,
+                    model=model,
+                    chunk_count=chunk_count,
+                    total_bytes=byte_count,
+                    started_at=stream_started_at,
+                )
+                if stream_completed:
+                    self._log_sse_stream_completed(
+                        stream_id=stream_id,
+                        session_id=session_id,
+                        model=model,
+                        chunk_count=chunk_count,
+                        total_bytes=byte_count,
+                        started_at=stream_started_at,
+                        seen_done=bool(stream_state.get("seen_done")),
+                        finalize_attempted=finalized,
+                        finalize_completed=finalize_completed,
+                    )
 
         return StreamingResponse(
             stream_body(),
@@ -6374,6 +6654,7 @@ class GatewayService:
         injection_debug: dict[str, Any] | None = None,
     ) -> Response:
         model = str(payload.get("model") or "").strip()
+        stream_id = secrets.token_hex(4)
         stream_started_at = time.perf_counter()
         upstream_open_started_at = time.perf_counter()
         upstream_response = await self._open_anthropic_upstream_stream(route, payload)
@@ -6414,8 +6695,20 @@ class GatewayService:
                 media_type=upstream_response.headers.get("content-type", "application/json"),
             )
 
+        self._log_sse_stream_started(
+            stream_id=stream_id,
+            session_id=session_id,
+            model=model,
+            upstream_status=upstream_response.status_code,
+            message_count=self._sse_stream_message_count(payload),
+            started_at=stream_started_at,
+        )
+
         async def stream_body():
             finalized = False
+            finalize_completed = False
+            stream_completed = False
+            stage = "transform"
             stream_state = self._new_stream_capture_state()
             parser_state = self._new_sse_parse_state()
             body_started_at = time.perf_counter()
@@ -6429,10 +6722,11 @@ class GatewayService:
             final_sent = False
 
             async def finalize_once() -> None:
-                nonlocal finalized
+                nonlocal finalized, finalize_completed, stage
                 if finalized:
                     return
                 finalized = True
+                stage = "finalize"
                 await self._finalize_stream_turn(
                     session_id=session_id,
                     model=model,
@@ -6443,6 +6737,7 @@ class GatewayService:
                     client=client,
                     injection_debug=injection_debug,
                 )
+                finalize_completed = True
 
             def openai_chunk(delta: dict[str, Any], finish_reason: str | None = None) -> bytes:
                 return self._openai_sse(
@@ -6480,7 +6775,9 @@ class GatewayService:
                 )
 
             try:
+                stage = "transform"
                 yield openai_chunk({"role": "assistant"})
+                stage = "upstream_read"
                 async for chunk in upstream_response.aiter_bytes():
                     if not chunk:
                         continue
@@ -6491,9 +6788,10 @@ class GatewayService:
                         first_chunk_ms = max(0, int((now - stream_started_at) * 1000))
                         header_to_first_chunk_ms = max(0, int((now - body_started_at) * 1000))
                         logger.info(
-                            "Gateway stream first chunk | session=%s route=%s upstream=%s "
+                            "Gateway stream first chunk | stream_id=%s session=%s route=%s upstream=%s "
                             "model=%s upstream_model=%s status=%s header_ms=%s "
-                            "first_chunk_ms=%s header_to_first_chunk_ms=%s",
+                            "first_chunk_elapsed_ms=%s header_to_first_chunk_ms=%s chunk_bytes=%s",
+                            stream_id,
                             session_id,
                             "/v1/chat/completions",
                             upstream.get("name"),
@@ -6503,8 +6801,11 @@ class GatewayService:
                             upstream_headers_ms,
                             first_chunk_ms,
                             header_to_first_chunk_ms,
+                            len(chunk),
                         )
+                    stage = "capture"
                     self._consume_anthropic_stream_capture_chunk(stream_state, chunk)
+                    stage = "transform"
                     for event in self._anthropic_sse_events_from_chunk(parser_state, chunk):
                         for outgoing in self._openai_chunks_from_anthropic_event(
                             event,
@@ -6524,8 +6825,11 @@ class GatewayService:
                             yield self._openai_sse(outgoing["chunk"])
                     if stream_state.get("seen_done"):
                         await finalize_once()
+                    stage = "upstream_read"
 
+                stage = "capture"
                 self._consume_anthropic_stream_capture_chunk(stream_state, b"", final=True)
+                stage = "transform"
                 for event in self._anthropic_sse_events_from_chunk(parser_state, b"", final=True):
                     for outgoing in self._openai_chunks_from_anthropic_event(
                         event,
@@ -6544,14 +6848,42 @@ class GatewayService:
                             continue
                         yield self._openai_sse(outgoing["chunk"])
                 await finalize_once()
+                stage = "transform"
                 if not final_sent:
                     yield final_openai_chunk()
                     yield b"data: [DONE]\n\n"
+                stream_completed = True
+            except asyncio.CancelledError as exc:
+                self._log_sse_stream_exception(
+                    stream_id=stream_id,
+                    session_id=session_id,
+                    model=model,
+                    stage="downstream_cancelled",
+                    exc=exc,
+                    chunk_count=chunk_count,
+                    total_bytes=byte_count,
+                    started_at=stream_started_at,
+                )
+                raise
+            except Exception as exc:
+                self._log_sse_stream_exception(
+                    stream_id=stream_id,
+                    session_id=session_id,
+                    model=model,
+                    stage=stage,
+                    exc=exc,
+                    chunk_count=chunk_count,
+                    total_bytes=byte_count,
+                    started_at=stream_started_at,
+                )
+                raise
             finally:
                 logger.info(
-                    "Gateway stream timing | session=%s route=%s upstream=%s model=%s upstream_model=%s "
+                    "Gateway stream timing | stream_id=%s session=%s route=%s upstream=%s "
+                    "model=%s upstream_model=%s "
                     "status=%s header_ms=%s first_chunk_ms=%s header_to_first_chunk_ms=%s "
                     "body_ms=%s total_ms=%s chunks=%s bytes=%s finalized=%s seen_done=%s",
+                    stream_id,
                     session_id,
                     "/v1/chat/completions",
                     upstream.get("name"),
@@ -6568,7 +6900,27 @@ class GatewayService:
                     finalized,
                     bool(stream_state.get("seen_done")),
                 )
-                await upstream_response.aclose()
+                await self._close_sse_upstream_response(
+                    upstream_response=upstream_response,
+                    stream_id=stream_id,
+                    session_id=session_id,
+                    model=model,
+                    chunk_count=chunk_count,
+                    total_bytes=byte_count,
+                    started_at=stream_started_at,
+                )
+                if stream_completed:
+                    self._log_sse_stream_completed(
+                        stream_id=stream_id,
+                        session_id=session_id,
+                        model=model,
+                        chunk_count=chunk_count,
+                        total_bytes=byte_count,
+                        started_at=stream_started_at,
+                        seen_done=bool(stream_state.get("seen_done")),
+                        finalize_attempted=finalized,
+                        finalize_completed=finalize_completed,
+                    )
 
         return StreamingResponse(
             stream_body(),
@@ -6591,6 +6943,7 @@ class GatewayService:
         injection_debug: dict[str, Any] | None = None,
     ) -> Response:
         model = str(payload.get("model") or "").strip()
+        stream_id = secrets.token_hex(4)
         stream_started_at = time.perf_counter()
         upstream_open_started_at = time.perf_counter()
         upstream_response = await self._open_anthropic_upstream_stream(route, payload)
@@ -6622,8 +6975,20 @@ class GatewayService:
                 )
             )
 
+        self._log_sse_stream_started(
+            stream_id=stream_id,
+            session_id=session_id,
+            model=model,
+            upstream_status=upstream_response.status_code,
+            message_count=self._sse_stream_message_count(payload),
+            started_at=stream_started_at,
+        )
+
         async def stream_body():
             finalized = False
+            finalize_completed = False
+            stream_completed = False
+            stage = "upstream_read"
             stream_state = self._new_stream_capture_state()
             body_started_at = time.perf_counter()
             first_chunk_ms: int | None = None
@@ -6632,10 +6997,11 @@ class GatewayService:
             byte_count = 0
 
             async def finalize_once() -> None:
-                nonlocal finalized
+                nonlocal finalized, finalize_completed, stage
                 if finalized:
                     return
                 finalized = True
+                stage = "finalize"
                 await self._finalize_stream_turn(
                     session_id=session_id,
                     model=model,
@@ -6646,8 +7012,10 @@ class GatewayService:
                     client=client,
                     injection_debug=injection_debug,
                 )
+                finalize_completed = True
 
             try:
+                stage = "upstream_read"
                 async for chunk in upstream_response.aiter_bytes():
                     if chunk:
                         chunk_count += 1
@@ -6657,9 +7025,10 @@ class GatewayService:
                             first_chunk_ms = max(0, int((now - stream_started_at) * 1000))
                             header_to_first_chunk_ms = max(0, int((now - body_started_at) * 1000))
                             logger.info(
-                                "Gateway stream first chunk | session=%s route=%s upstream=%s "
+                                "Gateway stream first chunk | stream_id=%s session=%s route=%s upstream=%s "
                                 "model=%s upstream_model=%s status=%s header_ms=%s "
-                                "first_chunk_ms=%s header_to_first_chunk_ms=%s",
+                                "first_chunk_elapsed_ms=%s header_to_first_chunk_ms=%s chunk_bytes=%s",
+                                stream_id,
                                 session_id,
                                 "/v1/messages",
                                 upstream.get("name"),
@@ -6669,18 +7038,50 @@ class GatewayService:
                                 upstream_headers_ms,
                                 first_chunk_ms,
                                 header_to_first_chunk_ms,
+                                len(chunk),
                             )
+                        stage = "capture"
                         self._consume_anthropic_stream_capture_chunk(stream_state, chunk)
                         if stream_state.get("seen_done"):
                             await finalize_once()
+                        stage = "transform"
                         yield chunk
+                        stage = "upstream_read"
+                stage = "capture"
                 self._consume_anthropic_stream_capture_chunk(stream_state, b"", final=True)
                 await finalize_once()
+                stream_completed = True
+            except asyncio.CancelledError as exc:
+                self._log_sse_stream_exception(
+                    stream_id=stream_id,
+                    session_id=session_id,
+                    model=model,
+                    stage="downstream_cancelled",
+                    exc=exc,
+                    chunk_count=chunk_count,
+                    total_bytes=byte_count,
+                    started_at=stream_started_at,
+                )
+                raise
+            except Exception as exc:
+                self._log_sse_stream_exception(
+                    stream_id=stream_id,
+                    session_id=session_id,
+                    model=model,
+                    stage=stage,
+                    exc=exc,
+                    chunk_count=chunk_count,
+                    total_bytes=byte_count,
+                    started_at=stream_started_at,
+                )
+                raise
             finally:
                 logger.info(
-                    "Gateway stream timing | session=%s route=%s upstream=%s model=%s upstream_model=%s "
+                    "Gateway stream timing | stream_id=%s session=%s route=%s upstream=%s "
+                    "model=%s upstream_model=%s "
                     "status=%s header_ms=%s first_chunk_ms=%s header_to_first_chunk_ms=%s "
                     "body_ms=%s total_ms=%s chunks=%s bytes=%s finalized=%s seen_done=%s",
+                    stream_id,
                     session_id,
                     "/v1/messages",
                     upstream.get("name"),
@@ -6697,7 +7098,27 @@ class GatewayService:
                     finalized,
                     bool(stream_state.get("seen_done")),
                 )
-                await upstream_response.aclose()
+                await self._close_sse_upstream_response(
+                    upstream_response=upstream_response,
+                    stream_id=stream_id,
+                    session_id=session_id,
+                    model=model,
+                    chunk_count=chunk_count,
+                    total_bytes=byte_count,
+                    started_at=stream_started_at,
+                )
+                if stream_completed:
+                    self._log_sse_stream_completed(
+                        stream_id=stream_id,
+                        session_id=session_id,
+                        model=model,
+                        chunk_count=chunk_count,
+                        total_bytes=byte_count,
+                        started_at=stream_started_at,
+                        seen_done=bool(stream_state.get("seen_done")),
+                        finalize_attempted=finalized,
+                        finalize_completed=finalize_completed,
+                    )
 
         return StreamingResponse(
             stream_body(),
