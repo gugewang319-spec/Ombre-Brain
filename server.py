@@ -3655,6 +3655,12 @@ def _bucket_allows_memory_edge_backfill(bucket: dict) -> bool:
     return bool(bucket and not is_self_anchor_bucket(bucket) and meta.get("type") != "feel" and not meta.get("protected"))
 
 
+def _bucket_metadata_time_sort_key(bucket: dict, mgr) -> datetime:
+    meta = bucket.get("metadata", {}) if isinstance(bucket, dict) else {}
+    value = meta.get("updated_at") or meta.get("created")
+    return mgr._parse_iso_datetime(value) or datetime.min
+
+
 async def _backfill_memory_enrichment(
     limit: int | None = None,
     *,
@@ -3681,7 +3687,7 @@ async def _backfill_memory_enrichment(
 
     candidates = [bucket for bucket in all_buckets if _bucket_needs_memory_enrichment(bucket)]
     candidates.sort(
-        key=lambda item: item.get("metadata", {}).get("updated_at") or item.get("metadata", {}).get("created", ""),
+        key=lambda item: _bucket_metadata_time_sort_key(item, mgr),
         reverse=True,
     )
 
@@ -3747,7 +3753,7 @@ async def _edge_backfill_candidates(
         except Exception as e:
             return [], [f"list_failed: {e}"]
         buckets.sort(
-            key=lambda item: item.get("metadata", {}).get("updated_at") or item.get("metadata", {}).get("created", ""),
+            key=lambda item: _bucket_metadata_time_sort_key(item, mgr),
             reverse=True,
         )
 
@@ -3860,7 +3866,7 @@ async def _entity_edge_backfill_candidates(
         except Exception as e:
             return [], [f"list_failed: {e}"]
         buckets.sort(
-            key=lambda item: item.get("metadata", {}).get("updated_at") or item.get("metadata", {}).get("created", ""),
+            key=lambda item: _bucket_metadata_time_sort_key(item, mgr),
             reverse=True,
         )
 

@@ -1063,7 +1063,8 @@ class ReflectionEngine:
 
         recent_items = sorted(
             all_buckets,
-            key=lambda b: b.get("metadata", {}).get("created", ""),
+            key=lambda b: self._to_local(b.get("metadata", {}).get("created"))
+            or datetime.min.replace(tzinfo=self.tz),
             reverse=True,
         )
         recent_added = 0
