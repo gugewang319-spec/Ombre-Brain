@@ -10,6 +10,8 @@ import glob
 import re
 
 from openai import AsyncOpenAI
+
+from utils import create_chat_completion
 import frontmatter
 
 ANALYZE_PROMPT = (
@@ -65,7 +67,8 @@ async def reclassify():
         full_text = f"{name}\n{content}" if name else content
 
         try:
-            resp = await client.chat.completions.create(
+            resp = await create_chat_completion(
+                client,
                 model="deepseek-ai/DeepSeek-V3",
                 messages=[
                     {"role": "system", "content": ANALYZE_PROMPT},

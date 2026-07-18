@@ -107,9 +107,12 @@ from utils import (
     count_tokens_approx,
     bucket_content_for_recall,
     bucket_text_for_embedding,
+    create_chat_completion,
+    dumps_llm_payload,
     local_date_key,
     load_config,
     parse_human_date_reference,
+    sanitize_unicode,
     setup_logging,
     strip_human_date_references,
     strip_display_temperature_sections,
@@ -3375,7 +3378,7 @@ class GatewayService:
                         "Authorization": f"Bearer {key_entry['value']}",
                         "Content-Type": "application/json",
                     },
-                    json=upstream_payload,
+                    json=sanitize_unicode(upstream_payload),
                 )
             except httpx.RequestError as exc:
                 latency_ms = int((time.perf_counter() - started_at) * 1000)
@@ -3444,7 +3447,7 @@ class GatewayService:
                 response = await self.http_client.post(
                     url,
                     headers=self._anthropic_upstream_headers(upstream, key_entry, request=request),
-                    json=upstream_payload,
+                    json=sanitize_unicode(upstream_payload),
                 )
             except httpx.RequestError as exc:
                 latency_ms = int((time.perf_counter() - started_at) * 1000)
@@ -3513,7 +3516,7 @@ class GatewayService:
                     "Authorization": f"Bearer {key_entry['value']}",
                     "Content-Type": "application/json",
                 },
-                json=upstream_payload,
+                json=sanitize_unicode(upstream_payload),
             )
             started_at = time.perf_counter()
             try:
@@ -3590,7 +3593,7 @@ class GatewayService:
                 "POST",
                 url,
                 headers=self._anthropic_upstream_headers(upstream, key_entry),
-                json=upstream_payload,
+                json=sanitize_unicode(upstream_payload),
             )
             started_at = time.perf_counter()
             try:
@@ -13240,7 +13243,7 @@ class GatewayService:
                         "Authorization": f"Bearer {self.domain_sentinel_api_key}",
                         "Content-Type": "application/json",
                     },
-                    json=payload,
+                    json=sanitize_unicode(payload),
                 ),
                 timeout=self.domain_sentinel_timeout_seconds,
             )
@@ -14040,7 +14043,7 @@ class GatewayService:
                 {"role": "system", "content": QUERY_PLANNER_SYSTEM_PROMPT},
                 {
                     "role": "user",
-                    "content": json.dumps(
+                    "content": dumps_llm_payload(
                         {
                             "message": query,
                             "max_queries": self.query_planner_max_queries,
@@ -14100,7 +14103,8 @@ class GatewayService:
                 "temperature": 0,
             }
         try:
-            response = await client.chat.completions.create(
+            response = await create_chat_completion(
+                client,
                 model=payload["model"],
                 messages=payload["messages"],
                 **options,
@@ -14236,7 +14240,7 @@ class GatewayService:
                 {"role": "system", "content": SEMANTIC_RESCUE_SYSTEM_PROMPT},
                 {
                     "role": "user",
-                    "content": json.dumps(
+                    "content": dumps_llm_payload(
                         {
                             "query": query,
                             "axes": axes,

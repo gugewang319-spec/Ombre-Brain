@@ -11,7 +11,13 @@ from openai import AsyncOpenAI
 
 from identity import identity_names, render_identity_template
 from self_anchor import is_self_anchor_bucket
-from utils import bucket_text_for_embedding, count_tokens_approx, strip_wikilinks
+from utils import (
+    bucket_text_for_embedding,
+    count_tokens_approx,
+    create_chat_completion,
+    dumps_llm_payload,
+    strip_wikilinks,
+)
 
 logger = logging.getLogger("ombre_brain.portrait")
 
@@ -1538,7 +1544,7 @@ class DailyPortraitMaintainer:
     async def _create_stable_completion(self, payload: dict, *, max_tokens: int):
         messages = [
             {"role": "system", "content": self._stable_prompt()},
-            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            {"role": "user", "content": dumps_llm_payload(payload, ensure_ascii=False)},
         ]
         options = self._completion_options(
             max_tokens=max_tokens,
@@ -1546,7 +1552,8 @@ class DailyPortraitMaintainer:
             json_response=self.json_response_format,
         )
         try:
-            return await self.client.chat.completions.create(
+            return await create_chat_completion(
+                self.client,
                 model=self.model,
                 messages=messages,
                 **options,
@@ -1555,7 +1562,8 @@ class DailyPortraitMaintainer:
             if not options.pop("response_format", None):
                 raise
             logger.warning("Portrait stable JSON response_format failed, retrying without it: %s", exc)
-            return await self.client.chat.completions.create(
+            return await create_chat_completion(
+                self.client,
                 model=self.model,
                 messages=messages,
                 **options,
@@ -1898,7 +1906,7 @@ class DailyPortraitMaintainer:
     async def _create_patch_completion(self, payload: dict, *, max_tokens: int):
         messages = [
             {"role": "system", "content": self._prompt()},
-            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            {"role": "user", "content": dumps_llm_payload(payload, ensure_ascii=False)},
         ]
         options = self._completion_options(
             max_tokens=max_tokens,
@@ -1906,7 +1914,8 @@ class DailyPortraitMaintainer:
             json_response=self.json_response_format,
         )
         try:
-            return await self.client.chat.completions.create(
+            return await create_chat_completion(
+                self.client,
                 model=self.model,
                 messages=messages,
                 **options,
@@ -1915,7 +1924,8 @@ class DailyPortraitMaintainer:
             if not options.pop("response_format", None):
                 raise
             logger.warning("Portrait JSON response_format failed, retrying without it: %s", exc)
-            return await self.client.chat.completions.create(
+            return await create_chat_completion(
+                self.client,
                 model=self.model,
                 messages=messages,
                 **options,

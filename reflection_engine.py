@@ -15,7 +15,7 @@ from memory_edges import RELATION_TYPES, MemoryEdgeStore
 from memory_metadata import domain_prompt_options_text, normalize_domain_key
 from persona_event_selection import select_persona_events
 from self_anchor import is_self_anchor_bucket
-from utils import bucket_text_for_embedding, strip_wikilinks
+from utils import bucket_text_for_embedding, create_chat_completion, dumps_llm_payload, strip_wikilinks
 
 logger = logging.getLogger("ombre_brain.reflection")
 
@@ -1134,11 +1134,12 @@ class ReflectionEngine:
             "new_memory": self._memory_payload(bucket, content_limit=1200),
             "candidate_memories": [self._memory_payload(item, content_limit=360) for item in candidates],
         }
-        response = await self.client.chat.completions.create(
+        response = await create_chat_completion(
+            self.client,
             model=self.model,
             messages=[
                 {"role": "system", "content": CLASSIFY_PROMPT},
-                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                {"role": "user", "content": dumps_llm_payload(payload, ensure_ascii=False)},
             ],
             **self._completion_options(max_tokens=self.max_tokens, temperature=self.temperature),
         )
@@ -1391,11 +1392,12 @@ class ReflectionEngine:
         if not client or not model:
             return self._fallback_reflection(period, key, materials)
         payload = {"period": period, "date": key, **materials}
-        response = await client.chat.completions.create(
+        response = await create_chat_completion(
+            client,
             model=model,
             messages=[
                 {"role": "system", "content": self._reflect_prompt()},
-                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                {"role": "user", "content": dumps_llm_payload(payload, ensure_ascii=False)},
             ],
             **self._completion_options(
                 max_tokens=self.max_tokens,
@@ -1709,7 +1711,7 @@ class ReflectionEngine:
                     model=model,
                     messages=[
                         {"role": "system", "content": self._daily_chat_memory_summary_prompt()},
-                        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                        {"role": "user", "content": dumps_llm_payload(payload, ensure_ascii=False)},
                     ],
                     max_tokens=self.daily_chat_memory_summary_max_tokens,
                     temperature=self.temperature,
@@ -2138,7 +2140,7 @@ class ReflectionEngine:
                 model=model,
                 messages=[
                     {"role": "system", "content": self._daily_activity_summary_prompt()},
-                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                    {"role": "user", "content": dumps_llm_payload(payload, ensure_ascii=False)},
                 ],
                 max_tokens=self.daily_activity_summary_max_tokens,
                 temperature=self.temperature,
@@ -2615,7 +2617,7 @@ class ReflectionEngine:
                             "role": "system",
                             "content": self._daily_chat_memory_prompt(max_candidates=max_candidates),
                         },
-                        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                        {"role": "user", "content": dumps_llm_payload(payload, ensure_ascii=False)},
                     ],
                     max_tokens=self.daily_chat_memory_candidate_max_tokens,
                     temperature=self.temperature,
@@ -3712,11 +3714,12 @@ class ReflectionEngine:
                 },
             }
             try:
-                response = await self.client.chat.completions.create(
+                response = await create_chat_completion(
+                    self.client,
                     model=self.model,
                     messages=[
                         {"role": "system", "content": self._diary_memory_prompt()},
-                        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                        {"role": "user", "content": dumps_llm_payload(payload, ensure_ascii=False)},
                     ],
                     **self._completion_options(max_tokens=min(self.max_tokens, 520), temperature=self.temperature),
                 )
@@ -4428,7 +4431,8 @@ class ReflectionEngine:
                 temperature=temperature,
                 thinking_mode="",
             )
-        return await client.chat.completions.create(
+        return await create_chat_completion(
+            client,
             model=model,
             messages=messages,
             **completion_options,

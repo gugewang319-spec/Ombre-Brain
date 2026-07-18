@@ -22,7 +22,7 @@ from bucket_manager import BucketManager
 from embedding_engine import EmbeddingEngine
 from gateway import GatewayService
 from gateway_state import GatewayStateStore
-from utils import load_config
+from utils import create_embedding, load_config
 
 
 DEFAULT_BUCKETS_DIR = ROOT / "tmp" / "p0-local-snapshot-20260628-1528" / "buckets"
@@ -106,7 +106,8 @@ class OfflineEmbeddingEngine:
         text = str(query or "")
         if self.query_instruction:
             text = f"Instruct: {self.query_instruction}\nQuery: {text}"
-        response = await self.client.embeddings.create(
+        response = await create_embedding(
+            self.client,
             model=self.model,
             input=text[: self.max_chars],
         )

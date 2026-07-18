@@ -11,6 +11,7 @@
 
 import os
 import re
+import json
 import uuid
 import yaml
 import logging
@@ -25,37 +26,57 @@ from starlette.responses import JSONResponse as StarletteJSONResponse
 LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 
 
-def make_json_safe(value):
-    """Convert nested response data into UTF-8-safe JSON primitives."""
+def sanitize_unicode(value):
+    """Recursively replace lone Unicode surrogates while preserving JSON structure."""
     if isinstance(value, str):
         return "".join(
             "\ufffd" if 0xD800 <= ord(char) <= 0xDFFF else char
             for char in value
         )
     if isinstance(value, (datetime, date)):
-        return make_json_safe(value.isoformat())
+        return sanitize_unicode(value.isoformat())
     if isinstance(value, Path):
-        return make_json_safe(str(value))
+        return sanitize_unicode(str(value))
     if isinstance(value, (bytes, bytearray)):
         try:
-            return make_json_safe(bytes(value).decode("utf-8"))
+            return sanitize_unicode(bytes(value).decode("utf-8"))
         except UnicodeDecodeError:
             return f"<bytes:{len(value)}>"
     if isinstance(value, dict):
         safe = {}
         for key, item in value.items():
-            safe_key = make_json_safe(key)
+            safe_key = sanitize_unicode(key)
             if not isinstance(safe_key, (str, int, float, bool)) and safe_key is not None:
-                safe_key = make_json_safe(str(safe_key))
-            safe[safe_key] = make_json_safe(item)
+                safe_key = sanitize_unicode(str(safe_key))
+            safe[safe_key] = sanitize_unicode(item)
         return safe
     if isinstance(value, (list, tuple, set)):
-        return [make_json_safe(item) for item in value]
+        return [sanitize_unicode(item) for item in value]
     if isinstance(value, float):
         return value if math.isfinite(value) else None
     if value is None or isinstance(value, (int, bool)):
         return value
     return f"<unsupported:{type(value).__name__}>"
+
+
+def make_json_safe(value):
+    """Convert nested response data into UTF-8-safe JSON primitives."""
+    return sanitize_unicode(value)
+
+
+def dumps_llm_payload(value, **kwargs) -> str:
+    """Serialize an LLM payload only after recursively sanitizing Unicode."""
+    return json.dumps(sanitize_unicode(value), **kwargs)
+
+
+async def create_chat_completion(client, **payload):
+    """Send a UTF-8-safe OpenAI-compatible chat completion request."""
+    return await client.chat.completions.create(**sanitize_unicode(payload))
+
+
+async def create_embedding(client, **payload):
+    """Send a UTF-8-safe OpenAI-compatible embedding request."""
+    return await client.embeddings.create(**sanitize_unicode(payload))
 
 
 class JsonSafeJSONResponse(StarletteJSONResponse):

@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from utils import load_config
+from utils import load_config, sanitize_unicode
 
 
 DEFAULT_BRIDGE_DB = Path(r"D:\haven_bridge\data\haven.db")
@@ -278,7 +278,7 @@ def call_selector(prompt: str, cfg: WorkerConfig) -> str:
     }
     request = urllib.request.Request(
         url,
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        data=json.dumps(sanitize_unicode(payload), ensure_ascii=False).encode("utf-8"),
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
         method="POST",
     )

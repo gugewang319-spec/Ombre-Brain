@@ -18,7 +18,7 @@ from openai import AsyncOpenAI
 
 from identity import identity_names
 from raw_events import raw_event_text_looks_injected, strip_raw_client_context
-from utils import bucket_text_for_embedding, strip_wikilinks
+from utils import bucket_text_for_embedding, create_chat_completion, dumps_llm_payload, strip_wikilinks
 
 logger = logging.getLogger("ombre_brain.dream")
 
@@ -611,14 +611,14 @@ class DreamEngine:
             "model": self.model,
             "messages": [
                 {"role": "system", "content": DREAM_PROMPT},
-                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                {"role": "user", "content": dumps_llm_payload(payload, ensure_ascii=False)},
             ],
             "max_tokens": self.max_tokens,
             "temperature": self.temperature,
         }
         if self.thinking_mode:
             options["extra_body"] = {"thinking": {"type": self.thinking_mode}}
-        response = await self.client.chat.completions.create(**options)
+        response = await create_chat_completion(self.client, **options)
         raw = response.choices[0].message.content if response.choices else ""
         cleaned = (raw or "").strip()
         if cleaned.startswith("```"):

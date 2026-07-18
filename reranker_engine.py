@@ -6,6 +6,8 @@ from typing import Any
 
 import httpx
 
+from utils import sanitize_unicode
+
 logger = logging.getLogger("ombre_brain.reranker")
 
 
@@ -65,7 +67,7 @@ class RerankerEngine:
                         "Authorization": f"Bearer {self.api_key}",
                         "Content-Type": "application/json",
                     },
-                    json=payload,
+                    json=sanitize_unicode(payload),
                 )
                 response.raise_for_status()
                 body = response.json()

@@ -12,6 +12,7 @@ from openai import AsyncOpenAI
 
 from identity import generic_identity_names, identity_names, render_identity_template
 from persona_event_selection import trim_persona_excerpt
+from utils import create_chat_completion, dumps_llm_payload
 
 logger = logging.getLogger("ombre_brain.persona")
 
@@ -612,13 +613,14 @@ class PersonaStateEngine:
         if self.mode != "llm" or not self.client:
             return None, "", "persona LLM is not configured"
         try:
-            response = await self.client.chat.completions.create(
+            response = await create_chat_completion(
+                self.client,
                 model=self.model,
                 messages=[
                     {"role": "system", "content": self._post_reply_evaluation_prompt()},
                     {
                         "role": "user",
-                        "content": json.dumps(
+                        "content": dumps_llm_payload(
                             {
                                 "current_state": self._snapshot(global_state, session_state, self.fallback_guidance),
                                 "latest_user_message": user_message[:2000],

@@ -28,7 +28,14 @@ from typing import Optional
 import jieba
 from rapidfuzz import fuzz
 
-from utils import LOCAL_TZ, bucket_text_for_embedding, count_tokens_approx, now_iso, strip_affect_anchor
+from utils import (
+    LOCAL_TZ,
+    bucket_text_for_embedding,
+    count_tokens_approx,
+    create_chat_completion,
+    now_iso,
+    strip_affect_anchor,
+)
 
 logger = logging.getLogger("ombre_brain.import")
 
@@ -1483,7 +1490,8 @@ class ImportEngine:
         user_content = chunk_content
         if self.extract_max_input_chars > 0:
             user_content = chunk_content[: self.extract_max_input_chars]
-        response = await self.dehydrator.client.chat.completions.create(
+        response = await create_chat_completion(
+            self.dehydrator.client,
             model=self.dehydrator.model,
             messages=[
                 {"role": "system", "content": IMPORT_EXTRACT_PROMPT},

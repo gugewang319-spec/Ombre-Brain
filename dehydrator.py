@@ -36,7 +36,7 @@ from openai import AsyncOpenAI
 from identity import generic_identity_names, identity_names, render_identity_template
 from memory_layers import normalize_write_classification
 from memory_metadata import domain_prompt_options_text, normalize_domain_key
-from utils import count_tokens_approx
+from utils import count_tokens_approx, create_chat_completion
 
 logger = logging.getLogger("ombre_brain.dehydrator")
 
@@ -434,7 +434,8 @@ class Dehydrator:
         Call LLM API for intelligent dehydration (via OpenAI-compatible client).
         调用 LLM API 执行智能脱水。
         """
-        response = await self.client.chat.completions.create(
+        response = await create_chat_completion(
+            self.client,
             model=self.model,
             messages=[
                 {"role": "system", "content": DEHYDRATE_PROMPT},
@@ -451,7 +452,8 @@ class Dehydrator:
 
     async def _api_direct_bucket_capsule(self, content: str) -> str:
         """Call LLM API for direct-recall whole-bucket capsule compression."""
-        response = await self.client.chat.completions.create(
+        response = await create_chat_completion(
+            self.client,
             model=self.model,
             messages=[
                 {"role": "system", "content": DIRECT_BUCKET_CAPSULE_PROMPT},
@@ -476,7 +478,8 @@ class Dehydrator:
         调用 LLM API 执行智能合并。
         """
         user_msg = f"旧记忆：\n{old_content[:2000]}\n\n新内容：\n{new_content[:2000]}"
-        response = await self.client.chat.completions.create(
+        response = await create_chat_completion(
+            self.client,
             model=self.model,
             messages=[
                 {"role": "system", "content": render_identity_template(MERGE_PROMPT_TEMPLATE, self.identity)},
@@ -570,7 +573,8 @@ class Dehydrator:
         Call LLM API for content analysis / tagging.
         调用 LLM API 执行内容分析打标。
         """
-        response = await self.client.chat.completions.create(
+        response = await create_chat_completion(
+            self.client,
             model=self.model,
             messages=[
                 {"role": "system", "content": ANALYZE_PROMPT},
@@ -673,7 +677,8 @@ class Dehydrator:
             logger.warning("Generate moment skipped: dehydration API unavailable / 生成 moment 跳过：脱水 API 不可用")
             return ""
         try:
-            response = await self.client.chat.completions.create(
+            response = await create_chat_completion(
+                self.client,
                 model=self.model,
                 messages=[
                     {"role": "system", "content": (
@@ -733,7 +738,8 @@ class Dehydrator:
         Call LLM API for diary organization.
         调用 LLM API 执行日记整理。
         """
-        response = await self.client.chat.completions.create(
+        response = await create_chat_completion(
+            self.client,
             model=self.model,
             messages=[
                 {"role": "system", "content": _render_dehydrator_template(DIGEST_PROMPT_TEMPLATE, self.identity)},

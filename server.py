@@ -135,6 +135,8 @@ from utils import (
     bucket_content_for_recall,
     bucket_text_for_embedding,
     count_tokens_approx,
+    create_chat_completion,
+    dumps_llm_payload,
     LOCAL_TZ,
     local_date_key,
     load_config,
@@ -2793,11 +2795,12 @@ async def _call_profile_fact_proposal_model(
         "content": content[:5000],
         "max_proposals": max(1, min(3, int(max_proposals))),
     }
-    response = await dehydrator.client.chat.completions.create(
+    response = await create_chat_completion(
+        dehydrator.client,
         model=dehydrator.model,
         messages=[
             {"role": "system", "content": prompt},
-            {"role": "user", "content": _json_lib.dumps(evidence_payload, ensure_ascii=False)},
+            {"role": "user", "content": dumps_llm_payload(evidence_payload, ensure_ascii=False)},
         ],
         **dehydrator._completion_options(max_tokens=900, temperature=0.0),
     )
@@ -2945,11 +2948,12 @@ async def _call_anchor_proposal_model(
         "last_active": meta.get("last_active", ""),
         "content": strip_wikilinks(bucket.get("content", ""))[:5000],
     }
-    response = await dehydrator.client.chat.completions.create(
+    response = await create_chat_completion(
+        dehydrator.client,
         model=dehydrator.model,
         messages=[
             {"role": "system", "content": prompt},
-            {"role": "user", "content": _json_lib.dumps(evidence_payload, ensure_ascii=False)},
+            {"role": "user", "content": dumps_llm_payload(evidence_payload, ensure_ascii=False)},
         ],
         **dehydrator._completion_options(max_tokens=500, temperature=0.0),
     )

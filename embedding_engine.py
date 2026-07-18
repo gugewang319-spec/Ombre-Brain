@@ -21,6 +21,8 @@ from pathlib import Path
 
 from openai import AsyncOpenAI
 
+from utils import create_embedding
+
 logger = logging.getLogger("ombre_brain.embedding")
 
 
@@ -109,7 +111,8 @@ class EmbeddingEngine:
         prepared = self._prepare_embedding_input(text, kind=kind)
         truncated = prepared[: self.max_chars]
         try:
-            response = await self.client.embeddings.create(
+            response = await create_embedding(
+                self.client,
                 model=self.model,
                 input=truncated,
             )
