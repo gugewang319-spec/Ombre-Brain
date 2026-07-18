@@ -319,3 +319,71 @@ upstream 经常修改该文件。同步时必须逐字段合并，确认：
 - 完成全量 pytest、py_compile、Shell 语法检查和 `git diff --check` 后，才可进入生产合入审查。
 
 完整同步和部署验证流程见 `docs/upstream-sync-sop.md`。
+
+## 2026-07-18 维护记录
+
+- 当前生产头：`83a85b8ba798fd36c63f13f1ad49e8076e811c2b`
+- 当前文档目标头：由本次维护记录提交产生，以文档分支 HEAD 为准
+
+### 1. 分离生产分支
+
+- Zeabur 使用 `zeabur` 作为生产部署分支。
+- `main` 保持不动。
+- 后续生产更新只通过 fast-forward-only 推进，不产生额外 merge commit。
+
+### 2. 同步 upstream
+
+- `upstream/main` 基线为 `bbd6500de639f64fef6d63b705d2509d937b0a16`。
+- `zeabur` 完整包含当前 upstream。
+- 当前 behind 为 0。
+
+### 3. 配置持久化
+
+- 持久配置路径为 `OMBRE_CONFIG_PATH=/data/state/config.yaml`。
+- `/data/state` 与 `/data/buckets` 使用持久卷。
+- API Key、Token 和密码继续通过 Zeabur 环境变量提供，不写入仓库文档或配置样例。
+
+### 4. DeepSeek V4 结构化任务兼容
+
+- Persona 使用 JSON mode，并按模型和显式配置决定 thinking 参数。
+- Dehydrator 只对协议要求严格 JSON 的任务启用 JSON mode。
+- Reflection 的六类 JSON 任务均纳入结构化请求：分类、反思、每日聊天窗口摘要、每日活动摘要、每日聊天记忆候选和日记记忆候选。
+- DeepSeek V4 未显式配置时默认 `thinking.type=disabled`。
+- 显式 `thinking_mode` 优先于自动默认。
+- Dedicated daily 的非 DeepSeek 模型（如 Qwen）保留 `enable_thinking=False`。
+- `thinking` 与 `enable_thinking` 始终互斥。
+
+### 5. Unicode 安全
+
+- API `JSONResponse` 使用统一安全序列化边界。
+- ChatCompletion、Embedding、Rerank 和 raw HTTP 模型 payload 在序列化前统一 sanitize。
+- 非法 Unicode surrogate 使用 replacement 替换；正常 Unicode、数字、布尔值、`None` 和数据结构保持不变。
+
+### 6. Bucket 时间兼容
+
+- 已覆盖 Reflection enrichment backfill、memory-edge backfill、entity-edge backfill、Reflection 候选排序和 `/api/import/results`。
+- `datetime`、ISO string、带时区字符串、空值和非法值统一转换为稳定可比较的排序键。
+- 本轮修复没有批量改写生产 bucket，也没有修改 memory schema。
+
+### 7. Reflection Provider 配置错配
+
+- 生产 Reflection 模型为 `reflection.model=deepseek-v4-flash`。
+- `reflection.base_url` 为空时曾错误回退到 SiliconFlow embedding provider，造成 model 与 Provider 不匹配。
+- 通过 `OMBRE_REFLECTION_MODEL`、`OMBRE_REFLECTION_BASE_URL`、`OMBRE_REFLECTION_API_KEY` 将 model、base URL 和凭据固定到同一 Provider。
+- Reflection scheduler 在服务重启后读取并使用上述配置。
+
+### 8. Keepalive 告警验证
+
+- 容器内验证目标为 `http://127.0.0.1:8000/health`，对应 Brain 自身的健康端点。
+- 五次验证均返回 HTTP 200，耗时约 0.006–0.024 秒。
+- 基于这五次样本，告警判断为部署启动阶段的偶发毛刺；未发现持续性健康端点故障。
+- 当前无需修改 keepalive 代码。
+
+### 9. 测试和维护流程
+
+- 当前记录的最高全量测试结果为 `55 passed`。
+- 已建立 `docs/fork-maintenance.md`。
+- 已建立 `docs/upstream-sync-sop.md`。
+- 高风险文件禁止整文件选择 ours 或 theirs。
+- 保留能力和测试，不执着保留具体实现。
+- 当前 fork 健康等级为 B（健康，但核心补丁分散度偏高）。
