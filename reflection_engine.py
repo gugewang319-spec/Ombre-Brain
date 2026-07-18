@@ -1135,17 +1135,18 @@ class ReflectionEngine:
             "new_memory": self._memory_payload(bucket, content_limit=1200),
             "candidate_memories": [self._memory_payload(item, content_limit=360) for item in candidates],
         }
-        response = await create_chat_completion(
+        response = await self._create_structured_completion(
             self.client,
+            task="memory_enrichment",
             model=self.model,
             messages=[
                 {"role": "system", "content": CLASSIFY_PROMPT},
                 {"role": "user", "content": dumps_llm_payload(payload, ensure_ascii=False)},
             ],
-            **self._completion_options(max_tokens=self.max_tokens, temperature=self.temperature),
+            max_tokens=self.max_tokens,
+            temperature=self.temperature,
         )
-        raw = response.choices[0].message.content if response.choices else ""
-        parsed = self._parse_json_object(raw or "")
+        parsed = self._parse_structured_completion(response, task="memory_enrichment")
         return parsed or self._heuristic_classify(bucket)
 
     def _edges_from_classification(
@@ -1389,25 +1390,23 @@ class ReflectionEngine:
         return list(deduped.values())
 
     async def _api_reflect(self, period: str, key: str, materials: dict) -> dict:
-        client, model, use_dehydration = self._reflect_model_client()
+        client, model, _use_dehydration = self._reflect_model_client()
         if not client or not model:
             return self._fallback_reflection(period, key, materials)
         payload = {"period": period, "date": key, **materials}
-        response = await create_chat_completion(
+        task = f"reflection_{period}"
+        response = await self._create_structured_completion(
             client,
+            task=task,
             model=model,
             messages=[
                 {"role": "system", "content": self._reflect_prompt()},
                 {"role": "user", "content": dumps_llm_payload(payload, ensure_ascii=False)},
             ],
-            **self._completion_options(
-                max_tokens=self.max_tokens,
-                temperature=self.temperature,
-                thinking_mode="" if use_dehydration else None,
-            ),
+            max_tokens=self.max_tokens,
+            temperature=self.temperature,
         )
-        raw = response.choices[0].message.content if response.choices else ""
-        return self._parse_json_object(raw or "") or self._fallback_reflection(period, key, materials)
+        return self._parse_structured_completion(response, task=task) or self._fallback_reflection(period, key, materials)
 
     async def _reflection_materials(
         self,
@@ -1680,7 +1679,7 @@ class ReflectionEngine:
     ) -> list[dict]:
         if not self.daily_chat_memory_summary_enabled:
             return []
-        client, model, use_daily_client = self._daily_chat_memory_model_client(candidate=False)
+        client, model, _use_daily_client = self._daily_chat_memory_model_client(candidate=False)
         if not client:
             return []
         windows = self._daily_chat_memory_windows(turns)
@@ -1709,6 +1708,7 @@ class ReflectionEngine:
             try:
                 response = await self._daily_chat_memory_create_completion(
                     client,
+                    task="daily_chat_memory_summary",
                     model=model,
                     messages=[
                         {"role": "system", "content": self._daily_chat_memory_summary_prompt()},
@@ -1716,10 +1716,8 @@ class ReflectionEngine:
                     ],
                     max_tokens=self.daily_chat_memory_summary_max_tokens,
                     temperature=self.temperature,
-                    use_daily_client=use_daily_client,
                 )
-                raw = self._completion_content(response)
-                parsed = self._parse_json_object(raw or "")
+                parsed = self._parse_structured_completion(response, task="daily_chat_memory_summary")
             except Exception as exc:
                 logger.warning("Daily chat memory summary failed, window=%s: %s", index + 1, exc)
                 continue
@@ -2138,6 +2136,7 @@ class ReflectionEngine:
         try:
             response = await self._daily_chat_memory_create_completion(
                 client,
+                task="daily_activity_summary",
                 model=model,
                 messages=[
                     {"role": "system", "content": self._daily_activity_summary_prompt()},
@@ -2145,9 +2144,8 @@ class ReflectionEngine:
                 ],
                 max_tokens=self.daily_activity_summary_max_tokens,
                 temperature=self.temperature,
-                use_daily_client=use_daily_client,
             )
-            parsed = self._parse_json_object(self._completion_content(response) or "")
+            parsed = self._parse_structured_completion(response, task="daily_activity_summary")
         except Exception as exc:
             logger.warning("Daily activity summary model failed: %s", exc)
             return {}
@@ -2594,7 +2592,7 @@ class ReflectionEngine:
         window_summaries: list[dict] | None = None,
         max_candidates: int | None = None,
     ) -> list[dict]:
-        client, model, use_daily_client = self._daily_chat_memory_model_client(candidate=True)
+        client, model, _use_daily_client = self._daily_chat_memory_model_client(candidate=True)
         if client:
             summaries = window_summaries or []
             payload = {
@@ -2612,6 +2610,7 @@ class ReflectionEngine:
             try:
                 response = await self._daily_chat_memory_create_completion(
                     client,
+                    task="daily_chat_memory_candidates",
                     model=model,
                     messages=[
                         {
@@ -2622,10 +2621,8 @@ class ReflectionEngine:
                     ],
                     max_tokens=self.daily_chat_memory_candidate_max_tokens,
                     temperature=self.temperature,
-                    use_daily_client=use_daily_client,
                 )
-                raw = self._completion_content(response)
-                parsed = self._parse_json_object(raw or "")
+                parsed = self._parse_structured_completion(response, task="daily_chat_memory_candidates")
                 candidates = parsed.get("candidates") if isinstance(parsed, dict) else []
                 if isinstance(candidates, list):
                     return [item for item in candidates if isinstance(item, dict)]
@@ -3715,17 +3712,18 @@ class ReflectionEngine:
                 },
             }
             try:
-                response = await create_chat_completion(
+                response = await self._create_structured_completion(
                     self.client,
+                    task="diary_memory_candidate",
                     model=self.model,
                     messages=[
                         {"role": "system", "content": self._diary_memory_prompt()},
                         {"role": "user", "content": dumps_llm_payload(payload, ensure_ascii=False)},
                     ],
-                    **self._completion_options(max_tokens=min(self.max_tokens, 520), temperature=self.temperature),
+                    max_tokens=min(self.max_tokens, 520),
+                    temperature=self.temperature,
                 )
-                raw = response.choices[0].message.content if response.choices else ""
-                parsed = self._parse_json_object(raw or "")
+                parsed = self._parse_structured_completion(response, task="diary_memory_candidate")
                 if parsed:
                     return parsed
             except Exception as exc:
@@ -4382,73 +4380,118 @@ class ReflectionEngine:
     def _completion_options(
         self,
         *,
+        model: str,
         max_tokens: int,
         temperature: float,
-        thinking_mode: str | None = None,
     ) -> dict[str, Any]:
-        options: dict[str, Any] = {"max_tokens": max_tokens, "temperature": temperature}
-        mode = self.thinking_mode if thinking_mode is None else thinking_mode
+        options: dict[str, Any] = {
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "response_format": {"type": "json_object"},
+        }
+        mode = self._effective_thinking_mode(model)
         if mode:
             options["extra_body"] = {"thinking": {"type": mode}}
         return options
 
-    def _daily_chat_memory_completion_options(
-        self,
-        *,
-        max_tokens: int,
-        temperature: float,
-    ) -> dict[str, Any]:
-        return {
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            "extra_body": {"enable_thinking": False},
-        }
-
-    @staticmethod
-    def _completion_content(response: Any) -> str:
-        try:
-            return str(response.choices[0].message.content or "") if response.choices else ""
-        except (AttributeError, IndexError, TypeError):
+    def _effective_thinking_mode(self, model: str) -> str:
+        if not str(model or "").strip().lower().startswith("deepseek-v4-"):
             return ""
+        if self.thinking_mode:
+            return self.thinking_mode
+        return "disabled"
 
     async def _daily_chat_memory_create_completion(
         self,
         client: Any,
         *,
+        task: str,
         model: str,
         messages: list[dict[str, str]],
         max_tokens: int,
         temperature: float,
-        use_daily_client: bool,
     ) -> Any:
-        if use_daily_client:
-            completion_options = self._daily_chat_memory_completion_options(
-                max_tokens=max_tokens,
-                temperature=temperature,
-            )
-        else:
-            completion_options = self._completion_options(
-                max_tokens=max_tokens,
-                temperature=temperature,
-                thinking_mode="",
-            )
-        return await create_chat_completion(
+        return await self._create_structured_completion(
             client,
+            task=task,
             model=model,
             messages=messages,
-            **completion_options,
+            max_tokens=max_tokens,
+            temperature=temperature,
         )
 
-    def _parse_json_object(self, raw: str) -> dict:
+    async def _create_structured_completion(
+        self,
+        client: Any,
+        *,
+        task: str,
+        model: str,
+        messages: list[dict[str, str]],
+        max_tokens: int,
+        temperature: float,
+    ) -> Any:
+        try:
+            return await create_chat_completion(
+                client,
+                model=model,
+                messages=messages,
+                **self._completion_options(
+                    model=model,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                ),
+            )
+        except Exception as exc:
+            error_type = type(exc).__name__
+            logger.warning("Reflection API call failed | task=%s error_type=%s", task, error_type)
+            raise RuntimeError(f"Reflection API call failed: {error_type}") from None
+
+    def _parse_structured_completion(self, response: Any, *, task: str) -> dict:
+        try:
+            choice = response.choices[0] if response.choices else None
+        except (AttributeError, IndexError, TypeError):
+            choice = None
+        finish_reason = str(getattr(choice, "finish_reason", "") or "") if choice else ""
+        raw = str(getattr(getattr(choice, "message", None), "content", "") or "") if choice else ""
+        if finish_reason == "length":
+            logger.warning(
+                "Reflection response truncated | task=%s finish_reason=length content_chars=%s",
+                task,
+                len(raw),
+            )
+            return {}
+        if not raw.strip():
+            logger.warning(
+                "Reflection returned empty content | task=%s finish_reason=%s",
+                task,
+                finish_reason or "unknown",
+            )
+            return {}
+        return self._parse_json_object(raw, task=task, finish_reason=finish_reason)
+
+    def _parse_json_object(self, raw: str, *, task: str, finish_reason: str = "") -> dict:
         try:
             cleaned = raw.strip()
             if cleaned.startswith("```"):
                 cleaned = cleaned.split("\n", 1)[-1].rsplit("```", 1)[0]
             parsed = json.loads(cleaned)
         except (json.JSONDecodeError, IndexError, ValueError):
-            logger.warning("Reflection JSON parse failed: %s", raw[:200])
+            logger.warning(
+                "Reflection returned malformed JSON | task=%s finish_reason=%s content_chars=%s",
+                task,
+                finish_reason or "unknown",
+                len(raw),
+            )
             return {}
-        return parsed if isinstance(parsed, dict) else {}
+        if not isinstance(parsed, dict):
+            logger.warning(
+                "Reflection returned malformed JSON object | task=%s finish_reason=%s content_chars=%s",
+                task,
+                finish_reason or "unknown",
+                len(raw),
+            )
+            return {}
+        return parsed
 
     @staticmethod
     def _string_list(value: Any, limit: int) -> list[str]:
