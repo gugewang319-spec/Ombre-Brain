@@ -13238,7 +13238,10 @@ async def api_import_results(request):
         limit = int(request.query_params.get("limit", "50"))
         all_buckets = await bucket_mgr.list_all(include_archive=False)
         # Sort by created time, newest first
-        all_buckets.sort(key=lambda b: b["metadata"].get("created", ""), reverse=True)
+        all_buckets.sort(
+            key=lambda b: bucket_mgr._parse_iso_datetime(b["metadata"].get("created")) or datetime.min,
+            reverse=True,
+        )
         results = []
         for b in all_buckets[:limit]:
             results.append({
