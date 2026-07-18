@@ -1,4 +1,5 @@
 import logging
+from logging.handlers import RotatingFileHandler
 import hashlib
 import os
 import re
@@ -7,6 +8,7 @@ import json
 import codecs
 import time
 import asyncio
+import threading
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from dataclasses import replace
@@ -123,6 +125,153 @@ from utils import (
 from word_map import WordMapStore
 
 logger = logging.getLogger("ombre_brain.gateway")
+_SSE_DIAGNOSTICS_LOG_NAME = "sse-stream-diagnostics.log"
+_SSE_DIAGNOSTICS_MAX_BYTES = 2 * 1024 * 1024
+_SSE_DIAGNOSTICS_BACKUP_COUNT = 3
+_sse_diagnostics_file_logger = logging.getLogger("ombre_brain.sse_stream_diagnostics_file")
+_sse_diagnostics_file_handler: RotatingFileHandler | None = None
+_sse_diagnostics_file_disabled = False
+_sse_diagnostics_file_warning_emitted = False
+_sse_diagnostics_file_lock = threading.RLock()
+
+
+def _resolve_sse_diagnostics_log_path() -> str:
+    state_dir = str(os.environ.get("OMBRE_STATE_DIR") or "").strip()
+    if not state_dir:
+        config_path = str(os.environ.get("OMBRE_CONFIG_PATH") or "").strip()
+        if config_path:
+            state_dir = os.path.dirname(os.path.abspath(os.path.expanduser(config_path)))
+    if not state_dir:
+        state_dir = "/data/state"
+    return os.path.join(os.path.abspath(os.path.expanduser(state_dir)), _SSE_DIAGNOSTICS_LOG_NAME)
+
+
+def _redact_sse_diagnostics_text(value: Any, max_length: int = 600) -> str:
+    detail = sanitize_unicode("" if value is None else str(value))
+    detail = detail.replace("\r", " ").replace("\n", " ").replace("\t", " ")
+    detail = re.sub(
+        r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+",
+        r"\1<redacted>",
+        detail,
+    )
+    detail = re.sub(
+        r"(?i)((?:api[_-]?key|token|authorization)\s*[:=]\s*)"
+        r"(?:'[^']*'|\"[^\"]*\"|[^\s,;)\]]+)",
+        r"\1<redacted>",
+        detail,
+    )
+    if len(detail) > max_length:
+        return f"{detail[: max_length - 3]}..."
+    return detail
+
+
+def _disable_sse_diagnostics_file_logging(exc: BaseException) -> None:
+    global _sse_diagnostics_file_disabled, _sse_diagnostics_file_warning_emitted
+    with _sse_diagnostics_file_lock:
+        _sse_diagnostics_file_disabled = True
+        if _sse_diagnostics_file_warning_emitted:
+            return
+        _sse_diagnostics_file_warning_emitted = True
+    try:
+        logger.warning(
+            "SSE diagnostics file logging disabled after failure | error_type=%s error=%s",
+            type(exc).__name__,
+            _redact_sse_diagnostics_text(repr(exc), max_length=240),
+        )
+    except Exception:
+        pass
+
+
+class _BestEffortRotatingFileHandler(RotatingFileHandler):
+    def handleError(self, record: logging.LogRecord) -> None:
+        _disable_sse_diagnostics_file_logging(
+            RuntimeError("RotatingFileHandler emit failed")
+        )
+
+
+def _get_sse_diagnostics_file_logger() -> logging.Logger | None:
+    global _sse_diagnostics_file_handler
+    if _sse_diagnostics_file_disabled:
+        return None
+    if _sse_diagnostics_file_handler is not None:
+        return _sse_diagnostics_file_logger
+    with _sse_diagnostics_file_lock:
+        if _sse_diagnostics_file_disabled:
+            return None
+        if _sse_diagnostics_file_handler is not None:
+            return _sse_diagnostics_file_logger
+        handler: RotatingFileHandler | None = None
+        try:
+            log_path = _resolve_sse_diagnostics_log_path()
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+            handler = _BestEffortRotatingFileHandler(
+                log_path,
+                mode="a",
+                maxBytes=_SSE_DIAGNOSTICS_MAX_BYTES,
+                backupCount=_SSE_DIAGNOSTICS_BACKUP_COUNT,
+                encoding="utf-8",
+            )
+            formatter = logging.Formatter(
+                "%(asctime)sZ %(levelname)s %(message)s",
+                datefmt="%Y-%m-%dT%H:%M:%S",
+            )
+            formatter.converter = time.gmtime
+            handler.setFormatter(formatter)
+            handler.setLevel(logging.INFO)
+            _sse_diagnostics_file_logger.setLevel(logging.INFO)
+            _sse_diagnostics_file_logger.propagate = False
+            _sse_diagnostics_file_logger.addHandler(handler)
+            _sse_diagnostics_file_handler = handler
+        except Exception as exc:
+            if handler is not None:
+                try:
+                    handler.close()
+                except Exception:
+                    pass
+            _disable_sse_diagnostics_file_logging(exc)
+            return None
+    return _sse_diagnostics_file_logger
+
+
+def _write_sse_diagnostics_file_event(
+    *,
+    level: int,
+    message: str,
+    event: str,
+    stream_id: str,
+    session_id: str,
+    model: str,
+    stage: str,
+    exception_type: str = "-",
+    chunk_count: int = 0,
+    total_bytes: int = 0,
+    elapsed_ms: int = 0,
+    details: dict[str, Any] | None = None,
+) -> None:
+    try:
+        file_logger = _get_sse_diagnostics_file_logger()
+        if file_logger is None:
+            return
+        fields = [
+            f"stream_id={_redact_sse_diagnostics_text(stream_id, 80)}",
+            f"session={_redact_sse_diagnostics_text(session_id, 160)}",
+            f"model={_redact_sse_diagnostics_text(model, 160)}",
+            f"event={_redact_sse_diagnostics_text(event, 40)}",
+            f"stage={_redact_sse_diagnostics_text(stage, 40)}",
+            f"exception_type={_redact_sse_diagnostics_text(exception_type, 80)}",
+            f"chunk_count={int(chunk_count)}",
+            f"total_bytes={int(total_bytes)}",
+            f"elapsed_ms={int(elapsed_ms)}",
+        ]
+        for key, value in (details or {}).items():
+            fields.append(
+                f"{_redact_sse_diagnostics_text(key, 40)}="
+                f"{_redact_sse_diagnostics_text(value, 240)}"
+            )
+        file_logger.log(level, "%s | %s", message, " ".join(fields))
+    except Exception as exc:
+        _disable_sse_diagnostics_file_logging(exc)
+
 GENERIC_LEXICAL_STOPWORD_KEYS = frozenset(
     re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", str(term or "").strip().lower())
     for term in GENERIC_LEXICAL_STOPWORDS
@@ -3662,18 +3811,7 @@ class GatewayService:
 
     @staticmethod
     def _sse_stream_exception_repr(exc: BaseException) -> str:
-        detail = repr(exc)
-        detail = re.sub(
-            r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+",
-            r"\1<redacted>",
-            detail,
-        )
-        return re.sub(
-            r"(?i)((?:api[_-]?key|token|authorization)\s*[:=]\s*)"
-            r"(?:'[^']*'|\"[^\"]*\"|[^\s,;)\]]+)",
-            r"\1<redacted>",
-            detail,
-        )
+        return _redact_sse_diagnostics_text(repr(exc))
 
     def _log_sse_stream_started(
         self,
@@ -3685,6 +3823,7 @@ class GatewayService:
         message_count: int,
         started_at: float,
     ) -> None:
+        elapsed_ms = self._sse_stream_elapsed_ms(started_at)
         logger.info(
             "Gateway SSE stream started | stream_id=%s session=%s model=%s "
             "upstream_status=%s message_count=%s elapsed_ms=%s",
@@ -3693,7 +3832,68 @@ class GatewayService:
             model,
             upstream_status,
             message_count,
-            self._sse_stream_elapsed_ms(started_at),
+            elapsed_ms,
+        )
+        _write_sse_diagnostics_file_event(
+            level=logging.INFO,
+            message="Gateway SSE stream started",
+            event="started",
+            stream_id=stream_id,
+            session_id=session_id,
+            model=model,
+            stage="started",
+            elapsed_ms=elapsed_ms,
+            details={
+                "upstream_status": upstream_status,
+                "message_count": message_count,
+            },
+        )
+
+    def _log_sse_stream_first_chunk(
+        self,
+        *,
+        stream_id: str,
+        session_id: str,
+        route: str,
+        upstream_name: Any,
+        model: str,
+        upstream_model: Any,
+        upstream_status: int,
+        upstream_headers_ms: int,
+        first_chunk_elapsed_ms: int,
+        header_to_first_chunk_ms: int,
+        chunk_bytes: int,
+        chunk_count: int,
+        total_bytes: int,
+    ) -> None:
+        logger.info(
+            "Gateway stream first chunk | stream_id=%s session=%s route=%s upstream=%s "
+            "model=%s upstream_model=%s status=%s header_ms=%s "
+            "first_chunk_elapsed_ms=%s header_to_first_chunk_ms=%s chunk_bytes=%s",
+            stream_id,
+            session_id,
+            route,
+            upstream_name,
+            model,
+            upstream_model,
+            upstream_status,
+            upstream_headers_ms,
+            first_chunk_elapsed_ms,
+            header_to_first_chunk_ms,
+            chunk_bytes,
+        )
+        _write_sse_diagnostics_file_event(
+            level=logging.INFO,
+            message="Gateway stream first chunk",
+            event="first_chunk",
+            stream_id=stream_id,
+            session_id=session_id,
+            model=model,
+            stage="upstream_read",
+            chunk_count=chunk_count,
+            total_bytes=total_bytes,
+            elapsed_ms=first_chunk_elapsed_ms,
+            details={"chunk_bytes": chunk_bytes},
         )
 
     def _log_sse_stream_completed(
@@ -3709,6 +3909,7 @@ class GatewayService:
         finalize_attempted: bool,
         finalize_completed: bool,
     ) -> None:
+        elapsed_ms = self._sse_stream_elapsed_ms(started_at)
         logger.info(
             "Gateway SSE stream completed | stream_id=%s session=%s model=%s "
             "chunk_count=%s total_bytes=%s total_elapsed_ms=%s seen_done=%s "
@@ -3718,10 +3919,27 @@ class GatewayService:
             model,
             chunk_count,
             total_bytes,
-            self._sse_stream_elapsed_ms(started_at),
+            elapsed_ms,
             seen_done,
             finalize_attempted,
             finalize_completed,
+        )
+        _write_sse_diagnostics_file_event(
+            level=logging.INFO,
+            message="Gateway SSE stream completed",
+            event="completed",
+            stream_id=stream_id,
+            session_id=session_id,
+            model=model,
+            stage="completed",
+            chunk_count=chunk_count,
+            total_bytes=total_bytes,
+            elapsed_ms=elapsed_ms,
+            details={
+                "seen_done": seen_done,
+                "finalize_attempted": finalize_attempted,
+                "finalize_completed": finalize_completed,
+            },
         )
 
     def _log_sse_stream_exception(
@@ -3737,6 +3955,7 @@ class GatewayService:
         started_at: float,
     ) -> None:
         safe_exception_repr = self._sse_stream_exception_repr(exc)
+        elapsed_ms = self._sse_stream_elapsed_ms(started_at)
         safe_exception = RuntimeError(
             f"redacted {type(exc).__name__}: {safe_exception_repr}"
         )
@@ -3751,8 +3970,22 @@ class GatewayService:
             safe_exception_repr,
             chunk_count,
             total_bytes,
-            self._sse_stream_elapsed_ms(started_at),
+            elapsed_ms,
             exc_info=(type(safe_exception), safe_exception, exc.__traceback__),
+        )
+        _write_sse_diagnostics_file_event(
+            level=logging.ERROR,
+            message="Gateway SSE stream failed",
+            event="failed",
+            stream_id=stream_id,
+            session_id=session_id,
+            model=model,
+            stage=stage,
+            exception_type=type(exc).__name__,
+            chunk_count=chunk_count,
+            total_bytes=total_bytes,
+            elapsed_ms=elapsed_ms,
+            details={"exception_repr": safe_exception_repr},
         )
 
     async def _close_sse_upstream_response(
@@ -3894,21 +4127,20 @@ class GatewayService:
                             now = time.perf_counter()
                             first_chunk_ms = max(0, int((now - stream_started_at) * 1000))
                             header_to_first_chunk_ms = max(0, int((now - body_started_at) * 1000))
-                            logger.info(
-                                "Gateway stream first chunk | stream_id=%s session=%s route=%s upstream=%s "
-                                "model=%s upstream_model=%s status=%s header_ms=%s "
-                                "first_chunk_elapsed_ms=%s header_to_first_chunk_ms=%s chunk_bytes=%s",
-                                stream_id,
-                                session_id,
-                                "/v1/chat/completions",
-                                upstream.get("name"),
-                                model,
-                                route["upstream_model"],
-                                upstream_response.status_code,
-                                upstream_headers_ms,
-                                first_chunk_ms,
-                                header_to_first_chunk_ms,
-                                len(chunk),
+                            self._log_sse_stream_first_chunk(
+                                stream_id=stream_id,
+                                session_id=session_id,
+                                route="/v1/chat/completions",
+                                upstream_name=upstream.get("name"),
+                                model=model,
+                                upstream_model=route["upstream_model"],
+                                upstream_status=upstream_response.status_code,
+                                upstream_headers_ms=upstream_headers_ms,
+                                first_chunk_elapsed_ms=first_chunk_ms,
+                                header_to_first_chunk_ms=header_to_first_chunk_ms,
+                                chunk_bytes=len(chunk),
+                                chunk_count=chunk_count,
+                                total_bytes=byte_count,
                             )
                         stage = "capture"
                         self._consume_stream_capture_chunk(stream_state, chunk)
@@ -6357,21 +6589,20 @@ class GatewayService:
                         now = time.perf_counter()
                         first_chunk_ms = max(0, int((now - stream_started_at) * 1000))
                         header_to_first_chunk_ms = max(0, int((now - body_started_at) * 1000))
-                        logger.info(
-                            "Gateway stream first chunk | stream_id=%s session=%s route=%s upstream=%s "
-                            "model=%s upstream_model=%s status=%s header_ms=%s "
-                            "first_chunk_elapsed_ms=%s header_to_first_chunk_ms=%s chunk_bytes=%s",
-                            stream_id,
-                            session_id,
-                            "/v1/messages",
-                            upstream.get("name"),
-                            model,
-                            route["upstream_model"],
-                            upstream_response.status_code,
-                            upstream_headers_ms,
-                            first_chunk_ms,
-                            header_to_first_chunk_ms,
-                            len(chunk),
+                        self._log_sse_stream_first_chunk(
+                            stream_id=stream_id,
+                            session_id=session_id,
+                            route="/v1/messages",
+                            upstream_name=upstream.get("name"),
+                            model=model,
+                            upstream_model=route["upstream_model"],
+                            upstream_status=upstream_response.status_code,
+                            upstream_headers_ms=upstream_headers_ms,
+                            first_chunk_elapsed_ms=first_chunk_ms,
+                            header_to_first_chunk_ms=header_to_first_chunk_ms,
+                            chunk_bytes=len(chunk),
+                            chunk_count=chunk_count,
+                            total_bytes=byte_count,
                         )
                     stage = "capture"
                     self._consume_stream_capture_chunk(stream_state, chunk)
@@ -6787,21 +7018,20 @@ class GatewayService:
                         now = time.perf_counter()
                         first_chunk_ms = max(0, int((now - stream_started_at) * 1000))
                         header_to_first_chunk_ms = max(0, int((now - body_started_at) * 1000))
-                        logger.info(
-                            "Gateway stream first chunk | stream_id=%s session=%s route=%s upstream=%s "
-                            "model=%s upstream_model=%s status=%s header_ms=%s "
-                            "first_chunk_elapsed_ms=%s header_to_first_chunk_ms=%s chunk_bytes=%s",
-                            stream_id,
-                            session_id,
-                            "/v1/chat/completions",
-                            upstream.get("name"),
-                            model,
-                            route["upstream_model"],
-                            upstream_response.status_code,
-                            upstream_headers_ms,
-                            first_chunk_ms,
-                            header_to_first_chunk_ms,
-                            len(chunk),
+                        self._log_sse_stream_first_chunk(
+                            stream_id=stream_id,
+                            session_id=session_id,
+                            route="/v1/chat/completions",
+                            upstream_name=upstream.get("name"),
+                            model=model,
+                            upstream_model=route["upstream_model"],
+                            upstream_status=upstream_response.status_code,
+                            upstream_headers_ms=upstream_headers_ms,
+                            first_chunk_elapsed_ms=first_chunk_ms,
+                            header_to_first_chunk_ms=header_to_first_chunk_ms,
+                            chunk_bytes=len(chunk),
+                            chunk_count=chunk_count,
+                            total_bytes=byte_count,
                         )
                     stage = "capture"
                     self._consume_anthropic_stream_capture_chunk(stream_state, chunk)
@@ -7024,21 +7254,20 @@ class GatewayService:
                             now = time.perf_counter()
                             first_chunk_ms = max(0, int((now - stream_started_at) * 1000))
                             header_to_first_chunk_ms = max(0, int((now - body_started_at) * 1000))
-                            logger.info(
-                                "Gateway stream first chunk | stream_id=%s session=%s route=%s upstream=%s "
-                                "model=%s upstream_model=%s status=%s header_ms=%s "
-                                "first_chunk_elapsed_ms=%s header_to_first_chunk_ms=%s chunk_bytes=%s",
-                                stream_id,
-                                session_id,
-                                "/v1/messages",
-                                upstream.get("name"),
-                                model,
-                                route["upstream_model"],
-                                upstream_response.status_code,
-                                upstream_headers_ms,
-                                first_chunk_ms,
-                                header_to_first_chunk_ms,
-                                len(chunk),
+                            self._log_sse_stream_first_chunk(
+                                stream_id=stream_id,
+                                session_id=session_id,
+                                route="/v1/messages",
+                                upstream_name=upstream.get("name"),
+                                model=model,
+                                upstream_model=route["upstream_model"],
+                                upstream_status=upstream_response.status_code,
+                                upstream_headers_ms=upstream_headers_ms,
+                                first_chunk_elapsed_ms=first_chunk_ms,
+                                header_to_first_chunk_ms=header_to_first_chunk_ms,
+                                chunk_bytes=len(chunk),
+                                chunk_count=chunk_count,
+                                total_bytes=byte_count,
                             )
                         stage = "capture"
                         self._consume_anthropic_stream_capture_chunk(stream_state, chunk)

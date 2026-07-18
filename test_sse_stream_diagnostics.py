@@ -1,6 +1,8 @@
 import asyncio
 import logging
+import os
 from datetime import datetime as real_datetime, timezone
+from logging.handlers import RotatingFileHandler
 
 import pytest
 
@@ -19,6 +21,26 @@ ROUTE = {
     "public_model": MODEL,
     "upstream_model": MODEL,
 }
+
+
+def _reset_sse_diagnostics_file_logger():
+    handler = gateway._sse_diagnostics_file_handler
+    if handler is not None:
+        gateway._sse_diagnostics_file_logger.removeHandler(handler)
+        handler.close()
+    gateway._sse_diagnostics_file_handler = None
+    gateway._sse_diagnostics_file_disabled = False
+    gateway._sse_diagnostics_file_warning_emitted = False
+
+
+@pytest.fixture(autouse=True)
+def isolated_sse_file_log(monkeypatch, tmp_path):
+    _reset_sse_diagnostics_file_logger()
+    state_dir = tmp_path / "state"
+    monkeypatch.setenv("OMBRE_STATE_DIR", str(state_dir))
+    monkeypatch.delenv("OMBRE_CONFIG_PATH", raising=False)
+    yield state_dir
+    _reset_sse_diagnostics_file_logger()
 
 
 class FakeUpstreamResponse:
@@ -93,7 +115,11 @@ async def _raw_openai_response(service, payload=None):
     )
 
 
-async def test_raw_openai_stream_bytes_are_unchanged_and_logs_are_private(caplog, monkeypatch):
+async def test_raw_openai_stream_bytes_are_unchanged_and_logs_are_private(
+    caplog,
+    monkeypatch,
+    isolated_sse_file_log,
+):
     chunks = [
         b'data: {"choices":[{"delta":{"content":"PRIVATE_ASSISTANT_BODY"}}]}\n\n',
         b'data: [DONE]\n\n',
@@ -119,6 +145,10 @@ async def test_raw_openai_stream_bytes_are_unchanged_and_logs_are_private(caplog
     )
 
     assert await _collect(response) == b"".join(chunks)
+    file_log = (
+        isolated_sse_file_log / "sse-stream-diagnostics.log"
+    ).read_text(encoding="utf-8")
+    file_lines = file_log.splitlines()
     assert upstream_response.closed is True
     assert len(finalize_calls) == 1
     assert "Gateway SSE stream started" in caplog.text
@@ -131,6 +161,25 @@ async def test_raw_openai_stream_bytes_are_unchanged_and_logs_are_private(caplog
     assert "seen_done=True" in caplog.text
     assert "finalize_attempted=True" in caplog.text
     assert "finalize_completed=True" in caplog.text
+    assert len(file_lines) == 3
+    assert "Gateway SSE stream started" in file_lines[0]
+    assert "Gateway stream first chunk" in file_lines[1]
+    assert "Gateway SSE stream completed" in file_lines[2]
+    for line in file_lines:
+        assert line[:4].isdigit()
+        assert "Z INFO " in line
+        for field in (
+            "stream_id=",
+            "session=",
+            "model=",
+            "event=",
+            "stage=",
+            "exception_type=",
+            "chunk_count=",
+            "total_bytes=",
+            "elapsed_ms=",
+        ):
+            assert field in line
     for private_value in (
         "PRIVATE_MESSAGE_BODY",
         "PRIVATE_ASSISTANT_BODY",
@@ -139,6 +188,105 @@ async def test_raw_openai_stream_bytes_are_unchanged_and_logs_are_private(caplog
         "sk-upstream-private",
     ):
         assert private_value not in caplog.text
+        assert private_value not in file_log
+
+
+def test_sse_file_rotation_configuration(isolated_sse_file_log):
+    service = GatewayService.__new__(GatewayService)
+    service._log_sse_stream_started(
+        stream_id="rotation",
+        session_id=SESSION,
+        model=MODEL,
+        upstream_status=200,
+        message_count=1,
+        started_at=gateway.time.perf_counter(),
+    )
+
+    handler = gateway._sse_diagnostics_file_handler
+    assert isinstance(handler, RotatingFileHandler)
+    assert handler.maxBytes == 2 * 1024 * 1024
+    assert handler.backupCount == 3
+    assert handler.mode == "a"
+    assert handler.encoding.lower().replace("-", "") == "utf8"
+    assert handler.baseFilename == os.path.abspath(
+        isolated_sse_file_log / "sse-stream-diagnostics.log"
+    )
+
+
+def test_sse_file_log_path_resolution_priority(monkeypatch, tmp_path):
+    state_dir = tmp_path / "explicit-state"
+    config_path = tmp_path / "config-state" / "config.yaml"
+    monkeypatch.setenv("OMBRE_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("OMBRE_CONFIG_PATH", str(config_path))
+    assert gateway._resolve_sse_diagnostics_log_path() == os.path.abspath(
+        state_dir / "sse-stream-diagnostics.log"
+    )
+
+    monkeypatch.delenv("OMBRE_STATE_DIR")
+    assert gateway._resolve_sse_diagnostics_log_path() == os.path.abspath(
+        config_path.parent / "sse-stream-diagnostics.log"
+    )
+
+    monkeypatch.delenv("OMBRE_CONFIG_PATH")
+    assert gateway._resolve_sse_diagnostics_log_path() == os.path.abspath(
+        "/data/state/sse-stream-diagnostics.log"
+    )
+
+
+async def test_sse_file_write_failure_warns_once_without_affecting_stream(
+    caplog,
+    monkeypatch,
+):
+    chunks = [b"data: unchanged\n\n", b"data: [DONE]\n\n"]
+    upstream_response = FakeUpstreamResponse(chunks)
+    service, _ = _service(upstream_response)
+    gateway._get_sse_diagnostics_file_logger()
+    handler = gateway._sse_diagnostics_file_handler
+    assert handler is not None
+
+    def fail_write(record):
+        raise OSError("diagnostics disk unavailable")
+
+    monkeypatch.setattr(handler, "shouldRollover", fail_write)
+    caplog.set_level(logging.WARNING, logger="ombre_brain.gateway")
+    response = await _raw_openai_response(service)
+
+    assert await _collect(response) == b"".join(chunks)
+    warnings = [
+        record
+        for record in caplog.records
+        if "SSE diagnostics file logging disabled after failure" in record.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert gateway._sse_diagnostics_file_disabled is True
+    assert upstream_response.closed is True
+
+
+async def test_sse_file_creation_failure_warns_once_without_affecting_stream(
+    caplog,
+    monkeypatch,
+):
+    chunks = [b"data: unchanged\n\n", b"data: [DONE]\n\n"]
+    upstream_response = FakeUpstreamResponse(chunks)
+    service, _ = _service(upstream_response)
+
+    def fail_create(*args, **kwargs):
+        raise PermissionError("diagnostics directory is read-only")
+
+    monkeypatch.setattr(gateway, "_BestEffortRotatingFileHandler", fail_create)
+    caplog.set_level(logging.WARNING, logger="ombre_brain.gateway")
+    response = await _raw_openai_response(service)
+
+    assert await _collect(response) == b"".join(chunks)
+    warnings = [
+        record
+        for record in caplog.records
+        if "SSE diagnostics file logging disabled after failure" in record.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert gateway._sse_diagnostics_file_handler is None
+    assert gateway._sse_diagnostics_file_disabled is True
+    assert upstream_response.closed is True
 
 
 async def test_native_anthropic_stream_bytes_are_unchanged():
@@ -255,7 +403,10 @@ async def test_anthropic_to_openai_stream_output_remains_exact(monkeypatch):
     assert await _collect(response) == expected
 
 
-async def test_upstream_read_exception_is_logged_redacted_and_reraised(caplog):
+async def test_upstream_read_exception_is_logged_redacted_and_reraised(
+    caplog,
+    isolated_sse_file_log,
+):
     first_chunk = b"data: partial\n\n"
     read_error = RuntimeError(
         "api_key=TOPSECRET token=TOKENVALUE Bearer BEARERSECRET"
@@ -278,6 +429,16 @@ async def test_upstream_read_exception_is_logged_redacted_and_reraised(caplog):
     assert "TOPSECRET" not in caplog.text
     assert "TOKENVALUE" not in caplog.text
     assert "BEARERSECRET" not in caplog.text
+    file_log = (
+        isolated_sse_file_log / "sse-stream-diagnostics.log"
+    ).read_text(encoding="utf-8")
+    assert "Gateway SSE stream failed" in file_log
+    assert "event=failed" in file_log
+    assert "stage=upstream_read" in file_log
+    assert "exception_type=RuntimeError" in file_log
+    assert "TOPSECRET" not in file_log
+    assert "TOKENVALUE" not in file_log
+    assert "BEARERSECRET" not in file_log
     assert any(
         record.exc_info is not None
         for record in caplog.records
