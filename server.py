@@ -11782,6 +11782,11 @@ async def api_config_get(request):
             "enabled": bool(getattr(persona_engine, "enabled", persona_cfg.get("enabled", True))),
             "model": getattr(persona_engine, "model", persona_cfg.get("model", "")),
             "base_url": getattr(persona_engine, "base_url", persona_cfg.get("base_url", "")),
+            "thinking_mode": getattr(
+                persona_engine,
+                "thinking_mode",
+                persona_cfg.get("thinking_mode", ""),
+            ),
             "event_recording_enabled": _bool_value(
                 getattr(
                     persona_engine,
@@ -12386,6 +12391,13 @@ async def api_config_update(request):
                 persona_cfg[key] = str(p[key] or "").strip()
                 persona_gateway_payload[key] = persona_cfg[key]
                 updated.append(f"persona.{key}")
+        if "thinking_mode" in p:
+            thinking_mode = str(p.get("thinking_mode") or "").strip().lower()
+            if thinking_mode == "auto" or thinking_mode not in {"", "enabled", "disabled"}:
+                thinking_mode = ""
+            persona_cfg["thinking_mode"] = thinking_mode
+            persona_gateway_payload["thinking_mode"] = thinking_mode
+            updated.append("persona.thinking_mode")
         if "api_key" in p and p["api_key"]:
             persona_cfg["api_key"] = str(p["api_key"])
             os.environ["OMBRE_PERSONA_API_KEY"] = persona_cfg["api_key"]
@@ -12613,7 +12625,7 @@ async def api_config_update(request):
             save_config = save_config or {}
             if "dehydration" in body:
                 sc_dehy = save_config.setdefault("dehydration", {})
-                for key in ("model", "base_url", "max_tokens", "temperature"):
+                for key in ("model", "base_url", "max_tokens", "temperature", "thinking_mode"):
                     if key in body["dehydration"]:
                         sc_dehy[key] = body["dehydration"][key]
                 # Never persist api_key to yaml (use env var)
@@ -12865,6 +12877,11 @@ async def api_config_update(request):
                 for key in ("model", "base_url"):
                     if key in body["persona"]:
                         sc_persona[key] = str(body["persona"][key] or "").strip()
+                if "thinking_mode" in body["persona"]:
+                    thinking_mode = str(body["persona"].get("thinking_mode") or "").strip().lower()
+                    if thinking_mode == "auto" or thinking_mode not in {"", "enabled", "disabled"}:
+                        thinking_mode = ""
+                    sc_persona["thinking_mode"] = thinking_mode
                 # Never persist api_key to yaml (use env var)
 
             if "reflection" in body:

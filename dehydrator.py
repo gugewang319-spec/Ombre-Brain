@@ -579,6 +579,7 @@ class Dehydrator:
             **self._completion_options(
                 max_tokens=256,
                 temperature=0.1,
+                json_response=True,
             ),
         )
         if not response.choices:
@@ -741,6 +742,7 @@ class Dehydrator:
             **self._completion_options(
                 max_tokens=2048,
                 temperature=0.0,
+                json_response=True,
             ),
         )
         if not response.choices:
@@ -823,14 +825,30 @@ class Dehydrator:
                 domains.append(domain)
         return domains[:2] or ["general"]
 
-    def _completion_options(self, *, max_tokens: int, temperature: float) -> dict[str, Any]:
+    def _completion_options(
+        self,
+        *,
+        max_tokens: int,
+        temperature: float,
+        json_response: bool = False,
+    ) -> dict[str, Any]:
         options: dict[str, Any] = {
             "max_tokens": max_tokens,
             "temperature": temperature,
         }
-        if self.thinking_mode:
-            options["extra_body"] = {"thinking": {"type": self.thinking_mode}}
+        if json_response:
+            options["response_format"] = {"type": "json_object"}
+        thinking_mode = self._effective_thinking_mode()
+        if thinking_mode:
+            options["extra_body"] = {"thinking": {"type": thinking_mode}}
         return options
+
+    def _effective_thinking_mode(self) -> str:
+        if self.thinking_mode:
+            return self.thinking_mode
+        if "deepseek-v4-" in str(self.model or "").strip().lower():
+            return "disabled"
+        return ""
 
     def _normalize_thinking_mode(self, value: Any) -> str:
         normalized = str(value or "").strip().lower()

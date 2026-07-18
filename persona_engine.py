@@ -111,7 +111,7 @@ class PersonaStateEngine:
             self.persona_cfg.get("thinking_mode", "")
         )
         self.temperature = float(self.persona_cfg.get("temperature", 0.1))
-        self.max_tokens = int(self.persona_cfg.get("max_tokens", 500))
+        self.max_tokens = int(self.persona_cfg.get("max_tokens", 800))
         self.session_mood_half_life_minutes = float(
             self.persona_cfg.get("session_mood_half_life_minutes", 90)
         )
@@ -636,15 +636,37 @@ class PersonaStateEngine:
                 ],
                 **self._completion_options(),
             )
-            raw = response.choices[0].message.content if response.choices else ""
+            choice = response.choices[0] if response.choices else None
+            finish_reason = str(getattr(choice, "finish_reason", "") or "")
+            raw = choice.message.content if choice else ""
+            raw = raw or ""
+            if finish_reason == "length":
+                logger.warning(
+                    "Persona evaluator response truncated | finish_reason=length content_chars=%s",
+                    len(raw),
+                )
+                return None, raw, "persona LLM response truncated (finish_reason=length)"
+            if not raw.strip():
+                logger.warning(
+                    "Persona evaluator returned empty content | finish_reason=%s",
+                    finish_reason or "unknown",
+                )
+                return None, raw, "persona LLM returned empty content"
             parsed = self._parse_json(raw or "")
             if parsed is None:
-                logger.warning("Persona evaluator returned malformed JSON")
+                logger.warning(
+                    "Persona evaluator returned malformed JSON | finish_reason=%s content_chars=%s",
+                    finish_reason or "unknown",
+                    len(raw),
+                )
                 return None, raw or "", "persona LLM returned malformed JSON"
             return self._normalize_evaluation(parsed), raw or "", None
         except Exception as exc:
-            logger.warning("Persona evaluation failed: %s", exc)
-            return None, "", str(exc)
+            logger.warning(
+                "Persona evaluation API call failed | error_type=%s",
+                type(exc).__name__,
+            )
+            return None, "", f"persona LLM API call failed: {type(exc).__name__}"
 
     def _parse_json(self, raw: str) -> dict | None:
         text = raw.strip()
@@ -1403,10 +1425,19 @@ class PersonaStateEngine:
         options: dict[str, Any] = {
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
+            "response_format": {"type": "json_object"},
         }
-        if self.thinking_mode:
-            options["extra_body"] = {"thinking": {"type": self.thinking_mode}}
+        thinking_mode = self._effective_thinking_mode()
+        if thinking_mode:
+            options["extra_body"] = {"thinking": {"type": thinking_mode}}
         return options
+
+    def _effective_thinking_mode(self) -> str:
+        if self.thinking_mode:
+            return self.thinking_mode
+        if "deepseek-v4-" in str(self.model or "").strip().lower():
+            return "disabled"
+        return ""
 
     def _normalize_thinking_mode(self, value: Any) -> str:
         normalized = str(value or "").strip().lower()

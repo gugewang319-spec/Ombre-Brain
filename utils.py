@@ -382,7 +382,7 @@ def load_config(config_path: str = None) -> dict:
             "api_key": "",
             "thinking_mode": "",
             "temperature": 0.1,
-            "max_tokens": 500,
+            "max_tokens": 800,
             "global_decay_hours": 168,
             "session_mood_half_life_minutes": 90,
             "max_personality_delta": 0.01,

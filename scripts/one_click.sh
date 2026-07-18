@@ -587,7 +587,7 @@ persona:
   model: $(yaml_quote "${dehy_model}")
   thinking_mode: ""
   temperature: 0.1
-  max_tokens: 500
+  max_tokens: 800
 
 portrait:
   enabled: true

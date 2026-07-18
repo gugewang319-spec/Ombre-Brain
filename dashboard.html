@@ -3595,6 +3595,14 @@
         <input type="text" id="cfg-persona-model" placeholder="deepseek-chat" />
       </div>
       <div class="config-row">
+        <label>Thinking</label>
+        <select id="cfg-persona-thinking">
+          <option value="">自动（V4 后台任务默认关闭）</option>
+          <option value="disabled">关闭</option>
+          <option value="enabled">开启</option>
+        </select>
+      </div>
+      <div class="config-row">
         <label>Base URL</label>
         <input type="text" id="cfg-persona-url" placeholder="https://api.deepseek.com/v1" />
       </div>
@@ -8392,6 +8400,7 @@ async function loadConfig() {
     document.getElementById('cfg-persona-event-recording').value =
       (cfg.persona && cfg.persona.event_recording_enabled) === false ? 'false' : 'true';
     document.getElementById('cfg-persona-model').value = (cfg.persona && cfg.persona.model) || '';
+    document.getElementById('cfg-persona-thinking').value = (cfg.persona && cfg.persona.thinking_mode) || '';
     document.getElementById('cfg-persona-url').value = (cfg.persona && cfg.persona.base_url) || '';
     document.getElementById('cfg-persona-key').placeholder =
       '当前: ' + ((cfg.persona && cfg.persona.api_key_masked) || ((cfg.persona && cfg.persona.api_ready) ? '***' : '未设置'));
@@ -8599,6 +8608,7 @@ async function saveConfig(persist, persistEnv) {
       enabled: document.getElementById('cfg-persona-enabled').value === 'true',
       event_recording_enabled: document.getElementById('cfg-persona-event-recording').value === 'true',
       model: document.getElementById('cfg-persona-model').value,
+      thinking_mode: document.getElementById('cfg-persona-thinking').value,
       base_url: document.getElementById('cfg-persona-url').value,
     };
     candidate.dream = {
