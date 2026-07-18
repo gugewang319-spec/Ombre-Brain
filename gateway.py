@@ -1,5 +1,5 @@
 import logging
-from logging.handlers import RotatingFileHandler
+from logging.handlers import QueueHandler, QueueListener, RotatingFileHandler
 import hashlib
 import os
 import re
@@ -8,6 +8,8 @@ import json
 import codecs
 import time
 import asyncio
+import atexit
+import queue
 import threading
 from contextlib import asynccontextmanager
 from copy import deepcopy
@@ -128,8 +130,14 @@ logger = logging.getLogger("ombre_brain.gateway")
 _SSE_DIAGNOSTICS_LOG_NAME = "sse-stream-diagnostics.log"
 _SSE_DIAGNOSTICS_MAX_BYTES = 2 * 1024 * 1024
 _SSE_DIAGNOSTICS_BACKUP_COUNT = 3
+_SSE_DIAGNOSTICS_QUEUE_SIZE = 1000
+_SSE_DIAGNOSTICS_STOP_TIMEOUT_SECONDS = 1.0
 _sse_diagnostics_file_logger = logging.getLogger("ombre_brain.sse_stream_diagnostics_file")
 _sse_diagnostics_file_handler: RotatingFileHandler | None = None
+_sse_diagnostics_queue_handler: QueueHandler | None = None
+_sse_diagnostics_queue_listener: QueueListener | None = None
+_sse_diagnostics_queue: queue.Queue | None = None
+_sse_diagnostics_file_initialized = False
 _sse_diagnostics_file_disabled = False
 _sse_diagnostics_file_warning_emitted = False
 _sse_diagnostics_file_lock = threading.RLock()
@@ -165,16 +173,15 @@ def _redact_sse_diagnostics_text(value: Any, max_length: int = 600) -> str:
     return detail
 
 
-def _disable_sse_diagnostics_file_logging(exc: BaseException) -> None:
-    global _sse_diagnostics_file_disabled, _sse_diagnostics_file_warning_emitted
+def _warn_sse_diagnostics_file_logging_once(exc: BaseException) -> None:
+    global _sse_diagnostics_file_warning_emitted
     with _sse_diagnostics_file_lock:
-        _sse_diagnostics_file_disabled = True
         if _sse_diagnostics_file_warning_emitted:
             return
         _sse_diagnostics_file_warning_emitted = True
     try:
         logger.warning(
-            "SSE diagnostics file logging disabled after failure | error_type=%s error=%s",
+            "SSE diagnostics file logging warning | error_type=%s error=%s",
             type(exc).__name__,
             _redact_sse_diagnostics_text(repr(exc), max_length=240),
         )
@@ -182,29 +189,61 @@ def _disable_sse_diagnostics_file_logging(exc: BaseException) -> None:
         pass
 
 
+def _disable_sse_diagnostics_file_logging(exc: BaseException) -> None:
+    global _sse_diagnostics_file_disabled
+    with _sse_diagnostics_file_lock:
+        _sse_diagnostics_file_disabled = True
+    _warn_sse_diagnostics_file_logging_once(exc)
+
+
+class _BestEffortQueueHandler(QueueHandler):
+    def enqueue(self, record: logging.LogRecord) -> None:
+        if _sse_diagnostics_file_disabled:
+            return
+        try:
+            self.queue.put_nowait(record)
+        except queue.Full:
+            _warn_sse_diagnostics_file_logging_once(
+                RuntimeError("SSE diagnostics queue is full; event dropped")
+            )
+        except Exception as exc:
+            _disable_sse_diagnostics_file_logging(exc)
+
+    def handleError(self, record: logging.LogRecord) -> None:
+        _disable_sse_diagnostics_file_logging(
+            RuntimeError("QueueHandler emit failed")
+        )
+
+
 class _BestEffortRotatingFileHandler(RotatingFileHandler):
+    def emit(self, record: logging.LogRecord) -> None:
+        if _sse_diagnostics_file_disabled:
+            return
+        super().emit(record)
+
     def handleError(self, record: logging.LogRecord) -> None:
         _disable_sse_diagnostics_file_logging(
             RuntimeError("RotatingFileHandler emit failed")
         )
 
 
-def _get_sse_diagnostics_file_logger() -> logging.Logger | None:
+def _initialize_sse_diagnostics_file_logging() -> None:
     global _sse_diagnostics_file_handler
-    if _sse_diagnostics_file_disabled:
-        return None
-    if _sse_diagnostics_file_handler is not None:
-        return _sse_diagnostics_file_logger
+    global _sse_diagnostics_queue_handler
+    global _sse_diagnostics_queue_listener
+    global _sse_diagnostics_queue
+    global _sse_diagnostics_file_initialized
     with _sse_diagnostics_file_lock:
-        if _sse_diagnostics_file_disabled:
-            return None
-        if _sse_diagnostics_file_handler is not None:
-            return _sse_diagnostics_file_logger
-        handler: RotatingFileHandler | None = None
+        if _sse_diagnostics_file_initialized:
+            return
+        _sse_diagnostics_file_initialized = True
+        file_handler: RotatingFileHandler | None = None
+        queue_handler: QueueHandler | None = None
+        listener: QueueListener | None = None
         try:
             log_path = _resolve_sse_diagnostics_log_path()
             os.makedirs(os.path.dirname(log_path), exist_ok=True)
-            handler = _BestEffortRotatingFileHandler(
+            file_handler = _BestEffortRotatingFileHandler(
                 log_path,
                 mode="a",
                 maxBytes=_SSE_DIAGNOSTICS_MAX_BYTES,
@@ -216,21 +255,103 @@ def _get_sse_diagnostics_file_logger() -> logging.Logger | None:
                 datefmt="%Y-%m-%dT%H:%M:%S",
             )
             formatter.converter = time.gmtime
-            handler.setFormatter(formatter)
-            handler.setLevel(logging.INFO)
+            file_handler.setFormatter(formatter)
+            file_handler.setLevel(logging.INFO)
+            diagnostic_queue: queue.Queue = queue.Queue(
+                maxsize=_SSE_DIAGNOSTICS_QUEUE_SIZE
+            )
+            queue_handler = _BestEffortQueueHandler(diagnostic_queue)
+            queue_handler.setLevel(logging.INFO)
             _sse_diagnostics_file_logger.setLevel(logging.INFO)
             _sse_diagnostics_file_logger.propagate = False
-            _sse_diagnostics_file_logger.addHandler(handler)
-            _sse_diagnostics_file_handler = handler
+            _sse_diagnostics_file_logger.addHandler(queue_handler)
+            listener = QueueListener(
+                diagnostic_queue,
+                file_handler,
+                respect_handler_level=True,
+            )
+            listener.start()
+            _sse_diagnostics_file_handler = file_handler
+            _sse_diagnostics_queue_handler = queue_handler
+            _sse_diagnostics_queue_listener = listener
+            _sse_diagnostics_queue = diagnostic_queue
         except Exception as exc:
-            if handler is not None:
+            if queue_handler is not None:
                 try:
-                    handler.close()
+                    _sse_diagnostics_file_logger.removeHandler(queue_handler)
+                except Exception:
+                    pass
+            if listener is not None:
+                try:
+                    listener.stop()
+                except Exception:
+                    pass
+            if file_handler is not None:
+                try:
+                    file_handler.close()
                 except Exception:
                     pass
             _disable_sse_diagnostics_file_logging(exc)
-            return None
-    return _sse_diagnostics_file_logger
+
+
+def _stop_sse_diagnostics_file_logging() -> None:
+    global _sse_diagnostics_file_handler
+    global _sse_diagnostics_queue_handler
+    global _sse_diagnostics_queue_listener
+    global _sse_diagnostics_queue
+    with _sse_diagnostics_file_lock:
+        listener = _sse_diagnostics_queue_listener
+        file_handler = _sse_diagnostics_file_handler
+        queue_handler = _sse_diagnostics_queue_handler
+        if listener is None and file_handler is None and queue_handler is None:
+            return
+        _sse_diagnostics_queue_listener = None
+        _sse_diagnostics_file_handler = None
+        _sse_diagnostics_queue_handler = None
+        _sse_diagnostics_queue = None
+        if queue_handler is not None:
+            try:
+                _sse_diagnostics_file_logger.removeHandler(queue_handler)
+            except Exception:
+                pass
+    listener_stopped = listener is None
+    if listener is not None:
+        stop_errors: list[BaseException] = []
+
+        def stop_listener() -> None:
+            try:
+                listener.stop()
+            except BaseException as exc:
+                stop_errors.append(exc)
+
+        stop_thread = threading.Thread(
+            target=stop_listener,
+            name="sse-diagnostics-listener-stop",
+            daemon=True,
+        )
+        stop_thread.start()
+        stop_thread.join(timeout=_SSE_DIAGNOSTICS_STOP_TIMEOUT_SECONDS)
+        if stop_thread.is_alive():
+            _warn_sse_diagnostics_file_logging_once(
+                TimeoutError("QueueListener stop timed out")
+            )
+        elif stop_errors:
+            _warn_sse_diagnostics_file_logging_once(stop_errors[0])
+        else:
+            listener_stopped = True
+    if file_handler is not None and listener_stopped:
+        try:
+            file_handler.close()
+        except Exception as exc:
+            _warn_sse_diagnostics_file_logging_once(exc)
+    if queue_handler is not None:
+        try:
+            queue_handler.close()
+        except Exception as exc:
+            _warn_sse_diagnostics_file_logging_once(exc)
+
+
+atexit.register(_stop_sse_diagnostics_file_logging)
 
 
 def _write_sse_diagnostics_file_event(
@@ -249,8 +370,10 @@ def _write_sse_diagnostics_file_event(
     details: dict[str, Any] | None = None,
 ) -> None:
     try:
-        file_logger = _get_sse_diagnostics_file_logger()
-        if file_logger is None:
+        if (
+            _sse_diagnostics_file_disabled
+            or _sse_diagnostics_queue_handler is None
+        ):
             return
         fields = [
             f"stream_id={_redact_sse_diagnostics_text(stream_id, 80)}",
@@ -268,7 +391,12 @@ def _write_sse_diagnostics_file_event(
                 f"{_redact_sse_diagnostics_text(key, 40)}="
                 f"{_redact_sse_diagnostics_text(value, 240)}"
             )
-        file_logger.log(level, "%s | %s", message, " ".join(fields))
+        _sse_diagnostics_file_logger.log(
+            level,
+            "%s | %s",
+            message,
+            " ".join(fields),
+        )
     except Exception as exc:
         _disable_sse_diagnostics_file_logging(exc)
 
@@ -975,10 +1103,14 @@ class GatewayService:
         self.pending_tool_reasoning: dict[str, dict[tuple[str, ...], dict[str, Any]]] = {}
 
         self.http_client = http_client or httpx.AsyncClient(timeout=60.0)
+        _initialize_sse_diagnostics_file_logging()
 
     async def close(self) -> None:
-        if self.http_client and not getattr(self.http_client, "is_closed", False):
-            await self.http_client.aclose()
+        try:
+            if self.http_client and not getattr(self.http_client, "is_closed", False):
+                await self.http_client.aclose()
+        finally:
+            _stop_sse_diagnostics_file_logging()
 
     async def warm_recall_runtime(self) -> None:
         started_at = time.perf_counter()
@@ -21663,6 +21795,7 @@ def create_gateway_app(
 ) -> Starlette:
     config = config or load_config()
     service = service or GatewayService(config)
+    _initialize_sse_diagnostics_file_logging()
 
     @asynccontextmanager
     async def lifespan(app: Starlette):

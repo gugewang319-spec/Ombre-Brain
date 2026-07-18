@@ -1,8 +1,11 @@
 import asyncio
 import logging
 import os
+import queue
+import threading
+import time
 from datetime import datetime as real_datetime, timezone
-from logging.handlers import RotatingFileHandler
+from logging.handlers import QueueHandler, RotatingFileHandler
 
 import pytest
 
@@ -24,11 +27,16 @@ ROUTE = {
 
 
 def _reset_sse_diagnostics_file_logger():
-    handler = gateway._sse_diagnostics_file_handler
-    if handler is not None:
-        gateway._sse_diagnostics_file_logger.removeHandler(handler)
-        handler.close()
+    gateway._stop_sse_diagnostics_file_logging()
+    for handler in list(gateway._sse_diagnostics_file_logger.handlers):
+        if isinstance(handler, QueueHandler):
+            gateway._sse_diagnostics_file_logger.removeHandler(handler)
+            handler.close()
     gateway._sse_diagnostics_file_handler = None
+    gateway._sse_diagnostics_queue_handler = None
+    gateway._sse_diagnostics_queue_listener = None
+    gateway._sse_diagnostics_queue = None
+    gateway._sse_diagnostics_file_initialized = False
     gateway._sse_diagnostics_file_disabled = False
     gateway._sse_diagnostics_file_warning_emitted = False
 
@@ -39,8 +47,31 @@ def isolated_sse_file_log(monkeypatch, tmp_path):
     state_dir = tmp_path / "state"
     monkeypatch.setenv("OMBRE_STATE_DIR", str(state_dir))
     monkeypatch.delenv("OMBRE_CONFIG_PATH", raising=False)
+    gateway._initialize_sse_diagnostics_file_logging()
     yield state_dir
     _reset_sse_diagnostics_file_logger()
+
+
+def _wait_until(predicate, timeout=3.0):
+    deadline = time.perf_counter() + timeout
+    while time.perf_counter() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return bool(predicate())
+
+
+def _read_log_when_contains(path, expected, timeout=3.0):
+    content = ""
+
+    def contains_expected():
+        nonlocal content
+        if path.exists():
+            content = path.read_text(encoding="utf-8")
+        return expected in content
+
+    assert _wait_until(contains_expected, timeout=timeout)
+    return content
 
 
 class FakeUpstreamResponse:
@@ -145,9 +176,10 @@ async def test_raw_openai_stream_bytes_are_unchanged_and_logs_are_private(
     )
 
     assert await _collect(response) == b"".join(chunks)
-    file_log = (
-        isolated_sse_file_log / "sse-stream-diagnostics.log"
-    ).read_text(encoding="utf-8")
+    file_log = _read_log_when_contains(
+        isolated_sse_file_log / "sse-stream-diagnostics.log",
+        "Gateway SSE stream completed",
+    )
     file_lines = file_log.splitlines()
     assert upstream_response.closed is True
     assert len(finalize_calls) == 1
@@ -213,6 +245,27 @@ def test_sse_file_rotation_configuration(isolated_sse_file_log):
     )
 
 
+def test_sse_queue_listener_initializes_only_once():
+    listener = gateway._sse_diagnostics_queue_listener
+    queue_handler = gateway._sse_diagnostics_queue_handler
+    diagnostic_queue = gateway._sse_diagnostics_queue
+    assert listener is not None
+    assert queue_handler is not None
+    assert diagnostic_queue is not None
+    assert diagnostic_queue.maxsize == 1000
+
+    gateway._initialize_sse_diagnostics_file_logging()
+    gateway._initialize_sse_diagnostics_file_logging()
+
+    assert gateway._sse_diagnostics_queue_listener is listener
+    assert gateway._sse_diagnostics_queue_handler is queue_handler
+    assert gateway._sse_diagnostics_queue is diagnostic_queue
+    assert sum(
+        isinstance(handler, gateway._BestEffortQueueHandler)
+        for handler in gateway._sse_diagnostics_file_logger.handlers
+    ) == 1
+
+
 def test_sse_file_log_path_resolution_priority(monkeypatch, tmp_path):
     state_dir = tmp_path / "explicit-state"
     config_path = tmp_path / "config-state" / "config.yaml"
@@ -233,6 +286,82 @@ def test_sse_file_log_path_resolution_priority(monkeypatch, tmp_path):
     )
 
 
+async def test_slow_file_handler_does_not_block_sse_generator(monkeypatch):
+    chunks = [b"data: immediate\n\n", b"data: [DONE]\n\n"]
+    upstream_response = FakeUpstreamResponse(chunks)
+    service, _ = _service(upstream_response)
+    handler = gateway._sse_diagnostics_file_handler
+    assert handler is not None
+    original_emit = handler.emit
+    slow_started = threading.Event()
+    slow_once = True
+
+    def slow_emit(record):
+        nonlocal slow_once
+        if slow_once:
+            slow_once = False
+            slow_started.set()
+            time.sleep(0.5)
+        original_emit(record)
+
+    monkeypatch.setattr(handler, "emit", slow_emit)
+    service._log_sse_stream_started(
+        stream_id="slow-warmup",
+        session_id=SESSION,
+        model=MODEL,
+        upstream_status=200,
+        message_count=1,
+        started_at=time.perf_counter(),
+    )
+    assert slow_started.wait(timeout=1.0)
+
+    started_at = time.perf_counter()
+    response = await _raw_openai_response(service)
+    output = await _collect(response)
+    elapsed = time.perf_counter() - started_at
+
+    assert output == b"".join(chunks)
+    assert elapsed < 0.25
+    assert upstream_response.closed is True
+
+
+async def test_full_sse_diagnostics_queue_drops_without_blocking_stream(caplog):
+    _reset_sse_diagnostics_file_logger()
+    diagnostic_queue = queue.Queue(maxsize=1)
+    diagnostic_queue.put_nowait(logging.makeLogRecord({"msg": "occupied"}))
+    queue_handler = gateway._BestEffortQueueHandler(diagnostic_queue)
+    queue_handler.setLevel(logging.INFO)
+    gateway._sse_diagnostics_file_logger.setLevel(logging.INFO)
+    gateway._sse_diagnostics_file_logger.propagate = False
+    gateway._sse_diagnostics_file_logger.addHandler(queue_handler)
+    gateway._sse_diagnostics_queue = diagnostic_queue
+    gateway._sse_diagnostics_queue_handler = queue_handler
+    gateway._sse_diagnostics_file_initialized = True
+    gateway._sse_diagnostics_file_disabled = False
+    gateway._sse_diagnostics_file_warning_emitted = False
+
+    chunks = [b"data: queue-full\n\n", b"data: [DONE]\n\n"]
+    upstream_response = FakeUpstreamResponse(chunks)
+    service, _ = _service(upstream_response)
+    caplog.set_level(logging.WARNING, logger="ombre_brain.gateway")
+    started_at = time.perf_counter()
+    response = await _raw_openai_response(service)
+    output = await _collect(response)
+    elapsed = time.perf_counter() - started_at
+
+    assert output == b"".join(chunks)
+    assert elapsed < 0.2
+    assert diagnostic_queue.qsize() == 1
+    warnings = [
+        record
+        for record in caplog.records
+        if "SSE diagnostics file logging warning" in record.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "queue is full" in warnings[0].getMessage()
+    assert gateway._sse_diagnostics_file_disabled is False
+
+
 async def test_sse_file_write_failure_warns_once_without_affecting_stream(
     caplog,
     monkeypatch,
@@ -240,7 +369,6 @@ async def test_sse_file_write_failure_warns_once_without_affecting_stream(
     chunks = [b"data: unchanged\n\n", b"data: [DONE]\n\n"]
     upstream_response = FakeUpstreamResponse(chunks)
     service, _ = _service(upstream_response)
-    gateway._get_sse_diagnostics_file_logger()
     handler = gateway._sse_diagnostics_file_handler
     assert handler is not None
 
@@ -252,10 +380,17 @@ async def test_sse_file_write_failure_warns_once_without_affecting_stream(
     response = await _raw_openai_response(service)
 
     assert await _collect(response) == b"".join(chunks)
+    assert _wait_until(lambda: gateway._sse_diagnostics_file_disabled)
+    assert _wait_until(
+        lambda: any(
+            "SSE diagnostics file logging warning" in record.getMessage()
+            for record in caplog.records
+        )
+    )
     warnings = [
         record
         for record in caplog.records
-        if "SSE diagnostics file logging disabled after failure" in record.getMessage()
+        if "SSE diagnostics file logging warning" in record.getMessage()
     ]
     assert len(warnings) == 1
     assert gateway._sse_diagnostics_file_disabled is True
@@ -269,19 +404,21 @@ async def test_sse_file_creation_failure_warns_once_without_affecting_stream(
     chunks = [b"data: unchanged\n\n", b"data: [DONE]\n\n"]
     upstream_response = FakeUpstreamResponse(chunks)
     service, _ = _service(upstream_response)
+    _reset_sse_diagnostics_file_logger()
 
     def fail_create(*args, **kwargs):
         raise PermissionError("diagnostics directory is read-only")
 
     monkeypatch.setattr(gateway, "_BestEffortRotatingFileHandler", fail_create)
     caplog.set_level(logging.WARNING, logger="ombre_brain.gateway")
+    gateway._initialize_sse_diagnostics_file_logging()
     response = await _raw_openai_response(service)
 
     assert await _collect(response) == b"".join(chunks)
     warnings = [
         record
         for record in caplog.records
-        if "SSE diagnostics file logging disabled after failure" in record.getMessage()
+        if "SSE diagnostics file logging warning" in record.getMessage()
     ]
     assert len(warnings) == 1
     assert gateway._sse_diagnostics_file_handler is None
@@ -429,9 +566,10 @@ async def test_upstream_read_exception_is_logged_redacted_and_reraised(
     assert "TOPSECRET" not in caplog.text
     assert "TOKENVALUE" not in caplog.text
     assert "BEARERSECRET" not in caplog.text
-    file_log = (
-        isolated_sse_file_log / "sse-stream-diagnostics.log"
-    ).read_text(encoding="utf-8")
+    file_log = _read_log_when_contains(
+        isolated_sse_file_log / "sse-stream-diagnostics.log",
+        "Gateway SSE stream failed",
+    )
     assert "Gateway SSE stream failed" in file_log
     assert "event=failed" in file_log
     assert "stage=upstream_read" in file_log
