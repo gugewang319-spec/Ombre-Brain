@@ -3008,10 +3008,10 @@
       </div>
       <div style="margin-top:-4px;margin-bottom:12px;padding-left:122px;font-size:11px;color:var(--text-light);">关闭后 Gateway 不自动注入 Recent Context；可靠直命中和扩散不受影响</div>
       <div class="config-row">
-        <label>Persona提示</label>
+        <label>Persona轻提醒</label>
         <select id="cfg-persona-context-enabled"><option value="true">开启</option><option value="false">关闭</option></select>
       </div>
-      <div style="margin-top:-4px;margin-bottom:12px;padding-left:122px;font-size:11px;color:var(--text-light);">控制 Gateway 每隔若干轮注入一次 Persona State 提示；关闭后仍会后台更新 Persona</div>
+      <div style="margin-top:-4px;margin-bottom:12px;padding-left:122px;font-size:11px;color:var(--text-light);">默认每 15 轮比较一次最近 15 轮的净变化；无明显变化不提示，关闭后仍会后台更新 Persona</div>
       <div class="config-row">
         <label>Persona轮数</label>
         <input type="number" id="cfg-persona-context-rounds" min="0" max="200" />
@@ -3444,7 +3444,6 @@
       <div style="display:flex;gap:16px;margin-top:8px;font-size:13px;color:var(--text-dim);">
         <span>API调用: <b id="import-api-calls">0</b></span>
         <span>新建: <b id="import-created">0</b></span>
-        <span>合并: <b id="import-merged">0</b></span>
         <span>重复跳过: <b id="import-duplicate-skipped">0</b></span>
         <span>原文: <b id="import-raw">0</b></span>
         <span>Embedding: <b id="import-embeddings-created">0</b></span>
@@ -3590,6 +3589,11 @@
         <select id="cfg-persona-event-recording"><option value="true">开启</option><option value="false">关闭</option></select>
       </div>
       <div style="margin-top:-4px;margin-bottom:12px;padding-left:122px;font-size:11px;color:var(--text-light);">关闭后仍评估数值状态，但不新增 Recent Persona Events</div>
+      <div class="config-row">
+        <label>防撤退提醒</label>
+        <select id="cfg-persona-conflict-nudge"><option value="true">开启</option><option value="false">关闭</option></select>
+      </div>
+      <div style="margin-top:-4px;margin-bottom:12px;padding-left:122px;font-size:11px;color:var(--text-light);">只在明确争执或撤退信号出现时给模型一条私密提醒；优先于 Persona 轻提醒，不替模型决定回应</div>
       <div class="config-row">
         <label>Model</label>
         <input type="text" id="cfg-persona-model" placeholder="deepseek-chat" />
@@ -7381,7 +7385,6 @@ async function loadPersona(sessionId) {
 
 function renderPersona(data) {
   var state = data.state || {};
-  var personality = state.personality || {};
   var affect = state.affect || {};
   var relationship = state.relationship || {};
   var cfg = data.config || {};
@@ -7398,7 +7401,7 @@ function renderPersona(data) {
           '<div class="persona-orb" style="opacity:' + personaOrbOpacity(affect.arousal) + '"></div>' +
           '<div class="persona-mood">' +
             '<strong>' + esc(affect.mood_label || 'warm_neutral') + '</strong>' +
-            '<span>V' + personaNumber(affect.valence) + ' · A' + personaNumber(affect.arousal) + ' · session ' + esc(activeSession) + '</span>' +
+            '<span>心情 ' + personaNumber(affect.valence) + ' · 情绪能量 ' + personaNumber(affect.arousal) + ' · session ' + esc(activeSession) + '</span>' +
           '</div>' +
         '</div>' +
         '<div>' +
@@ -7416,27 +7419,18 @@ function renderPersona(data) {
         '<div class="persona-card">' +
           '<h3>Affect / Relationship</h3>' +
           '<div class="persona-meter-list">' +
-            personaMeter('情绪效价 valence', affect.valence, 'warm') +
-            personaMeter('唤醒度 arousal', affect.arousal, '') +
+            personaMeter('心情方向 valence', affect.valence, 'warm') +
+            personaMeter('情绪能量 arousal', affect.arousal, '') +
             personaMeter('温柔 tenderness', affect.tenderness, 'warm') +
             personaMeter('占有 possessiveness', affect.possessiveness, 'guard') +
             personaMeter('想念 longing', affect.longing, 'warm') +
-            personaMeter('安全 security', affect.security, 'warm') +
+            personaMeter('关系安全感 security', affect.security, 'warm') +
             personaMeter('保护 protective', affect.protective_drive, 'guard') +
+            personaMeter('欲望温度 libido', affect.libido, 'warm') +
             personaMeter('亲和 affinity', relationship.affinity, 'warm') +
             personaMeter('主导 dominance', relationship.dominance, '') +
             personaMeter('防御 defensiveness', relationship.defensiveness, 'guard') +
             personaMeter('信任 trust', relationship.trust, 'warm') +
-          '</div>' +
-        '</div>' +
-        '<div class="persona-card">' +
-          '<h3>Personality</h3>' +
-          '<div class="persona-meter-list">' +
-            personaMeter('开放 openness', personality.openness, '') +
-            personaMeter('自律 conscientiousness', personality.conscientiousness, '') +
-            personaMeter('外向 extraversion', personality.extraversion, '') +
-            personaMeter('温柔 agreeableness', personality.agreeableness, 'warm') +
-            personaMeter('敏感 neuroticism', personality.neuroticism, 'guard') +
           '</div>' +
         '</div>' +
       '</div>' +
@@ -7491,7 +7485,6 @@ function renderPersonaDeltas(ev) {
   var parts = [];
   collectPersonaDeltas(parts, 'affect', ev.affect_delta || {});
   collectPersonaDeltas(parts, 'rel', ev.relationship_delta || {});
-  collectPersonaDeltas(parts, 'trait', ev.personality_delta || {});
   if (!parts.length) return '';
   return '<div class="persona-deltas">' + parts.join('') + '</div>';
 }
@@ -8399,6 +8392,8 @@ async function loadConfig() {
       (cfg.persona && cfg.persona.enabled) === false ? 'false' : 'true';
     document.getElementById('cfg-persona-event-recording').value =
       (cfg.persona && cfg.persona.event_recording_enabled) === false ? 'false' : 'true';
+    document.getElementById('cfg-persona-conflict-nudge').value =
+      (cfg.persona && cfg.persona.conflict_nudge_enabled) ? 'true' : 'false';
     document.getElementById('cfg-persona-model').value = (cfg.persona && cfg.persona.model) || '';
     document.getElementById('cfg-persona-thinking').value = (cfg.persona && cfg.persona.thinking_mode) || '';
     document.getElementById('cfg-persona-url').value = (cfg.persona && cfg.persona.base_url) || '';
@@ -8607,6 +8602,7 @@ async function saveConfig(persist, persistEnv) {
     candidate.persona = {
       enabled: document.getElementById('cfg-persona-enabled').value === 'true',
       event_recording_enabled: document.getElementById('cfg-persona-event-recording').value === 'true',
+      conflict_nudge_enabled: document.getElementById('cfg-persona-conflict-nudge').value === 'true',
       model: document.getElementById('cfg-persona-model').value,
       thinking_mode: document.getElementById('cfg-persona-thinking').value,
       base_url: document.getElementById('cfg-persona-url').value,
@@ -8934,7 +8930,6 @@ function updateImportUI(s) {
   document.getElementById('import-progress-text').textContent = s.processed + '/' + s.total_chunks;
   document.getElementById('import-api-calls').textContent = s.api_calls;
   document.getElementById('import-created').textContent = s.memories_created;
-  document.getElementById('import-merged').textContent = s.memories_merged;
   document.getElementById('import-duplicate-skipped').textContent = s.memories_duplicate_skipped || 0;
   document.getElementById('import-raw').textContent = s.memories_raw;
   document.getElementById('import-embeddings-created').textContent = s.embeddings_created || 0;

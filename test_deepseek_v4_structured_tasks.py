@@ -113,6 +113,28 @@ def test_persona_non_deepseek_model_does_not_receive_thinking_parameter(monkeypa
     assert calls[0]["response_format"] == {"type": "json_object"}
 
 
+def test_persona_conflict_detector_uses_structured_v4_request_and_sanitizes_unicode(
+    monkeypatch,
+    tmp_path,
+):
+    engine = _persona_engine(monkeypatch, tmp_path, conflict_nudge_enabled=True)
+    completions = FakeCompletions(
+        content='{"signal": false, "kind": "none", "confidence": 0}'
+    )
+    engine.client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+
+    result = asyncio.run(engine.detect_conflict_nudge("conflict \ud800 signal"))
+
+    assert result["reason"] == "no_signal"
+    assert len(completions.calls) == 1
+    request = completions.calls[0]
+    assert request["extra_body"] == {"thinking": {"type": "disabled"}}
+    assert request["response_format"] == {"type": "json_object"}
+    assert request["max_tokens"] == 120
+    assert request["timeout"] == 4.0
+    assert "\ud800" not in request["messages"][1]["content"]
+
+
 @pytest.mark.parametrize(
     ("content", "finish_reason", "expected_error", "expected_log"),
     [
@@ -238,7 +260,7 @@ def _gateway_method(class_name, method_name):
     return method
 
 
-def test_dashboard_api_persists_and_hot_updates_persona_thinking_mode(monkeypatch, tmp_path):
+def test_dashboard_api_persists_and_hot_updates_persona_controls(monkeypatch, tmp_path):
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
         "persona:\n  model: old-model\n  unknown_persona_field: keep-me\nunknown_root: keep-root\n",
@@ -260,6 +282,8 @@ def test_dashboard_api_persists_and_hot_updates_persona_thinking_mode(monkeypatc
             self.model = persona.get("model", "")
             self.base_url = persona.get("base_url", "")
             self.thinking_mode = persona.get("thinking_mode", "")
+            self.event_recording_enabled = persona.get("event_recording_enabled", True)
+            self.conflict_nudge_enabled = persona.get("conflict_nudge_enabled", False)
             self.api_key = persona.get("api_key", "")
 
     class FakeJSONResponse:
@@ -273,6 +297,7 @@ def test_dashboard_api_persists_and_hot_updates_persona_thinking_mode(monkeypatc
                 "persona": {
                     "model": "deepseek-v4-flash",
                     "thinking_mode": "enabled",
+                    "conflict_nudge_enabled": True,
                 },
                 "persist": True,
             }
@@ -300,20 +325,25 @@ def test_dashboard_api_persists_and_hot_updates_persona_thinking_mode(monkeypatc
 
     assert response.status_code == 200
     assert "persona.thinking_mode" in response.content["updated"]
+    assert "persona.conflict_nudge_enabled" in response.content["updated"]
     assert namespace["persona_engine"].thinking_mode == "enabled"
+    assert namespace["persona_engine"].conflict_nudge_enabled is True
     assert hot_updates[-1]["persona"]["thinking_mode"] == "enabled"
+    assert hot_updates[-1]["persona"]["conflict_nudge_enabled"] is True
     assert saved["persona"]["thinking_mode"] == "enabled"
+    assert saved["persona"]["conflict_nudge_enabled"] is True
     assert saved["persona"]["unknown_persona_field"] == "keep-me"
     assert saved["unknown_root"] == "keep-root"
 
 
-def test_gateway_persona_hot_update_rebuilds_engine_with_thinking_mode(monkeypatch):
+def test_gateway_persona_hot_update_rebuilds_engine_with_merged_controls(monkeypatch):
     captured = []
 
     class FakePersonaStateEngine:
         def __init__(self, config):
             captured.append(copy.deepcopy(config))
             self.thinking_mode = config["persona"].get("thinking_mode", "")
+            self.conflict_nudge_enabled = config["persona"].get("conflict_nudge_enabled", False)
 
     namespace = {
         "Any": Any,
@@ -326,17 +356,24 @@ def test_gateway_persona_hot_update_rebuilds_engine_with_thinking_mode(monkeypat
 
     updated = namespace["_apply_persona_config"](
         service,
-        {"thinking_mode": "disabled"},
+        {"thinking_mode": "disabled", "conflict_nudge_enabled": True},
     )
 
-    assert updated == ["persona.thinking_mode"]
+    assert updated == ["persona.conflict_nudge_enabled", "persona.thinking_mode"]
     assert service.persona_engine.thinking_mode == "disabled"
+    assert service.persona_engine.conflict_nudge_enabled is True
     assert captured[-1]["persona"]["thinking_mode"] == "disabled"
+    assert captured[-1]["persona"]["conflict_nudge_enabled"] is True
 
 
-def test_dashboard_exposes_loads_and_saves_persona_thinking_mode():
+def test_dashboard_exposes_loads_and_saves_persona_controls():
     source = DASHBOARD_PATH.read_text(encoding="utf-8")
+    server_source = SERVER_PATH.read_text(encoding="utf-8")
 
     assert 'id="cfg-persona-thinking"' in source
     assert "cfg.persona.thinking_mode" in source
     assert "thinking_mode: document.getElementById('cfg-persona-thinking').value" in source
+    assert 'id="cfg-persona-conflict-nudge"' in source
+    assert "cfg.persona.conflict_nudge_enabled" in source
+    assert "conflict_nudge_enabled: document.getElementById('cfg-persona-conflict-nudge').value" in source
+    assert '"conflict_nudge_enabled": _bool_value(' in server_source

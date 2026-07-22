@@ -989,7 +989,7 @@ class GatewayService:
             "debug": self._portrait_memory_debug_base(),
         }
         self.current_inner_state_interval_rounds = max(
-            0, int(self.gateway_cfg.get("current_inner_state_interval_rounds", 0))
+            0, int(self.gateway_cfg.get("current_inner_state_interval_rounds", 15))
         )
         self.relationship_weather_interval_rounds = max(
             0, int(self.gateway_cfg.get("relationship_weather_interval_rounds", 0))
@@ -1334,6 +1334,9 @@ class GatewayService:
             "thinking_mode": getattr(self.persona_engine, "thinking_mode", ""),
             "event_recording_enabled": bool(
                 getattr(self.persona_engine, "event_recording_enabled", True)
+            ),
+            "conflict_nudge_enabled": bool(
+                getattr(self.persona_engine, "conflict_nudge_enabled", False)
             ),
             "api_ready": bool(getattr(self.persona_engine, "api_key", "")),
         }
@@ -1974,12 +1977,10 @@ class GatewayService:
             return []
         persona_cfg = self.config.setdefault("persona", {})
         updated: list[str] = []
-        if "enabled" in payload:
-            persona_cfg["enabled"] = bool(payload["enabled"])
-            updated.append("persona.enabled")
-        if "event_recording_enabled" in payload:
-            persona_cfg["event_recording_enabled"] = bool(payload["event_recording_enabled"])
-            updated.append("persona.event_recording_enabled")
+        for key in ("enabled", "event_recording_enabled", "conflict_nudge_enabled"):
+            if key in payload:
+                persona_cfg[key] = bool(payload[key])
+                updated.append(f"persona.{key}")
         for key in ("model", "base_url", "thinking_mode"):
             if key in payload:
                 value = str(payload[key] or "").strip()
@@ -2966,6 +2967,13 @@ class GatewayService:
         mark_step("classify_request", stage_started_at)
 
         persona_block = ""
+        conflict_nudge = ""
+        conflict_nudge_debug: dict[str, Any] = {
+            "triggered": False,
+            "kind": "none",
+            "confidence": 0.0,
+            "reason": "not_current_user_turn",
+        }
         core_memory = ""
         portrait_memory = ""
         portrait_memory_debug: dict[str, Any] = self._portrait_memory_debug_base()
@@ -3101,6 +3109,19 @@ class GatewayService:
                     if recall_plan_skip_reason == "recall_meta_without_target"
                     else "low_signal_auto_recall"
                 )
+            conflict_detector = getattr(self.persona_engine, "detect_conflict_nudge", None)
+            if (
+                self.persona_engine.enabled
+                and bool(getattr(self.persona_engine, "conflict_nudge_enabled", False))
+                and callable(conflict_detector)
+            ):
+                stage_started_at = time.perf_counter()
+                conflict_nudge_debug = await conflict_detector(
+                    current_user_query,
+                    self._recent_persona_pre_reply_turns(session_id),
+                )
+                conflict_nudge = str(conflict_nudge_debug.get("nudge") or "")
+                mark_step("persona_conflict_nudge", stage_started_at)
             if self.persona_engine.enabled and self._should_inject_interval(
                 session_id,
                 self.current_inner_state_interval_rounds,
@@ -3109,7 +3130,17 @@ class GatewayService:
                 persona_state = await self.persona_engine.build_pre_reply_guidance(
                     session_id, current_user_query
                 )
-                persona_block = self.persona_engine.format_state_block(persona_state)
+                recent_change_formatter = getattr(
+                    self.persona_engine,
+                    "format_recent_change_block",
+                    None,
+                )
+                if conflict_nudge:
+                    conflict_nudge_debug["persona_change_suppressed"] = True
+                elif callable(recent_change_formatter):
+                    persona_block = recent_change_formatter(session_id)
+                else:
+                    persona_block = self.persona_engine.format_state_block(persona_state)
                 mark_step("persona_pre_reply", stage_started_at)
             if self.persona_engine.enabled and persona_state is None:
                 stage_started_at = time.perf_counter()
@@ -3411,6 +3442,7 @@ class GatewayService:
         stage_started_at = time.perf_counter()
         stable_context, dynamic_context = self._build_injected_context_messages(
             persona_block=persona_block,
+            conflict_nudge=conflict_nudge,
             core_memory=core_memory,
             portrait_memory=portrait_memory,
             just_now_context=just_now_context,
@@ -3541,6 +3573,8 @@ class GatewayService:
                 dream_context_status=dream_context_status,
                 active_reminders=active_reminders,
                 active_reminder_ids=active_reminder_ids,
+                conflict_nudge=conflict_nudge,
+                conflict_nudge_debug=conflict_nudge_debug,
                 just_now_context=just_now_context,
                 just_now_context_debug=just_now_context_debug,
                 recent_context=recent_context,
@@ -5405,6 +5439,22 @@ class GatewayService:
                 session_id,
             )
             return
+        try:
+            evaluation_interval = max(
+                1,
+                int(getattr(self.persona_engine, "evaluation_interval_rounds", 3)),
+            )
+        except (TypeError, ValueError):
+            evaluation_interval = 3
+        current_round = self.state_store.get_current_round(session_id)
+        if current_round > 0 and current_round % evaluation_interval != 0:
+            logger.info(
+                "Persona post-reply update skipped | session=%s round=%s interval=%s reason=interval",
+                session_id,
+                current_round,
+                evaluation_interval,
+            )
+            return
         if not user_message.strip():
             logger.info(
                 "Persona post-reply update skipped | session=%s reason=missing_user_message",
@@ -5490,6 +5540,44 @@ class GatewayService:
             if len(selected) >= max_turns:
                 break
         return list(reversed(selected))
+
+    def _recent_persona_pre_reply_turns(self, session_id: str) -> list[dict[str, Any]]:
+        try:
+            max_turns = int(getattr(self.persona_engine, "conflict_nudge_context_turns", 3))
+        except (TypeError, ValueError):
+            max_turns = 3
+        max_turns = max(0, min(8, max_turns))
+        if max_turns <= 0:
+            return []
+        profile_id = str(getattr(self.persona_engine, "profile_id", "") or "default")
+        try:
+            turns = self.state_store.list_recent_conversation_turns(
+                profile_id=profile_id,
+                session_id=session_id,
+                limit=max_turns,
+                hours=12,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Persona conflict nudge context lookup failed | session=%s error=%s",
+                session_id,
+                exc,
+            )
+            return []
+        selected = []
+        for turn in reversed(turns):
+            user_text = self._clean_conversation_turn_text(turn.get("user_text", ""))
+            assistant_text = self._clean_conversation_turn_text(turn.get("assistant_text", ""))
+            if not user_text and not assistant_text:
+                continue
+            selected.append(
+                {
+                    "created_at": turn.get("created_at", ""),
+                    "user_text": user_text,
+                    "assistant_text": assistant_text,
+                }
+            )
+        return selected
 
     async def _finalize_stream_turn(
         self,
@@ -18502,6 +18590,7 @@ class GatewayService:
         persona_block: str,
         core_memory: str,
         portrait_memory: str,
+        conflict_nudge: str = "",
         just_now_context: str = "",
         recent_context: str = "",
         recalled_memory: str = "",
@@ -18521,6 +18610,7 @@ class GatewayService:
             section.strip()
             for section in [
                 persona_block,
+                conflict_nudge,
                 relationship_weather,
                 favorite_memory,
                 just_now_context,
@@ -18597,6 +18687,7 @@ class GatewayService:
             add_section("Recent Context", recent_context)
             add_section("Date Persona Trace", date_persona_trace)
             add_section("New Window Handoff Hint", handoff_tool_hint)
+            add_section("Conflict / Withdrawal Reminder", conflict_nudge)
             if persona_block.strip():
                 dynamic_sections.extend(["", persona_block])
             add_section("Relationship Weather", relationship_weather)
@@ -19531,6 +19622,8 @@ class GatewayService:
         dream_context_status: dict[str, Any],
         active_reminders: str,
         active_reminder_ids: list[str],
+        conflict_nudge: str,
+        conflict_nudge_debug: dict[str, Any],
         just_now_context: str,
         just_now_context_debug: dict[str, Any],
         date_recall: str,
@@ -19745,6 +19838,8 @@ class GatewayService:
             "dream_context_status": dream_context_status,
             "active_reminders_injected": bool(str(active_reminders or "").strip()),
             "active_reminder_ids": active_reminder_ids,
+            "conflict_nudge_injected": bool(str(conflict_nudge or "").strip()),
+            "conflict_nudge_debug": conflict_nudge_debug,
             "query_planner_debug": query_planner_debug or self._query_planner_debug_base(query),
             "structural_activation_debug": structural_activation_debug,
             "moment_chunk_shadow_debug": moment_chunk_shadow_debug,
@@ -19774,6 +19869,7 @@ class GatewayService:
             "diffused_memory": related_memory,
             "dream_context": dream_context,
             "active_reminders": active_reminders,
+            "conflict_nudge": conflict_nudge,
             "recent_context": recent_context,
             "stable_context": stable_context,
             "dynamic_context": dynamic_context,

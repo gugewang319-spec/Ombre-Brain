@@ -11805,6 +11805,14 @@ async def api_config_get(request):
                 ),
                 True,
             ),
+            "conflict_nudge_enabled": _bool_value(
+                getattr(
+                    persona_engine,
+                    "conflict_nudge_enabled",
+                    persona_cfg.get("conflict_nudge_enabled"),
+                ),
+                False,
+            ),
             "api_key_masked": _mask_key(getattr(persona_engine, "api_key", "") or persona_cfg.get("api_key", "")),
             "api_ready": bool(getattr(persona_engine, "api_key", "") or persona_cfg.get("api_key", "")),
         },
@@ -12388,14 +12396,11 @@ async def api_config_update(request):
         p = body["persona"]
         persona_cfg = config.setdefault("persona", {})
         persona_gateway_payload = {}
-        if "enabled" in p:
-            persona_cfg["enabled"] = bool(p["enabled"])
-            persona_gateway_payload["enabled"] = persona_cfg["enabled"]
-            updated.append("persona.enabled")
-        if "event_recording_enabled" in p:
-            persona_cfg["event_recording_enabled"] = bool(p["event_recording_enabled"])
-            persona_gateway_payload["event_recording_enabled"] = persona_cfg["event_recording_enabled"]
-            updated.append("persona.event_recording_enabled")
+        for key in ("enabled", "event_recording_enabled", "conflict_nudge_enabled"):
+            if key in p:
+                persona_cfg[key] = bool(p[key])
+                persona_gateway_payload[key] = persona_cfg[key]
+                updated.append(f"persona.{key}")
         for key in ("model", "base_url"):
             if key in p:
                 persona_cfg[key] = str(p[key] or "").strip()
@@ -12878,12 +12883,9 @@ async def api_config_update(request):
 
             if "persona" in body:
                 sc_persona = save_config.setdefault("persona", {})
-                if "enabled" in body["persona"]:
-                    sc_persona["enabled"] = bool(body["persona"]["enabled"])
-                if "event_recording_enabled" in body["persona"]:
-                    sc_persona["event_recording_enabled"] = bool(
-                        body["persona"]["event_recording_enabled"]
-                    )
+                for key in ("enabled", "event_recording_enabled", "conflict_nudge_enabled"):
+                    if key in body["persona"]:
+                        sc_persona[key] = bool(body["persona"][key])
                 for key in ("model", "base_url"):
                     if key in body["persona"]:
                         sc_persona[key] = str(body["persona"][key] or "").strip()
